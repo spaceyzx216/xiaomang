@@ -786,6 +786,10 @@ export default function ContentPage() {
           }
         }
       }
+
+      if (!donePayload) {
+        throw new Error("工作流连接已结束，但未收到 Done 事件。可能是请求超时或中途被中断，请重试。");
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "工作流执行失败";
       setWorkflowError(message);

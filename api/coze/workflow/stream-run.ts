@@ -1,7 +1,7 @@
 import { COZE_API_TOKEN, COZE_BASE_URL, COZE_WORKFLOW_ID, json, readBody } from "../../_lib/common.js";
 
 export const config = {
-  maxDuration: 60,
+  maxDuration: 300,
 };
 
 export default async function handler(req: any, res: any) {
