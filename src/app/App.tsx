@@ -4,7 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Checkbox } from "./components/ui/checkbox";
 import { Button } from "./components/ui/button";
 import { Badge } from "./components/ui/badge";
-import { PROXY_BASE, parseApiJson } from "./api";
+import { apiUrl, parseApiJson } from "./api";
 import {
   type CarouselApi,
   Carousel,
@@ -282,7 +282,7 @@ export default function App() {
     setTikhubError(null);
 
     try {
-      const response = await fetch(`${PROXY_BASE}/api/tikhub/batch`, {
+      const response = await fetch(apiUrl("/api/tikhub/batch"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

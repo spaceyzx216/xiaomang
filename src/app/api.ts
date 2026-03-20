@@ -1,7 +1,26 @@
-export const PROXY_BASE =
+const RAW_PROXY_BASE =
   import.meta.env.VITE_TIKHUB_PROXY_BASE ||
   import.meta.env.VITE_COZE_PROXY_BASE ||
   "";
+
+const normalizeProxyBase = (value: string) => {
+  const trimmed = String(value || "").trim().replace(/\/+$/, "");
+  if (!trimmed || trimmed === "/") return "";
+  if (trimmed === "/tikhub-proxy" || trimmed.endsWith("/tikhub-proxy")) {
+    return "";
+  }
+  if (trimmed === "/api" || trimmed.endsWith("/api")) {
+    return "";
+  }
+  return trimmed;
+};
+
+export const PROXY_BASE = normalizeProxyBase(RAW_PROXY_BASE);
+
+export const apiUrl = (path: string) => {
+  const normalizedPath = String(path || "").startsWith("/") ? path : `/${path}`;
+  return `${PROXY_BASE}${normalizedPath}`;
+};
 
 type JsonObject = Record<string, any>;
 

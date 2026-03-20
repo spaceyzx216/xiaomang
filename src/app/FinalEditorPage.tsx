@@ -4,7 +4,7 @@ import { Button } from "./components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Badge } from "./components/ui/badge";
 import { FileText, ArrowLeft, Download } from "lucide-react";
-import { PROXY_BASE, parseApiJson } from "./api";
+import { apiUrl, parseApiJson } from "./api";
 
 type FinalDraftPayload = {
   selectedTitles?: Array<{ title: string; detail?: string; raw?: string }>;
@@ -69,7 +69,7 @@ export default function FinalEditorPage() {
     setSaveLoading(true);
     setSaveMessage(null);
     try {
-      const response = await fetch(`${PROXY_BASE}/api/final-drafts`, {
+      const response = await fetch(apiUrl("/api/final-drafts"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(draftPayload),
@@ -90,7 +90,7 @@ export default function FinalEditorPage() {
   const clearSavedDraftAfterExport = async () => {
     if (!savedDraftId) return;
     try {
-      await fetch(`${PROXY_BASE}/api/final-drafts/${savedDraftId}`, {
+      await fetch(apiUrl(`/api/final-drafts/${savedDraftId}`), {
         method: "DELETE",
       });
       setSavedDraftId(null);
@@ -127,16 +127,16 @@ export default function FinalEditorPage() {
   };
 
   const exportWord = async () => {
-      await downloadFile(`${PROXY_BASE}/api/export/word`, "final-copy.doc");
+      await downloadFile(apiUrl("/api/export/word"), "final-copy.doc");
   };
 
   const exportExcel = async () => {
-    await downloadFile(`${PROXY_BASE}/api/export/excel`, "final-copy.csv");
+    await downloadFile(apiUrl("/api/export/excel"), "final-copy.csv");
   };
 
   const clearLegacyDraftFile = async () => {
     try {
-      await fetch(`${PROXY_BASE}/api/final-drafts`, { method: "DELETE" });
+      await fetch(apiUrl("/api/final-drafts"), { method: "DELETE" });
     } catch {
       // ignore cleanup errors
     }
