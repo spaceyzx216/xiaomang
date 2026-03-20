@@ -1,3 +1,5 @@
+declare const process: any;
+
 type VercelRequest = any;
 type VercelResponse = any;
 

@@ -1,5 +1,5 @@
-import { addDraft, clearDrafts, listDrafts } from "../_lib/draftStore";
-import { json, readBody } from "../_lib/common";
+import { addDraft, clearDrafts, listDrafts } from "../_lib/draftStore.js";
+import { json, readBody } from "../_lib/common.js";
 
 export default async function handler(req: any, res: any) {
   if (req.method === "GET") {

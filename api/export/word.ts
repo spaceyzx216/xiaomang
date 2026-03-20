@@ -1,4 +1,4 @@
-import { readBody } from "../_lib/common";
+import { readBody } from "../_lib/common.js";
 
 export default async function handler(req: any, res: any) {
   if (req.method !== "POST") {

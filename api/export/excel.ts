@@ -1,4 +1,4 @@
-import { readBody } from "../_lib/common";
+import { readBody } from "../_lib/common.js";
 
 const esc = (v: string) => `"${String(v || "").replace(/"/g, '""')}"`;
 

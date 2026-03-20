@@ -1,10 +1,10 @@
-import { COZE_API_TOKEN, COZE_BASE_URL, COZE_WORKFLOW_ID, json, readBody } from "../../_lib/common";
+import { COZE_API_TOKEN, COZE_BASE_URL, COZE_WORKFLOW_ID, json, readBody } from "../../_lib/common.js";
 
 export const config = {
   maxDuration: 60,
 };
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(req: any, res: any) {
   if (req.method !== "POST") {
     return json(res, 405, { error: "Method not allowed" });
   }

@@ -1,5 +1,5 @@
-import { deleteDraft } from "../_lib/draftStore";
-import { json } from "../_lib/common";
+import { deleteDraft } from "../_lib/draftStore.js";
+import { json } from "../_lib/common.js";
 
 export default async function handler(req: any, res: any) {
   if (req.method !== "DELETE") {
