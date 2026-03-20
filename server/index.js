@@ -23,6 +23,14 @@ const cozeWorkflowId = process.env.COZE_WORKFLOW_ID || "";
 
 app.use(express.json({ limit: "1mb" }));
 
+app.get("/health", (_req, res) => {
+  res.json({
+    status: "ok",
+    service: "xiaomang-proxy",
+    time: new Date().toISOString(),
+  });
+});
+
 const sanitizeUrl = (rawUrl) => {
   try {
     const parsed = new URL(rawUrl);
