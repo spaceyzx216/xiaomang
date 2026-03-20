@@ -1,7 +1,7 @@
 export const PROXY_BASE =
   import.meta.env.VITE_TIKHUB_PROXY_BASE ||
   import.meta.env.VITE_COZE_PROXY_BASE ||
-  "http://127.0.0.1:18891";
+  "";
 
 type JsonObject = Record<string, any>;
 
@@ -40,7 +40,7 @@ export async function parseApiJson(response: Response): Promise<JsonObject> {
     trimmedText.startsWith("<html") ||
     trimmedText.startsWith("The page could not be found")
   ) {
-    throw new Error(`代理接口不可用，当前返回的是页面内容（HTTP ${response.status}）。请检查 /tikhub-proxy 是否已正确转发到后端服务。`);
+    throw new Error(`代理接口不可用，当前返回的是页面内容（HTTP ${response.status}）。请检查 /api 路由与服务端配置是否正常。`);
   }
 
   throw new Error(`接口返回了非 JSON 内容（HTTP ${response.status}）：${summarizeText(rawText)}`);

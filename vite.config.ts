@@ -19,11 +19,10 @@ export default defineConfig({
 
   server: {
     proxy: {
-      '/tikhub-proxy': {
+      '/api': {
         target: 'http://localhost:8787',
         changeOrigin: true,
         secure: false,
-        rewrite: (pathValue) => pathValue.replace(/^\/tikhub-proxy/, ''),
       },
     },
   },
