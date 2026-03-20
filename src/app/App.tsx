@@ -86,6 +86,36 @@ const mockData = {
   ]
 };
 
+const TASK_AUTH_TOKEN_KEY = "kk_task_token";
+const TASK_USER_ID_KEY = "kk_task_user_id";
+
+function getTaskAuthContext() {
+  const params = new URLSearchParams(window.location.search);
+  const urlToken = String(params.get("taskToken") || "").trim();
+  const urlUserId = String(params.get("taskUserId") || "").trim();
+
+  const storedToken = String(localStorage.getItem(TASK_AUTH_TOKEN_KEY) || "").trim();
+  const storedUserId = String(localStorage.getItem(TASK_USER_ID_KEY) || "").trim();
+
+  const token = urlToken || storedToken;
+  const userId = urlUserId || storedUserId;
+
+  if (urlToken) localStorage.setItem(TASK_AUTH_TOKEN_KEY, urlToken);
+  if (urlUserId) localStorage.setItem(TASK_USER_ID_KEY, urlUserId);
+
+  if (urlToken || urlUserId || params.has("from")) {
+    params.delete("taskToken");
+    params.delete("taskUserId");
+    params.delete("from");
+
+    const nextQuery = params.toString();
+    const nextUrl = `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ""}${window.location.hash}`;
+    window.history.replaceState({}, "", nextUrl);
+  }
+
+  return { token, userId };
+}
+
 export default function App() {
   const navigate = useNavigate();
   const [selectedTopics, setSelectedTopics] = useState<string[]>(() => {
@@ -207,7 +237,16 @@ export default function App() {
       setTaskLoading(true);
       setTaskError(null);
       try {
-        const response = await fetch("http://127.0.0.1:18891/api/tasks/today");
+        const { token } = getTaskAuthContext();
+        if (!token) {
+          throw new Error("未检测到登录态，请从 KKClaw 登录后再打开工作站");
+        }
+
+        const response = await fetch("http://127.0.0.1:18891/api/tasks/today", {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
         const data = await response.json();
         if (!response.ok || !data?.success) {
           throw new Error(data?.error || "任务服务不可用");
