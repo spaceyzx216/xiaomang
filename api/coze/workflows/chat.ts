@@ -41,11 +41,28 @@ export default async function handler(req: any, res: any) {
       body: JSON.stringify(body),
     });
 
-    const text = await response.text();
     res.status(response.status);
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
-    return res.send(text);
+    res.setHeader("Connection", "keep-alive");
+
+    if (!response.body) {
+      return res.end("event: error\ndata: {\"msg\":\"No stream body\"}\n\n");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        res.write(decoder.decode(value, { stream: true }));
+      }
+    }
+
+    res.end();
+    return;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Request failed";
     return json(res, 500, { error: message });
