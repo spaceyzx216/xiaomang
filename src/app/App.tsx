@@ -4,6 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Checkbox } from "./components/ui/checkbox";
 import { Button } from "./components/ui/button";
 import { Badge } from "./components/ui/badge";
+import { PROXY_BASE, parseApiJson } from "./api";
 import {
   type CarouselApi,
   Carousel,
@@ -281,7 +282,7 @@ export default function App() {
     setTikhubError(null);
 
     try {
-      const response = await fetch(`${import.meta.env.VITE_TIKHUB_PROXY_BASE || "/tikhub-proxy"}/api/tikhub/batch`, {
+      const response = await fetch(`${PROXY_BASE}/api/tikhub/batch`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -289,7 +290,7 @@ export default function App() {
         body: JSON.stringify({ urls: rawLinks }),
       });
 
-      const data = await response.json();
+      const data = await parseApiJson(response);
       if (!response.ok) {
         throw new Error(data?.error || "请求失败");
       }

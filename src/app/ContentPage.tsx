@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router";
+import { PROXY_BASE } from "./api";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Badge } from "./components/ui/badge";
 import { Checkbox } from "./components/ui/checkbox";
@@ -440,7 +441,7 @@ export default function ContentPage() {
     setTranslationItems([]);
 
     try {
-      const response = await fetch(`${import.meta.env.VITE_COZE_PROXY_BASE || "/tikhub-proxy"}/api/coze/workflow/stream-run`, {
+      const response = await fetch(`${PROXY_BASE}/api/coze/workflow/stream-run`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -550,7 +551,7 @@ export default function ContentPage() {
       const systemPrompt = `你是资深新媒体编辑，请将用户给出的文案改写为${rewriteTarget}平台风格。输出必须是JSON：{"results":[{"id":"...","rewritten":"..."}]}`;
       const inputPayload = selectedRewriteScripts.map(item => ({ id: item.id, text: item.content }));
 
-      const response = await fetch(`${import.meta.env.VITE_COZE_PROXY_BASE || "/tikhub-proxy"}/api/coze/workflows/chat`, {
+      const response = await fetch(`${PROXY_BASE}/api/coze/workflows/chat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -715,7 +716,7 @@ export default function ContentPage() {
     setWorkflowRawDone("");
 
     try {
-      const response = await fetch(`${import.meta.env.VITE_COZE_PROXY_BASE || "/tikhub-proxy"}/api/coze/workflow/stream-run`, {
+      const response = await fetch(`${PROXY_BASE}/api/coze/workflow/stream-run`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
