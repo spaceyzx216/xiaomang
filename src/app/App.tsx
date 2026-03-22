@@ -363,6 +363,15 @@ export default function App() {
     taskCarouselApi.scrollTo(taskIndex, true);
   }, [taskCarouselApi, taskIndex]);
 
+  useEffect(() => {
+    const links = parseBenchmarkLinks(activeTask?.benchmarkAccounts);
+    if (links.length === 0) return;
+
+    const nextValue = links.join("\n");
+    setTikhubInput(nextValue);
+    sessionStorage.setItem("tikhubInput", nextValue);
+  }, [activeTask?._id, activeTask?.benchmarkAccounts]);
+
   const handleSubmit = () => {
     const selectedData = tikhubTopics.filter(topic => selectedTopics.includes(topic.id));
     sessionStorage.setItem("selectedTopics", JSON.stringify(selectedData));
@@ -389,6 +398,25 @@ export default function App() {
   const splitRequirements = (items?: string[]) => {
     if (!Array.isArray(items)) return [];
     return items.filter(item => item && item.trim().length > 0);
+  };
+
+  const parseBenchmarkLinks = (value?: string) => {
+    const raw = String(value || "").trim();
+    if (!raw) return [] as string[];
+
+    const urlMatches = raw.match(/https?:\/\/[^\s，,；;]+/g) || [];
+    if (urlMatches.length > 0) {
+      return Array.from(new Set(urlMatches.map(link => link.trim()).filter(Boolean)));
+    }
+
+    return Array.from(
+      new Set(
+        raw
+          .split(/[\n，,；;\s]+/)
+          .map(link => link.trim())
+          .filter(Boolean)
+      )
+    );
   };
 
   const metaChips = (task?: TaskItem) => {
@@ -542,7 +570,7 @@ export default function App() {
 
                                 <div className="rounded-xl border border-slate-200 bg-white px-4 py-4 shadow-sm">
                                   <div className="text-sm font-semibold text-slate-900">对标账号</div>
-                                  <p className="mt-2 text-sm text-slate-600 leading-relaxed break-all">
+                                  <p className="mt-2 text-sm text-slate-600 leading-relaxed break-all whitespace-pre-line">
                                     {task.benchmarkAccounts || "未提供"}
                                   </p>
                                 </div>
