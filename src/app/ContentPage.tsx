@@ -1093,49 +1093,51 @@ export default function ContentPage() {
               )}
             </div>
 
-            <div className="rounded-xl border border-slate-200 bg-white px-4 py-3">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="text-sm text-slate-700">
-                  多链接结果卡片：
-                  <span className="ml-1 font-semibold text-slate-900">
-                    {workflowGroups.length > 0 ? `${activeGroupIndex + 1} / ${workflowGroups.length}` : "0 / 0"}
-                  </span>
+            <Card className="bg-white border-slate-200 overflow-hidden">
+              <CardHeader className="pb-3 border-b border-slate-100">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="text-sm text-slate-700">
+                    当前链接任务卡片：
+                    <span className="ml-1 font-semibold text-slate-900">
+                      {workflowGroups.length > 0 ? `${activeGroupIndex + 1} / ${workflowGroups.length}` : "0 / 0"}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="h-8 px-2"
+                      onClick={() => setActiveGroupIndex((prev) => Math.max(0, prev - 1))}
+                      disabled={workflowGroups.length === 0 || activeGroupIndex <= 0}
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="h-8 px-2"
+                      onClick={() => setActiveGroupIndex((prev) => Math.min(workflowGroups.length - 1, prev + 1))}
+                      disabled={workflowGroups.length === 0 || activeGroupIndex >= workflowGroups.length - 1}
+                    >
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                  </div>
                 </div>
-                <div className="flex items-center gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="h-8 px-2"
-                    onClick={() => setActiveGroupIndex((prev) => Math.max(0, prev - 1))}
-                    disabled={workflowGroups.length === 0 || activeGroupIndex <= 0}
-                  >
-                    <ChevronLeft className="h-4 w-4" />
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="h-8 px-2"
-                    onClick={() => setActiveGroupIndex((prev) => Math.min(workflowGroups.length - 1, prev + 1))}
-                    disabled={workflowGroups.length === 0 || activeGroupIndex >= workflowGroups.length - 1}
-                  >
-                    <ChevronRight className="h-4 w-4" />
-                  </Button>
+                <div className="mt-2 text-xs text-slate-500 break-all">
+                  当前链接：{activeGroup?.shareLink || "请先调用工作流生成内容"}
                 </div>
-              </div>
-              <div className="mt-2 text-xs text-slate-500 break-all">
-                当前链接：{activeGroup?.shareLink || "请先调用工作流生成内容"}
-              </div>
-            </div>
+              </CardHeader>
 
-            <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 items-start">
-              <Card className="bg-white border-slate-200 xl:sticky xl:top-4">
+              <CardContent className="pt-4">
+                <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 items-stretch">
+              <Card className="bg-white border-slate-200 flex flex-col h-[56vh] min-h-[420px] max-h-[680px]">
                 <CardHeader className="pb-3">
                   <div className="flex items-center justify-between">
                     <CardTitle className="text-base font-semibold text-slate-900">标题</CardTitle>
                     <Badge className="bg-indigo-50 text-indigo-600">{funnelStatus.titleCount} 已选</Badge>
                   </div>
                 </CardHeader>
-                <CardContent className="space-y-2 max-h-[62vh] overflow-auto pr-1">
+                <CardContent className="space-y-2 flex-1 min-h-0 overflow-auto pr-1">
                   {workflowResult.titles.map((titleBlock) => {
                     const titleLabel = extractTitleLabel(titleBlock);
                     const extraLines = splitByLine(titleBlock).slice(1);
@@ -1171,14 +1173,14 @@ export default function ContentPage() {
                 </CardContent>
               </Card>
 
-              <Card className="bg-white border-slate-200 xl:sticky xl:top-4">
+              <Card className="bg-white border-slate-200 flex flex-col h-[56vh] min-h-[420px] max-h-[680px]">
                 <CardHeader className="pb-3">
                   <div className="flex items-center justify-between">
                     <CardTitle className="text-base font-semibold text-slate-900">3 秒留存</CardTitle>
                     <Badge className="bg-indigo-50 text-indigo-600">{funnelStatus.hookCount} 已选</Badge>
                   </div>
                 </CardHeader>
-                <CardContent className="space-y-2 max-h-[62vh] overflow-auto pr-1">
+                <CardContent className="space-y-2 flex-1 min-h-0 overflow-auto pr-1">
                   {workflowResult.hooks.map((hook) => {
                     const isSelected = selectedHooks.includes(hook.id);
                     const typeLabel = hook.hookType === "opening_text"
@@ -1219,14 +1221,14 @@ export default function ContentPage() {
                 </CardContent>
               </Card>
 
-              <Card className="bg-white border-slate-200 xl:sticky xl:top-4">
+              <Card className="bg-white border-slate-200 flex flex-col h-[56vh] min-h-[420px] max-h-[680px]">
                 <CardHeader className="pb-3">
                   <div className="flex items-center justify-between">
                     <CardTitle className="text-base font-semibold text-slate-900">二创文案</CardTitle>
                     <Badge className="bg-indigo-50 text-indigo-600">{funnelStatus.scriptCount} 已选</Badge>
                   </div>
                 </CardHeader>
-                <CardContent className="space-y-3 max-h-[62vh] overflow-auto pr-1">
+                <CardContent className="space-y-3 flex-1 min-h-0 overflow-auto pr-1">
                   {workflowResult.scripts.map((script) => (
                     <div
                       key={script.id}
@@ -1263,7 +1265,9 @@ export default function ContentPage() {
                   ))}
                 </CardContent>
               </Card>
-            </div>
+                </div>
+              </CardContent>
+            </Card>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <Card className="bg-white border-slate-200">
