@@ -1026,14 +1026,6 @@ export default function ContentPage() {
               <div>
                 当前已选选题：{selectedTopics.length} 条。后续标题、3 秒留存、二创文案将基于这些真实选题数据生成。
               </div>
-              {shareLinksText && (
-                <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2">
-                  <div className="text-xs font-semibold text-slate-700">工作流输入 share_links（已自动导入）</div>
-                  <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-md bg-white p-2 text-[11px] text-slate-700 border border-slate-200">
-                    {shareLinksText}
-                  </pre>
-                </div>
-              )}
 
               <div className="flex flex-wrap gap-2 items-center">
                 <Button
@@ -1097,7 +1089,7 @@ export default function ContentPage() {
               <CardHeader className="pb-3 border-b border-slate-100">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="text-sm text-slate-700">
-                    当前链接任务卡片：
+                    当前任务卡片：
                     <span className="ml-1 font-semibold text-slate-900">
                       {workflowGroups.length > 0 ? `${activeGroupIndex + 1} / ${workflowGroups.length}` : "0 / 0"}
                     </span>
@@ -1123,9 +1115,7 @@ export default function ContentPage() {
                     </Button>
                   </div>
                 </div>
-                <div className="mt-2 text-xs text-slate-500 break-all">
-                  当前链接：{activeGroup?.shareLink || "请先调用工作流生成内容"}
-                </div>
+
               </CardHeader>
 
               <CardContent className="pt-4">
