@@ -3,3 +3,7 @@
 591b740c4d93f29bbe599754b77b4349be5eef29 9fd1bc567acbb52e722405aedc5d3ab233922e69 spaceyzx216 <2146986718@zufe.edu.cn> 1774199230 +0800	commit: feat: auto-fill TikHub input from benchmark accounts and resolve merge conflicts
 9fd1bc567acbb52e722405aedc5d3ab233922e69 a640e4a5b107eebc211522debe0e2fc8df8e8d4b spaceyzx216 <2146986718@zufe.edu.cn> 1774251504 +0800	commit: feat: enhance ContentPage to support multiple workflow results and improve session management
 a640e4a5b107eebc211522debe0e2fc8df8e8d4b ccd7fd7c9cc492f23e1b4f0000202c9085dfa880 spaceyzx216 <2146986718@zufe.edu.cn> 1774252972 +0800	commit: feat: enhance ContentPage to support multiple workflow results and improve session management
+ccd7fd7c9cc492f23e1b4f0000202c9085dfa880 0ef2be305b784bc500b36c4930052354f6c0019b spaceyzx216 <2146986718@zufe.edu.cn> 1774253445 +0800	commit: feat: support per-link content cards and unified task container layout
+0ef2be305b784bc500b36c4930052354f6c0019b 59b6e4c1f5e4cc169d2d7a0eccdc7106800fd792 spaceyzx216 <2146986718@zufe.edu.cn> 1774262233 +0800	commit: feat: improve multi-link content workflow UI and unify three panels into one task card
+59b6e4c1f5e4cc169d2d7a0eccdc7106800fd792 5ef7b1f2cd1325b2d571d94bd1f6898244c977b6 spaceyzx216 <2146986718@zufe.edu.cn> 1774267523 +0800	commit: fix: adapt workflow parsing to new title and hook schema
+5ef7b1f2cd1325b2d571d94bd1f6898244c977b6 44eea11cddd2b103751c621dde02e166a3042dca spaceyzx216 <2146986718@zufe.edu.cn> 1774270288 +0800	commit: more time for coze

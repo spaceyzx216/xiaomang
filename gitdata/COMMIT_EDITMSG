@@ -1,6 +1,1 @@
-feat: enhance ContentPage to support multiple workflow results and improve session management
-
-- Added functionality to parse and manage multiple workflow results from payloads.
-- Introduced new types for structured handling of workflow results and groups.
-- Updated session storage management for workflow data and active group index.
-- Enhanced UI to display multiple result cards for better user experience.
+more time for coze

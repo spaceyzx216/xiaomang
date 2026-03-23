@@ -894,95 +894,116 @@ export default function ContentPage() {
     setWorkflowRawDone("");
 
     try {
-      const response = await fetch(apiUrl("/api/coze/workflow/stream-run"), {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          workflow_id: "7618854964156563519",
-          parameters: {
-            share_links: shareLinksText,
-          },
-        }),
-      });
-
-      if (!response.ok || !response.body) {
-        const text = await response.text();
-        throw new Error(text || `HTTP ${response.status}`);
+      const MAX_LINKS_PER_BATCH = 3;
+      const batches: string[][] = [];
+      for (let i = 0; i < shareLinks.length; i += MAX_LINKS_PER_BATCH) {
+        batches.push(shareLinks.slice(i, i + MAX_LINKS_PER_BATCH));
       }
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-      let buffer = "";
-      let donePayload = "";
+      const allGroups: WorkflowResultGroup[] = [];
+      const allRawPayloads: string[] = [];
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
+      for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+        const batchLinks = batches[batchIndex];
+        const batchLinksText = batchLinks.join("\n");
 
-        buffer += decoder.decode(value, { stream: true });
-        const chunks = buffer.split("\n\n");
-        buffer = chunks.pop() || "";
+        const response = await fetch(apiUrl("/api/coze/workflow/stream-run"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            workflow_id: "7618854964156563519",
+            parameters: {
+              share_links: batchLinksText,
+            },
+          }),
+        });
 
-        for (const chunk of chunks) {
-          const lines = chunk.split("\n");
-          let event = "";
-          let dataLine = "";
+        if (!response.ok || !response.body) {
+          const text = await response.text();
+          throw new Error(text || `HTTP ${response.status}`);
+        }
 
-          for (const line of lines) {
-            if (line.startsWith("event:")) event = line.slice(6).trim();
-            if (line.startsWith("data:")) dataLine += line.slice(5).trim();
-          }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+        let donePayload = "";
+        let batchPreview = "";
 
-          if (!event) continue;
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
 
-          let data: any = {};
-          try {
-            data = dataLine ? JSON.parse(dataLine) : {};
-          } catch {
-            data = { raw: dataLine };
-          }
+          buffer += decoder.decode(value, { stream: true });
+          const chunks = buffer.split("\n\n");
+          buffer = chunks.pop() || "";
 
-          if (event === "Message") {
-            const content = String(data?.content || "");
-            if (content) {
-              setStreamPreview(prev => prev + content);
-              donePayload = content;
+          for (const chunk of chunks) {
+            const lines = chunk.split("\n");
+            let event = "";
+            let dataLine = "";
+
+            for (const line of lines) {
+              if (line.startsWith("event:")) event = line.slice(6).trim();
+              if (line.startsWith("data:")) dataLine += line.slice(5).trim();
+            }
+
+            if (!event) continue;
+
+            let data: any = {};
+            try {
+              data = dataLine ? JSON.parse(dataLine) : {};
+            } catch {
+              data = { raw: dataLine };
+            }
+
+            if (event === "Message") {
+              const content = String(data?.content || "");
+              if (content) {
+                batchPreview += content;
+                setStreamPreview(prev => prev + content);
+                donePayload = content;
+              }
+            }
+
+            if (event === "Error") {
+              throw new Error(data?.error_message || `工作流执行失败（批次 ${batchIndex + 1}/${batches.length}）`);
+            }
+
+            if (event === "Done") {
+              const payloadText = donePayload || batchPreview;
+              allRawPayloads.push(payloadText);
+
+              const grouped = parseWorkflowPayloadGroups(payloadText, batchLinks);
+              const normalized = grouped.length > 0
+                ? grouped
+                : [
+                    {
+                      id: `link-${allGroups.length + 1}`,
+                      shareLink: batchLinks[0] || "",
+                      result: parseWorkflowPayload(payloadText),
+                    },
+                  ];
+
+              allGroups.push(...normalized);
             }
           }
+        }
 
-          if (event === "Error") {
-            throw new Error(data?.error_message || "工作流执行失败");
-          }
-
-          if (event === "Done") {
-            const payloadText = donePayload || streamPreview;
-            setWorkflowRawDone(payloadText);
-            sessionStorage.setItem("workflowRawDone", payloadText);
-
-            const grouped = parseWorkflowPayloadGroups(payloadText, shareLinks);
-            const normalized = grouped.length > 0
-              ? grouped
-              : [
-                  {
-                    id: "link-1",
-                    shareLink: shareLinks[0] || "",
-                    result: parseWorkflowPayload(payloadText),
-                  },
-                ];
-
-            setWorkflowGroups(normalized);
-            sessionStorage.setItem("contentWorkflowGroups", JSON.stringify(normalized));
-            setActiveGroupIndex(0);
-            sessionStorage.setItem("contentActiveGroupIndex", "0");
-          }
+        if (!donePayload && !batchPreview) {
+          throw new Error(`工作流连接已结束，但未收到 Done 事件（批次 ${batchIndex + 1}/${batches.length}）。可能是请求超时或中途被中断，请重试。`);
         }
       }
 
-      if (!donePayload) {
-        throw new Error("工作流连接已结束，但未收到 Done 事件。可能是请求超时或中途被中断，请重试。");
-      }
+      const combinedPayload = allRawPayloads.join("\n\n");
+      setWorkflowRawDone(combinedPayload);
+      sessionStorage.setItem("workflowRawDone", combinedPayload);
+
+      setWorkflowGroups(allGroups);
+      sessionStorage.setItem("contentWorkflowGroups", JSON.stringify(allGroups));
+      setActiveGroupIndex(0);
+      sessionStorage.setItem("contentActiveGroupIndex", "0");
     } catch (error) {
       const message = error instanceof Error ? error.message : "工作流执行失败";
       setWorkflowError(message);
