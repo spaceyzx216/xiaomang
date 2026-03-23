@@ -892,6 +892,10 @@ export default function ContentPage() {
     setWorkflowError(null);
     setStreamPreview("");
     setWorkflowRawDone("");
+    setWorkflowGroups([]);
+    setActiveGroupIndex(0);
+    sessionStorage.setItem("contentWorkflowGroups", "[]");
+    sessionStorage.setItem("contentActiveGroupIndex", "0");
 
     try {
       const MAX_LINKS_PER_BATCH = 3;
@@ -902,6 +906,14 @@ export default function ContentPage() {
 
       const allGroups: WorkflowResultGroup[] = [];
       const allRawPayloads: string[] = [];
+
+      const commitPartialResults = () => {
+        const combinedPayload = allRawPayloads.join("\n\n");
+        setWorkflowRawDone(combinedPayload);
+        sessionStorage.setItem("workflowRawDone", combinedPayload);
+        setWorkflowGroups([...allGroups]);
+        sessionStorage.setItem("contentWorkflowGroups", JSON.stringify(allGroups));
+      };
 
       for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
         const batchLinks = batches[batchIndex];
@@ -994,16 +1006,11 @@ export default function ContentPage() {
         if (!donePayload && !batchPreview) {
           throw new Error(`工作流连接已结束，但未收到 Done 事件（批次 ${batchIndex + 1}/${batches.length}）。可能是请求超时或中途被中断，请重试。`);
         }
+
+        commitPartialResults();
       }
 
-      const combinedPayload = allRawPayloads.join("\n\n");
-      setWorkflowRawDone(combinedPayload);
-      sessionStorage.setItem("workflowRawDone", combinedPayload);
-
-      setWorkflowGroups(allGroups);
-      sessionStorage.setItem("contentWorkflowGroups", JSON.stringify(allGroups));
-      setActiveGroupIndex(0);
-      sessionStorage.setItem("contentActiveGroupIndex", "0");
+      commitPartialResults();
     } catch (error) {
       const message = error instanceof Error ? error.message : "工作流执行失败";
       setWorkflowError(message);
