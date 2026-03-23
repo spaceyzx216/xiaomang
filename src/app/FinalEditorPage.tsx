@@ -12,6 +12,9 @@ type FinalDraftPayload = {
   selectedScripts?: Array<{ id: string; title: string; content: string }>;
   rewriteResults?: Array<{ id: string; original: string; rewritten: string; target: string }>;
   translationItems?: Array<{ id: string; zh: string; en: string; sourceType: string }>;
+  sourceGroupId?: string | null;
+  sourceGroupIndex?: number;
+  totalGroups?: number;
 };
 
 const loadDraftPayload = (): FinalDraftPayload => {
@@ -123,7 +126,14 @@ export default function FinalEditorPage() {
     URL.revokeObjectURL(url);
 
     await clearSavedDraftAfterExport();
-    setSaveMessage("导出完成，临时保存记录已自动删除。");
+
+    const currentIndex = Number(payload.sourceGroupIndex || 0);
+    const totalGroups = Number(payload.totalGroups || 0);
+    const nextIndex = totalGroups > 0 ? Math.min(currentIndex + 1, totalGroups - 1) : 0;
+    sessionStorage.setItem("contentActiveGroupIndex", String(nextIndex));
+
+    setSaveMessage("导出完成，已自动返回内容生成页继续下一条链接。");
+    navigate("/content");
   };
 
   const exportWord = async () => {

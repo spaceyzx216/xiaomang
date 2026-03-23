@@ -12,7 +12,7 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "./components/ui/accordion";
-import { Loader2, FileText, Layers, CheckCircle2, Sparkles } from "lucide-react";
+import { Loader2, FileText, Layers, CheckCircle2, Sparkles, ChevronLeft, ChevronRight } from "lucide-react";
 
 type TopicLike = {
   id?: string;
@@ -32,6 +32,12 @@ type WorkflowResult = {
   titles: string[];
   hooks: WorkflowHook[];
   scripts: Array<{ id: string; title: string; content: string }>;
+};
+
+type WorkflowResultGroup = {
+  id: string;
+  shareLink: string;
+  result: WorkflowResult;
 };
 
 type TranslationItem = {
@@ -236,6 +242,104 @@ const parseWorkflowPayload = (payloadText: string): WorkflowResult => {
   };
 };
 
+const parseWorkflowPayloadGroups = (payloadText: string, links: string[]): WorkflowResultGroup[] => {
+  const text = String(payloadText || "").trim();
+  if (!text || links.length === 0) return [];
+
+  const startIdx = text.indexOf("{");
+  const endIdx = text.lastIndexOf("}");
+  const jsonText = startIdx >= 0 && endIdx > startIdx ? text.slice(startIdx, endIdx + 1) : text;
+
+  let obj: any = null;
+  try {
+    obj = JSON.parse(jsonText);
+    if (typeof obj?.output === "string") {
+      try {
+        obj = JSON.parse(obj.output);
+      } catch {
+        obj = { output: obj.output };
+      }
+    }
+  } catch {
+    obj = { output: text };
+  }
+
+  const listFromCodeList = Array.isArray(obj?.Code_list) ? obj.Code_list : [];
+  const listFromCodeList1 = Array.isArray(obj?.Code_list1) ? obj.Code_list1 : [];
+
+  const results = links.map((shareLink, index) => {
+    const codeItemRaw = listFromCodeList[index]?.fields?.[0];
+    const codeItem = (() => {
+      if (!codeItemRaw) return null;
+      if (typeof codeItemRaw === "string") {
+        try {
+          return JSON.parse(codeItemRaw);
+        } catch {
+          return null;
+        }
+      }
+      return codeItemRaw;
+    })();
+
+    const code1ItemRaw = listFromCodeList1[index]?.records?.[0]?.fields;
+    const code1Item = (() => {
+      if (!code1ItemRaw) return null;
+      if (typeof code1ItemRaw === "string") {
+        try {
+          return JSON.parse(code1ItemRaw);
+        } catch {
+          return null;
+        }
+      }
+      return code1ItemRaw;
+    })();
+
+    const titleText = String(codeItem?.title || code1Item?.标题 || "");
+    const titleBlocks = parseTitleBlocks(titleText);
+    const titles = (titleBlocks.length > 0 ? titleBlocks : splitByLine(titleText))
+      .map(item => item.trim())
+      .filter(Boolean);
+
+    const hooks: WorkflowHook[] = [
+      {
+        id: `hook-opening-${index}`,
+        content: String(code1Item?.opening_text || code1Item?.开头钩子 || "").trim(),
+        hookType: "opening_text",
+      },
+      {
+        id: `hook-ending-${index}`,
+        content: String(code1Item?.ending_text || code1Item?.结尾钩子 || "").trim(),
+        hookType: "ending_text",
+      },
+    ].filter(item => item.content);
+
+    const scriptContent = String(codeItem?.content || "").trim();
+    const scripts = scriptContent
+      ? [
+          {
+            id: `script-${index + 1}`,
+            title: "二创文案",
+            content: scriptContent,
+          },
+        ]
+      : [];
+
+    const result: WorkflowResult = {
+      titles,
+      hooks,
+      scripts,
+    };
+
+    return {
+      id: `link-${index + 1}`,
+      shareLink,
+      result,
+    };
+  });
+
+  return results;
+};
+
 export default function ContentPage() {
   const [selectedTitles, setSelectedTitles] = useState<string[]>([]);
   const [selectedHooks, setSelectedHooks] = useState<string[]>([]);
@@ -243,8 +347,12 @@ export default function ContentPage() {
   const [workflowLoading, setWorkflowLoading] = useState(false);
   const [workflowError, setWorkflowError] = useState<string | null>(null);
   const [streamPreview, setStreamPreview] = useState("");
-  const [workflowRawDone, setWorkflowRawDone] = useState("");
-  const [workflowResult, setWorkflowResult] = useState<WorkflowResult>(fallbackResult);
+  const [workflowRawDone, setWorkflowRawDone] = useState(() => sessionStorage.getItem("workflowRawDone") || "");
+  const [workflowGroups, setWorkflowGroups] = useState<WorkflowResultGroup[]>(() => loadJson<WorkflowResultGroup[]>("contentWorkflowGroups", []));
+  const [activeGroupIndex, setActiveGroupIndex] = useState(() => {
+    const raw = Number(sessionStorage.getItem("contentActiveGroupIndex") || 0);
+    return Number.isFinite(raw) ? Math.max(0, raw) : 0;
+  });
   const [activeScript, setActiveScript] = useState<{ title: string; content: string } | null>(null);
 
   const [translationEnabled, setTranslationEnabled] = useState(false);
@@ -278,6 +386,8 @@ export default function ContentPage() {
   }, [selectedTopics]);
 
   const shareLinksText = useMemo(() => shareLinks.join("\n"), [shareLinks]);
+  const activeGroup = workflowGroups[activeGroupIndex] || null;
+  const workflowResult = activeGroup?.result || fallbackResult;
 
   const toggleSelection = (value: string, list: string[], setList: (v: string[]) => void) => {
     setList(list.includes(value) ? list.filter(item => item !== value) : [...list, value]);
@@ -307,6 +417,29 @@ export default function ContentPage() {
       setRewriteResults([]);
     }
   }, [rewriteEnabled]);
+
+  useEffect(() => {
+    if (!activeGroup) {
+      setSelectedTitles([]);
+      setSelectedHooks([]);
+      setSelectedScripts([]);
+      setTranslationItems([]);
+      setRewriteSelection([]);
+      setRewriteResults([]);
+      return;
+    }
+
+    setSelectedTitles([]);
+    setSelectedHooks([]);
+    setSelectedScripts([]);
+    setTranslationItems([]);
+    setRewriteSelection([]);
+    setRewriteResults([]);
+  }, [activeGroup?.id]);
+
+  useEffect(() => {
+    sessionStorage.setItem("contentActiveGroupIndex", String(activeGroupIndex));
+  }, [activeGroupIndex]);
 
   const parseTranslationPayload = (
     payloadText: string,
@@ -690,6 +823,9 @@ export default function ContentPage() {
       rewriteResults,
       translationItems,
       createdAt: Date.now(),
+      sourceGroupId: activeGroup?.id || null,
+      sourceGroupIndex: activeGroupIndex,
+      totalGroups: workflowGroups.length,
     };
 
     sessionStorage.setItem("finalDraftPayload", JSON.stringify(payload));
@@ -781,8 +917,23 @@ export default function ContentPage() {
           if (event === "Done") {
             const payloadText = donePayload || streamPreview;
             setWorkflowRawDone(payloadText);
-            const parsed = parseWorkflowPayload(payloadText);
-            setWorkflowResult(parsed);
+            sessionStorage.setItem("workflowRawDone", payloadText);
+
+            const grouped = parseWorkflowPayloadGroups(payloadText, shareLinks);
+            const normalized = grouped.length > 0
+              ? grouped
+              : [
+                  {
+                    id: "link-1",
+                    shareLink: shareLinks[0] || "",
+                    result: parseWorkflowPayload(payloadText),
+                  },
+                ];
+
+            setWorkflowGroups(normalized);
+            sessionStorage.setItem("contentWorkflowGroups", JSON.stringify(normalized));
+            setActiveGroupIndex(0);
+            sessionStorage.setItem("contentActiveGroupIndex", "0");
           }
         }
       }
@@ -940,6 +1091,40 @@ export default function ContentPage() {
                   ))}
                 </Accordion>
               )}
+            </div>
+
+            <div className="rounded-xl border border-slate-200 bg-white px-4 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="text-sm text-slate-700">
+                  多链接结果卡片：
+                  <span className="ml-1 font-semibold text-slate-900">
+                    {workflowGroups.length > 0 ? `${activeGroupIndex + 1} / ${workflowGroups.length}` : "0 / 0"}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-8 px-2"
+                    onClick={() => setActiveGroupIndex((prev) => Math.max(0, prev - 1))}
+                    disabled={workflowGroups.length === 0 || activeGroupIndex <= 0}
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-8 px-2"
+                    onClick={() => setActiveGroupIndex((prev) => Math.min(workflowGroups.length - 1, prev + 1))}
+                    disabled={workflowGroups.length === 0 || activeGroupIndex >= workflowGroups.length - 1}
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+              <div className="mt-2 text-xs text-slate-500 break-all">
+                当前链接：{activeGroup?.shareLink || "请先调用工作流生成内容"}
+              </div>
             </div>
 
             <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 items-start">
