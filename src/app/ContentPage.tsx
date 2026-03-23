@@ -92,9 +92,17 @@ const toPreview = (text: string, max = 80) => {
   return normalized.length > max ? `${normalized.slice(0, max)}...` : normalized;
 };
 
+const normalizeTitleLine = (line: string) =>
+  String(line || "")
+    .replace(/^[-]{2,}\s*$/, "")
+    .replace(/^#{1,6}\s*/, "")
+    .replace(/^\*+\s*/, "")
+    .replace(/\*+$/, "")
+    .trim();
+
 const parseTitleBlocks = (titleText: string) => {
   const lines = splitByLine(titleText)
-    .map(line => line.replace(/^[-]{2,}\s*$/, "").trim())
+    .map(normalizeTitleLine)
     .filter(Boolean)
     .filter(line => !line.includes("爆款标题") && line !== "---");
 
@@ -102,7 +110,9 @@ const parseTitleBlocks = (titleText: string) => {
   let current: string[] = [];
 
   for (const line of lines) {
-    if (/^\d+\./.test(line)) {
+    const isBlockStart = /^\d+\s*[\.、]/.test(line) || /^标题[:：]/.test(line);
+
+    if (isBlockStart) {
       if (current.length > 0) blocks.push(current);
       current = [line];
       continue;
@@ -112,21 +122,31 @@ const parseTitleBlocks = (titleText: string) => {
 
     if (/^(类型|优势|技巧)[:：]/.test(line)) {
       current.push(line);
+      continue;
+    }
+
+    if (/^---+$/.test(line)) {
+      if (current.length > 0) {
+        blocks.push(current);
+        current = [];
+      }
     }
   }
 
   if (current.length > 0) blocks.push(current);
 
-  return blocks.map(block => block.join("\n")).filter(Boolean);
+  return blocks
+    .map(block => block.join("\n").trim())
+    .filter(item => item && !/^---+$/.test(item));
 };
 
 const extractTitleLabel = (titleBlock: string) => {
-  const firstLine = splitByLine(titleBlock)[0] || "";
+  const firstLine = normalizeTitleLine(splitByLine(titleBlock)[0] || "");
   return firstLine
-    .replace(/^\d+\.?\s*/, "")
+    .replace(/^\d+\s*[\.、]?\s*/, "")
     .replace(/^标题[:：]\s*/, "")
-    .replace(/^\*+|\*+$/g, "")
-    .replace(/\*\*/g, "")
+    .replace(/^《?\s*/, "")
+    .replace(/\s*》?$/, "")
     .trim();
 };
 
@@ -195,15 +215,26 @@ const parseWorkflowPayload = (payloadText: string): WorkflowResult => {
     .map(item => item.trim())
     .filter(Boolean);
 
+  const openingHookRaw = codeList1Field?.opening_text || codeList1Field?.开头钩子;
+  const endingHookRaw = codeList1Field?.ending_text || codeList1Field?.结尾钩子;
+
+  const openingHook = typeof openingHookRaw === "object" && openingHookRaw
+    ? [openingHookRaw?.extracted, openingHookRaw?.created].map(v => String(v || "").trim()).filter(Boolean).join("\n")
+    : String(openingHookRaw || "").trim();
+
+  const endingHook = typeof endingHookRaw === "object" && endingHookRaw
+    ? [endingHookRaw?.extracted_result, endingHookRaw?.recommended_creation].map(v => String(v || "").trim()).filter(Boolean).join("\n")
+    : String(endingHookRaw || "").trim();
+
   const hooks: WorkflowHook[] = [
     {
       id: "hook-opening",
-      content: String(codeList1Field?.opening_text || codeList1Field?.开头钩子 || "").trim(),
+      content: openingHook,
       hookType: "opening_text",
     },
     {
       id: "hook-ending",
-      content: String(codeList1Field?.ending_text || codeList1Field?.结尾钩子 || "").trim(),
+      content: endingHook,
       hookType: "ending_text",
     },
   ].filter(item => item.content);
@@ -300,15 +331,26 @@ const parseWorkflowPayloadGroups = (payloadText: string, links: string[]): Workf
       .map(item => item.trim())
       .filter(Boolean);
 
+    const openingHookRaw = code1Item?.opening_text || code1Item?.开头钩子;
+    const endingHookRaw = code1Item?.ending_text || code1Item?.结尾钩子;
+
+    const openingHook = typeof openingHookRaw === "object" && openingHookRaw
+      ? [openingHookRaw?.extracted, openingHookRaw?.created].map(v => String(v || "").trim()).filter(Boolean).join("\n")
+      : String(openingHookRaw || "").trim();
+
+    const endingHook = typeof endingHookRaw === "object" && endingHookRaw
+      ? [endingHookRaw?.extracted_result, endingHookRaw?.recommended_creation].map(v => String(v || "").trim()).filter(Boolean).join("\n")
+      : String(endingHookRaw || "").trim();
+
     const hooks: WorkflowHook[] = [
       {
         id: `hook-opening-${index}`,
-        content: String(code1Item?.opening_text || code1Item?.开头钩子 || "").trim(),
+        content: openingHook,
         hookType: "opening_text",
       },
       {
         id: `hook-ending-${index}`,
-        content: String(code1Item?.ending_text || code1Item?.结尾钩子 || "").trim(),
+        content: endingHook,
         hookType: "ending_text",
       },
     ].filter(item => item.content);
