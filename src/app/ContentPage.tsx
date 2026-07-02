@@ -1467,7 +1467,7 @@ export default function ContentPage() {
     }
 
     try {
-      const MAX_LINKS_PER_BATCH = 3;
+      const MAX_LINKS_PER_BATCH = 1;
       const batches: string[][] = [];
       for (let i = 0; i < linksToGenerate.length; i += MAX_LINKS_PER_BATCH) {
         batches.push(linksToGenerate.slice(i, i + MAX_LINKS_PER_BATCH));
