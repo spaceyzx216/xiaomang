@@ -6,6 +6,7 @@ const store = new Map<string, {
   scriptDraft: string;
   rewriteDraft: string;
   translationDraft: string;
+  benchmarkVideos: Array<Record<string, unknown>>;
 }>();
 
 const MAX_ITEMS = 200;
@@ -18,6 +19,7 @@ export const addDraft = (input: {
   scriptDraft?: string;
   rewriteDraft?: string;
   translationDraft?: string;
+  benchmarkVideos?: Array<Record<string, unknown>>;
 }) => {
   const item = {
     id: `draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -27,6 +29,7 @@ export const addDraft = (input: {
     scriptDraft: String(input.scriptDraft || ""),
     rewriteDraft: String(input.rewriteDraft || ""),
     translationDraft: String(input.translationDraft || ""),
+    benchmarkVideos: Array.isArray(input.benchmarkVideos) ? input.benchmarkVideos : [],
   };
 
   store.set(item.id, item);

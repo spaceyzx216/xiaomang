@@ -5,9 +5,6 @@ type VercelResponse = any;
 
 export const TIKHUB_BASE_URL = process.env.TIKHUB_BASE_URL || "https://api.tikhub.io";
 export const TIKHUB_API_TOKEN = process.env.TIKHUB_API_TOKEN || "";
-export const COZE_BASE_URL = process.env.COZE_BASE_URL || "https://api.coze.cn";
-export const COZE_API_TOKEN = process.env.COZE_API_TOKEN || "";
-export const COZE_WORKFLOW_ID = process.env.COZE_WORKFLOW_ID || "";
 
 export const json = (res: VercelResponse, status: number, payload: unknown) => {
   res.status(status).setHeader("Content-Type", "application/json; charset=utf-8");

@@ -35,18 +35,17 @@ npm run build
 
 - `TIKHUB_BASE_URL`
 - `TIKHUB_API_TOKEN`
-- `COZE_BASE_URL`
-- `COZE_API_TOKEN`
-- `COZE_WORKFLOW_ID`
+- `DEEPSEEK_API_KEY`
+- `DOUBAO_API_KEY` or `DOUBAO_APP_KEY` / `DOUBAO_ACCESS_KEY`
 - `PORT` for Node mode
-- `VITE_COZE_PROXY_BASE` when front-end must point to a reverse proxy prefix
+- `VITE_API_PROXY_BASE` when front-end must point to a reverse proxy prefix
 
 ## Nginx Behavior
 
 - `/` serves SPA static assets
 - `/tikhub-proxy/` proxies to `127.0.0.1:8787`
 - `/tikhub-proxy/health` proxies to `/health`
-- SSE buffering is disabled for Coze stream compatibility
+- SSE buffering is disabled for Agent stream compatibility
 
 ## Release Checklist
 
@@ -54,7 +53,7 @@ See `deploy/go-live-checklist.md` for:
 
 - environment validation
 - KKClaw integration checks
-- Coze / Tikhub validation
+- Agent / Tikhub validation
 - rollback readiness
 
 ## Known Deployment Risks

@@ -6,7 +6,7 @@
 
 ## Executive Summary
 
-`xiaomang` 是一个内容生产工作台，主要服务于“选题筛选 -> 内容生成 -> 可选翻译/转写 -> 最终编辑导出”的运营流程。前端负责承接用户选择、流式展示 AI 生成结果和编辑导出；后端负责代理第三方能力、流式转发 Coze 输出、临时保存最终文案，以及在不同部署模式下提供等价接口。
+`xiaomang` 是一个内容生产工作台，主要服务于“选题筛选 -> 内容生成 -> 可选翻译/转写 -> 最终编辑导出”的运营流程。前端负责承接用户选择、流式展示 AI 生成结果和编辑导出；后端负责代理第三方能力、运行自研内容 Agent、临时保存最终文案，以及在不同部署模式下提供等价接口。
 
 ## Project Classification
 
@@ -23,14 +23,14 @@
 | UI | Tailwind CSS 4, Radix UI, lucide-react, MUI | 以本地封装 UI 组件为主 |
 | Backend (local) | Express 5, Node fetch, dotenv | 本地代理、SSE 转发、JSON 文件存储 |
 | Backend (serverless) | Vercel-style API handlers | `api/` 目录提供与本地代理近似的接口 |
-| External Services | Coze, Tikhub | 内容生成、翻译/转写、抖音链接解析 |
+| External Services | DeepSeek, Doubao, Tikhub | 内容生成、翻译/转写、视频转写、抖音链接解析 |
 | Deployment | Nginx + Node process + static dist | 也可拆分为静态前端 + serverless API |
 
 ## Key Features
 
 - 承接外部任务系统传入的任务与鉴权上下文
 - 批量输入抖音链接并通过 Tikhub 拉取作者与视频信息
-- 调用 Coze 工作流，流式生成标题、3 秒留存和二创文案
+- 调用自研内容 Agent，流式生成标题、3 秒留存和二创文案
 - 对选中的内容执行英文翻译
 - 对选中的脚本执行平台风格转写，当前支持抖音、小红书、微信
 - 进入最终文案编辑页，二次编辑后保存、导出 Word / Excel
@@ -40,9 +40,9 @@
 
 - 前端通过 `sessionStorage` 在三个页面之间传递任务、选题、工作流结果和编辑结果，减少全局状态复杂度
 - 本地开发模式使用 Vite 代理 `/api` 到 `server/index.js`
-- 生产示例里，Nginx 把 `/tikhub-proxy/` 反向代理到 Node 服务，同时前端通过 `VITE_COZE_PROXY_BASE` 指向代理前缀
+- 生产示例里，Nginx 把 `/tikhub-proxy/` 反向代理到 Node 服务，同时前端通过 `VITE_API_PROXY_BASE` 指向代理前缀
 - `api/` 目录复刻了核心接口，方便迁移到 Serverless 平台
-- Coze 的两类流式接口都被保留：`workflow/stream-run` 用于工作流，`workflows/chat` 用于对话式转写
+- Agent 接口包括：`workflow/stream-run` 用于主内容生成，`translation` 与 `rewrite` 用于可选增强能力
 
 ## Development Overview
 
@@ -50,7 +50,7 @@
 
 - Node.js 18+
 - npm
-- Coze / Tikhub 的可用凭证
+- DeepSeek / Doubao / Tikhub 的可用凭证
 
 ### Getting Started
 

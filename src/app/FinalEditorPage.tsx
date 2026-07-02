@@ -3,8 +3,23 @@ import { useNavigate } from "react-router";
 import { Button } from "./components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Badge } from "./components/ui/badge";
-import { FileText, ArrowLeft, Download } from "lucide-react";
-import { apiUrl, parseApiJson } from "./api";
+import { FileText, ArrowLeft } from "lucide-react";
+import { apiUrl, fetchWithRetry, parseApiJson } from "./api";
+import { cacheFinalDraft } from "./finalDraftCache";
+
+type BenchmarkVideo = {
+  title?: string;
+  link?: string;
+  coverUrl?: string;
+  durationSeconds?: number;
+  authorName?: string;
+  publishDate?: string;
+  likes?: number;
+  comments?: number;
+  shares?: number;
+  bookmarks?: number;
+  hotTopics?: string[];
+};
 
 type FinalDraftPayload = {
   selectedTitles?: Array<{ title: string; detail?: string; raw?: string }>;
@@ -12,6 +27,14 @@ type FinalDraftPayload = {
   selectedScripts?: Array<{ id: string; title: string; content: string }>;
   rewriteResults?: Array<{ id: string; original: string; rewritten: string; target: string }>;
   translationItems?: Array<{ id: string; zh: string; en: string; sourceType: string }>;
+  benchmarkVideos?: BenchmarkVideo[];
+  taskInfo?: {
+    id?: string;
+    customerName?: string;
+    ownerName?: string;
+    platformName?: string;
+    contentDirection?: string;
+  } | null;
   sourceGroupId?: string | null;
   sourceGroupIndex?: number;
   totalGroups?: number;
@@ -29,9 +52,24 @@ const loadDraftPayload = (): FinalDraftPayload => {
 
 const joinNonEmpty = (lines: string[]) => lines.map(item => String(item || "").trim()).filter(Boolean).join("\n\n");
 
+const formatMetric = (value?: number) => {
+  const numeric = Number(value || 0);
+  if (numeric >= 10000) return `${(numeric / 10000).toFixed(1)}万`;
+  return String(numeric || 0);
+};
+
+const formatDuration = (value?: number) => {
+  const total = Math.max(0, Math.round(Number(value || 0)));
+  if (!total) return "未知";
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return minutes > 0 ? `${minutes}:${String(seconds).padStart(2, "0")}` : `${seconds}s`;
+};
+
 export default function FinalEditorPage() {
   const navigate = useNavigate();
   const payload = useMemo(() => loadDraftPayload(), []);
+  const benchmarkVideos = Array.isArray(payload.benchmarkVideos) ? payload.benchmarkVideos : [];
 
   const [titleDraft, setTitleDraft] = useState(() => joinNonEmpty(
     (payload.selectedTitles || []).map((item, idx) => `${idx + 1}. ${item.title}${item.detail ? `\n${item.detail}` : ""}`)
@@ -55,7 +93,6 @@ export default function FinalEditorPage() {
 
   const [saveLoading, setSaveLoading] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
-  const [savedDraftId, setSavedDraftId] = useState<string | null>(null);
 
   const hasRewriteResult = (payload.rewriteResults || []).length > 0;
   const hasTranslationResult = (payload.translationItems || []).length > 0;
@@ -66,13 +103,15 @@ export default function FinalEditorPage() {
     scriptDraft,
     rewriteDraft: hasRewriteResult ? rewriteDraft : "",
     translationDraft: hasTranslationResult ? translationDraft : "",
+    benchmarkVideos,
+    taskInfo: payload.taskInfo || null,
   };
 
   const saveFinalDraft = async () => {
     setSaveLoading(true);
     setSaveMessage(null);
     try {
-      const response = await fetch(apiUrl("/api/final-drafts"), {
+      const response = await fetchWithRetry(apiUrl("/api/final-drafts"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(draftPayload),
@@ -81,74 +120,30 @@ export default function FinalEditorPage() {
       if (!response.ok || !data?.success) {
         throw new Error(data?.error || `HTTP ${response.status}`);
       }
-      setSavedDraftId(String(data?.item?.id || "") || null);
-      setSaveMessage("保存成功，已临时落库（导出后将自动删除）。");
+      if (data?.item?.id) {
+        cacheFinalDraft(data.item);
+      }
+      const currentIndex = Number(payload.sourceGroupIndex || 0);
+      const totalGroups = Number(payload.totalGroups || 0);
+      const nextIndex = totalGroups > 0 ? Math.min(currentIndex + 1, totalGroups - 1) : 0;
+      sessionStorage.setItem("contentActiveGroupIndex", String(nextIndex));
+      setSaveMessage("保存成功，已返回内容生成页。");
+      navigate("/content");
     } catch (error) {
-      setSaveMessage(error instanceof Error ? error.message : "保存失败");
+      const fallbackItem = {
+        id: `local_${Date.now()}`,
+        createdAt: new Date().toISOString(),
+        ...draftPayload,
+      };
+      cacheFinalDraft(fallbackItem);
+      const currentIndex = Number(payload.sourceGroupIndex || 0);
+      const totalGroups = Number(payload.totalGroups || 0);
+      const nextIndex = totalGroups > 0 ? Math.min(currentIndex + 1, totalGroups - 1) : 0;
+      sessionStorage.setItem("contentActiveGroupIndex", String(nextIndex));
+      setSaveMessage("服务端保存失败，已先保存到本地浏览器待导出列表，并返回内容生成页。");
+      navigate("/content");
     } finally {
       setSaveLoading(false);
-    }
-  };
-
-  const clearSavedDraftAfterExport = async () => {
-    if (!savedDraftId) return;
-    try {
-      await fetch(apiUrl(`/api/final-drafts/${savedDraftId}`), {
-        method: "DELETE",
-      });
-      setSavedDraftId(null);
-    } catch {
-      // ignore delete failures
-    }
-  };
-
-  const downloadFile = async (apiPath: string, fallbackName: string) => {
-    const response = await fetch(apiPath, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(draftPayload),
-    });
-    if (!response.ok) {
-      const t = await response.text();
-      throw new Error(t || `HTTP ${response.status}`);
-    }
-
-    const blob = await response.blob();
-    const disposition = response.headers.get("content-disposition") || "";
-    const matched = disposition.match(/filename="([^"]+)"/);
-    const filename = matched?.[1] || fallbackName;
-
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(url);
-
-    await clearSavedDraftAfterExport();
-
-    const currentIndex = Number(payload.sourceGroupIndex || 0);
-    const totalGroups = Number(payload.totalGroups || 0);
-    const nextIndex = totalGroups > 0 ? Math.min(currentIndex + 1, totalGroups - 1) : 0;
-    sessionStorage.setItem("contentActiveGroupIndex", String(nextIndex));
-
-    setSaveMessage("导出完成，已自动返回内容生成页继续下一条链接。");
-    navigate("/content");
-  };
-
-  const exportWord = async () => {
-      await downloadFile(apiUrl("/api/export/word"), "final-copy.doc");
-  };
-
-  const exportExcel = async () => {
-    await downloadFile(apiUrl("/api/export/excel"), "final-copy.csv");
-  };
-
-  const clearLegacyDraftFile = async () => {
-    try {
-      await fetch(apiUrl("/api/final-drafts"), { method: "DELETE" });
-    } catch {
-      // ignore cleanup errors
     }
   };
 
@@ -168,6 +163,36 @@ export default function FinalEditorPage() {
       </header>
 
       <div className="p-8 max-w-[1400px] mx-auto space-y-4">
+        <Card className="bg-white border-slate-200">
+          <CardHeader className="pb-2">
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-base">对标选题视频</CardTitle>
+              <Badge className="bg-slate-100 text-slate-700">{benchmarkVideos.length} 条</Badge>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm text-slate-700">
+            {benchmarkVideos.length > 0 ? benchmarkVideos.map((item, index) => (
+              <div key={`${item.link || item.title || index}`} className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-1">
+                <div className="font-medium text-slate-900 break-words">{index + 1}. {item.title || "未命名选题"}</div>
+                <div className="break-all text-xs text-slate-500">{item.link || "未提供链接"}</div>
+                <div className="text-xs text-slate-600">
+                  作者：{item.authorName || "未知"}{item.publishDate ? ` · 发布时间：${item.publishDate}` : ""}
+                </div>
+                <div className="text-xs text-slate-600">
+                  封面：{item.coverUrl ? <span className="break-all text-slate-500">{item.coverUrl}</span> : "未提供"} · 时长：{formatDuration(item.durationSeconds)}
+                </div>
+                <div className="text-xs text-slate-600">
+                  点赞 {formatMetric(item.likes)} / 评论 {formatMetric(item.comments)} / 转发 {formatMetric(item.shares)} / 收藏 {formatMetric(item.bookmarks)}
+                </div>
+              </div>
+            )) : (
+              <div className="rounded-lg border border-dashed border-slate-300 px-3 py-4 text-xs text-slate-500">
+                当前最终文案未携带对标视频信息。
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
         <Card className="bg-white border-slate-200">
           <CardHeader className="pb-2">
             <div className="flex items-center justify-between">
@@ -220,14 +245,6 @@ export default function FinalEditorPage() {
         )}
 
         <div className="flex flex-wrap gap-2 justify-end">
-          <Button variant="outline" onClick={exportWord}>
-            <Download className="h-4 w-4 mr-2" />
-            导出 Word
-          </Button>
-          <Button variant="outline" onClick={exportExcel}>
-            <Download className="h-4 w-4 mr-2" />
-            导出 Excel
-          </Button>
           <Button className="bg-emerald-600 hover:bg-emerald-700 text-white" onClick={saveFinalDraft} disabled={saveLoading}>
             <FileText className="h-4 w-4 mr-2" />
             {saveLoading ? "保存中..." : "保存最终文案"}

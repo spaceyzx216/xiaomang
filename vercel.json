@@ -1,0 +1,19 @@
+{
+  "functions": {
+    "api/agent/workflow/stream-run.ts": {
+      "maxDuration": 300
+    },
+    "api/agent/translation.ts": {
+      "maxDuration": 120
+    },
+    "api/agent/rewrite.ts": {
+      "maxDuration": 120
+    },
+    "api/export/feishu.ts": {
+      "maxDuration": 120
+    },
+    "api/export/bitable.ts": {
+      "maxDuration": 120
+    }
+  }
+}

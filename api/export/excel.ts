@@ -1,6 +1,5 @@
 import { readBody } from "../_lib/common.js";
-
-const esc = (v: string) => `"${String(v || "").replace(/"/g, '""')}"`;
+import { buildFinalDraftCsvRows, rowsToCsv } from "../_lib/exportFormatters.js";
 
 export default async function handler(req: any, res: any) {
   if (req.method !== "POST") {
@@ -9,16 +8,7 @@ export default async function handler(req: any, res: any) {
   }
 
   const body = readBody(req);
-  const rows = [
-    ["板块", "内容"],
-    ["标题", String(body?.titleDraft || "")],
-    ["3秒留存", String(body?.hookDraft || "")],
-    ["二创文案", String(body?.scriptDraft || "")],
-    ["风格转写结果", String(body?.rewriteDraft || "")],
-    ["中英翻译结果", String(body?.translationDraft || "")],
-  ];
-
-  const csv = rows.map((row) => row.map(esc).join(",")).join("\n");
+  const csv = rowsToCsv(buildFinalDraftCsvRows(body));
 
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
   res.setHeader("Content-Disposition", `attachment; filename="final-copy-${Date.now()}.csv"`);

@@ -9,3 +9,4 @@ server/.env.*
 .idea
 .git.broken-backup
 gitdata
+.codegraph

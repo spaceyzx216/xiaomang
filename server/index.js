@@ -1,25 +1,54 @@
 import express from "express";
 import dotenv from "dotenv";
-import { Readable } from "stream";
 import { promises as fs } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { runContentAgentWorkflow } from "../api/_lib/contentAgent/index.js";
+import { getContentAgentConfig } from "../api/_lib/contentAgent/config.js";
+import { appendQuery, fetchJson } from "../api/_lib/contentAgent/http.js";
+import { createRequestLogger, safeLink } from "../api/_lib/contentAgent/logger.js";
+import { runRewriteAgent, runTranslationAgent } from "../api/_lib/contentAgent/providers.js";
+import {
+  buildDraftListCsvRows,
+  buildFinalDraftCsvRows,
+  buildFinalDraftMarkdown,
+  normalizeBenchmarkVideos,
+  rowsToCsv,
+} from "../api/_lib/exportFormatters.js";
+import { writeFinalDraftToFeishu, writeFinalDraftToFeishuBitable } from "../api/_lib/feishuClient.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 dotenv.config({
+  path: path.resolve(__dirname, "../.env"),
+});
+dotenv.config({
   path: new URL("./.env", import.meta.url),
+  override: true,
 });
 
 const app = express();
 const port = Number(process.env.PORT || 8787);
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 const dataDir = path.resolve(__dirname, "data");
 const finalDraftFile = path.join(dataDir, "final-drafts.json");
 const baseUrl = process.env.TIKHUB_BASE_URL || "https://api.tikhub.io";
 const apiToken = process.env.TIKHUB_API_TOKEN || "";
-const cozeBaseUrl = process.env.COZE_BASE_URL || "https://api.coze.cn";
-const cozeToken = process.env.COZE_API_TOKEN || "";
-const cozeWorkflowId = process.env.COZE_WORKFLOW_ID || "";
+const apiRetryAttempts = Number.parseInt(process.env.AGENT_API_RETRY_ATTEMPTS || "2", 10);
+const apiRetryBaseDelayMs = Number.parseInt(process.env.AGENT_API_RETRY_BASE_DELAY_MS || "500", 10);
+const startupAgentConfig = getContentAgentConfig();
+createRequestLogger("server", "startup").info("server.config", {
+  port,
+  contentProvider: startupAgentConfig.provider,
+  agentWorkflowId: startupAgentConfig.mainWorkflowId,
+  tikhubBaseUrl: baseUrl,
+  transcriptProviders: startupAgentConfig.transcriptProviders.join(","),
+  doubaoResourceId: startupAgentConfig.doubaoResourceId,
+  tikhubConfigured: Boolean(startupAgentConfig.tikhubApiToken),
+  deepseekConfigured: Boolean(startupAgentConfig.deepseekApiKey),
+  doubaoAsrConfigured: Boolean(startupAgentConfig.doubaoApiKey || (startupAgentConfig.doubaoAppKey && startupAgentConfig.doubaoAccessKey)),
+  doubaoVideoConfigured: Boolean(startupAgentConfig.doubaoVideoEndpoint && startupAgentConfig.doubaoVideoApiKey),
+});
 
 app.use(express.json({ limit: "1mb" }));
 
@@ -65,15 +94,22 @@ const writeFinalDrafts = async (payload) => {
 };
 
 app.post("/api/tikhub/batch", async (req, res) => {
+  const logger = createRequestLogger("api.tikhub.batch", req.headers["x-request-id"]);
   const { urls } = req.body || {};
+  logger.info("route.request.start", {
+    interface: "/api/tikhub/batch",
+    urlCount: Array.isArray(urls) ? urls.length : 0,
+  });
 
   if (!apiToken) {
+    logger.error("route.config.error", { error: "Missing TIKHUB_API_TOKEN" });
     return res.status(500).json({
       error: "Missing TIKHUB_API_TOKEN",
     });
   }
 
   if (!Array.isArray(urls) || urls.length === 0) {
+    logger.warn("route.validation.error", { error: "urls must be a non-empty array" });
     return res.status(400).json({ error: "urls must be a non-empty array" });
   }
 
@@ -87,20 +123,31 @@ app.post("/api/tikhub/batch", async (req, res) => {
     }
 
     const sanitizedUrl = sanitizeUrl(url);
+    logger.info("tikhub.item.start", { url: safeLink(sanitizedUrl) });
 
     try {
-      const secResp = await fetch(
-        `${baseUrl}/api/v1/douyin/web/get_sec_user_id?url=${encodeURIComponent(sanitizedUrl)}`,
+      const secEndpoint = `${baseUrl}/api/v1/douyin/web/get_sec_user_id`;
+      const { response: secResp, data: secUserResponse } = await fetchJson(
+        appendQuery(secEndpoint, { url: sanitizedUrl }),
         {
+          timeoutMs: startupAgentConfig.requestTimeoutMs,
+          retries: Number.isFinite(apiRetryAttempts) ? apiRetryAttempts : 2,
+          retryBaseDelayMs: Number.isFinite(apiRetryBaseDelayMs) ? apiRetryBaseDelayMs : 500,
+          logger,
+          interfaceName: "tikhub:get_sec_user_id",
           headers: {
             Authorization: `Bearer ${apiToken}`,
           },
         },
       );
-      const secUserResponse = await secResp.json();
       const secUserId = secUserResponse?.data || secUserResponse?.sec_user_id;
 
       if (!secResp.ok || !secUserId) {
+        logger.warn("tikhub.item.failed", {
+          step: "get_sec_user_id",
+          status: secResp.status,
+          error: secUserResponse?.message || "Failed to resolve sec_user_id",
+        });
         results.push({
           url,
           secUserResponse,
@@ -109,15 +156,25 @@ app.post("/api/tikhub/batch", async (req, res) => {
         continue;
       }
 
-      const videosResp = await fetch(
-        `${baseUrl}/api/v1/douyin/app/v3/fetch_user_post_videos?sec_user_id=${encodeURIComponent(secUserId)}&count=20&max_cursor=0&sort_type=0`,
+      const videosEndpoint = `${baseUrl}/api/v1/douyin/app/v3/fetch_user_post_videos`;
+      const { response: videosResp, data: videosResponse } = await fetchJson(
+        appendQuery(videosEndpoint, {
+          sec_user_id: secUserId,
+          count: 20,
+          max_cursor: 0,
+          sort_type: 0,
+        }),
         {
+          timeoutMs: startupAgentConfig.requestTimeoutMs,
+          retries: Number.isFinite(apiRetryAttempts) ? apiRetryAttempts : 2,
+          retryBaseDelayMs: Number.isFinite(apiRetryBaseDelayMs) ? apiRetryBaseDelayMs : 500,
+          logger,
+          interfaceName: "tikhub:fetch_user_post_videos",
           headers: {
             Authorization: `Bearer ${apiToken}`,
           },
         },
       );
-      const videosResponse = await videosResp.json();
 
       const dataBlock = videosResponse?.data;
       const videosList = Array.isArray(dataBlock)
@@ -136,7 +193,17 @@ app.post("/api/tikhub/batch", async (req, res) => {
         videosResponse,
         error: videosResp.ok ? null : videosResponse?.message || "Failed to fetch videos",
       });
+      logger.info("tikhub.item.end", {
+        url: safeLink(sanitizedUrl),
+        secUserId,
+        videosCount: videosList.length,
+        error: videosResp.ok ? "" : videosResponse?.message || "Failed to fetch videos",
+      });
     } catch (error) {
+      logger.error("tikhub.item.error", {
+        url: safeLink(sanitizedUrl),
+        error: error instanceof Error ? error.message : "Request failed",
+      });
       results.push({
         url,
         error: error instanceof Error ? error.message : "Request failed",
@@ -144,63 +211,36 @@ app.post("/api/tikhub/batch", async (req, res) => {
     }
   }
 
+  logger.info("route.request.done", {
+    interface: "/api/tikhub/batch",
+    resultCount: results.length,
+    errorCount: results.filter(item => item?.error).length,
+  });
   return res.json({ results });
 });
 
-app.post("/api/coze/workflow/stream-run", async (req, res) => {
-  if (!cozeToken) {
-    return res.status(500).json({
-      error: "Missing COZE_API_TOKEN",
-    });
-  }
-
+app.post("/api/agent/workflow/stream-run", async (req, res) => {
+  const logger = createRequestLogger("api.agent.workflow.stream-run", req.headers["x-request-id"]);
+  const agentConfig = getContentAgentConfig();
   const body = {
     ...req.body,
-    workflow_id: req.body?.workflow_id || cozeWorkflowId,
+    workflow_id: req.body?.workflow_id || agentConfig.mainWorkflowId,
   };
 
-  if (!body.workflow_id) {
-    return res.status(400).json({
-      error: "workflow_id is required",
-    });
-  }
-
   if (body.bot_id && body.app_id) {
+    logger.warn("route.validation.error", { error: "bot_id and app_id cannot be specified together" });
     return res.status(400).json({
       error: "bot_id and app_id cannot be specified together",
     });
   }
 
-  try {
-    const response = await fetch(`${cozeBaseUrl}/v1/workflow/stream_run`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${cozeToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
+  logger.info("route.request.start", {
+    interface: "/api/agent/workflow/stream-run",
+    workflowId: body.workflow_id,
+    mode: "agent",
+  });
 
-    res.status(response.status);
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-
-    if (!response.body) {
-      return res.end("event: Error\ndata: {\"error_message\":\"No stream body\"}\n\n");
-    }
-
-    const stream = Readable.fromWeb(response.body);
-    stream.on("error", () => {
-      if (!res.writableEnded) {
-        res.end();
-      }
-    });
-    stream.pipe(res);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Request failed";
-    return res.status(500).json({ error: message });
-  }
+  return runContentAgentWorkflow(req, res, { body, config: agentConfig, logger });
 });
 
 app.post("/api/final-drafts", async (req, res) => {
@@ -210,6 +250,7 @@ app.post("/api/final-drafts", async (req, res) => {
     scriptDraft = "",
     rewriteDraft = "",
     translationDraft = "",
+    benchmarkVideos = [],
   } = req.body || {};
 
   try {
@@ -222,6 +263,7 @@ app.post("/api/final-drafts", async (req, res) => {
       scriptDraft: String(scriptDraft || ""),
       rewriteDraft: String(rewriteDraft || ""),
       translationDraft: String(translationDraft || ""),
+      benchmarkVideos: normalizeBenchmarkVideos(benchmarkVideos),
     };
 
     db.items = [item, ...(Array.isArray(db.items) ? db.items : [])].slice(0, 200);
@@ -281,27 +323,7 @@ app.delete("/api/final-drafts/:id", async (req, res) => {
 });
 
 app.post("/api/export/word", async (req, res) => {
-  const { titleDraft = "", hookDraft = "", scriptDraft = "", rewriteDraft = "", translationDraft = "" } = req.body || {};
-
-  const docText = [
-    "# 最终文案",
-    "",
-    "## 标题",
-    String(titleDraft || ""),
-    "",
-    "## 3 秒留存",
-    String(hookDraft || ""),
-    "",
-    "## 二创文案",
-    String(scriptDraft || ""),
-    "",
-    "## 风格转写结果",
-    String(rewriteDraft || ""),
-    "",
-    "## 中英翻译结果",
-    String(translationDraft || ""),
-    "",
-  ].join("\n");
+  const docText = buildFinalDraftMarkdown(req.body || {});
 
   res.setHeader("Content-Type", "application/msword; charset=utf-8");
   res.setHeader("Content-Disposition", `attachment; filename="final-copy-${Date.now()}.doc"`);
@@ -309,19 +331,7 @@ app.post("/api/export/word", async (req, res) => {
 });
 
 app.post("/api/export/excel", async (req, res) => {
-  const { titleDraft = "", hookDraft = "", scriptDraft = "", rewriteDraft = "", translationDraft = "" } = req.body || {};
-
-  const esc = (v) => `"${String(v || "").replace(/"/g, '""')}"`;
-  const rows = [
-    ["板块", "内容"],
-    ["标题", titleDraft],
-    ["3秒留存", hookDraft],
-    ["二创文案", scriptDraft],
-    ["风格转写结果", rewriteDraft],
-    ["中英翻译结果", translationDraft],
-  ];
-
-  const csv = rows.map(row => row.map(esc).join(",")).join("\n");
+  const csv = rowsToCsv(buildFinalDraftCsvRows(req.body || {}));
 
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
   res.setHeader("Content-Disposition", `attachment; filename="final-copy-${Date.now()}.csv"`);
@@ -337,28 +347,17 @@ app.post("/api/export/final-drafts/word", async (_req, res) => {
       return res.status(400).json({ success: false, error: "暂无可导出的已保存文案" });
     }
 
-    const sections = list.map((item, idx) => [
-      `# 任务 ${idx + 1}`,
-      `保存时间：${String(item?.createdAt || "")}`,
-      "",
-      "## 标题",
-      String(item?.titleDraft || ""),
-      "",
-      "## 3 秒留存",
-      String(item?.hookDraft || ""),
-      "",
-      "## 二创文案",
-      String(item?.scriptDraft || ""),
-      "",
-      "## 风格转写结果",
-      String(item?.rewriteDraft || ""),
-      "",
-      "## 中英翻译结果",
-      String(item?.translationDraft || ""),
-      "",
-      "---",
-      "",
-    ].join("\n"));
+    const sections = list.map((item, idx) => {
+      const body = buildFinalDraftMarkdown(item).replace(/^# 最终文案\n\n/, "");
+      return [
+        `# 任务 ${idx + 1}`,
+        `保存时间：${String(item?.createdAt || "")}`,
+        "",
+        body,
+        "---",
+        "",
+      ].join("\n");
+    });
 
     const docText = [
       "# 全部任务最终文案汇总",
@@ -387,21 +386,7 @@ app.post("/api/export/final-drafts/excel", async (_req, res) => {
       return res.status(400).json({ success: false, error: "暂无可导出的已保存文案" });
     }
 
-    const esc = (v) => `"${String(v || "").replace(/"/g, '""')}"`;
-    const rows = [
-      ["序号", "保存时间", "标题", "3秒留存", "二创文案", "风格转写结果", "中英翻译结果"],
-      ...list.map((item, idx) => [
-        String(idx + 1),
-        String(item?.createdAt || ""),
-        String(item?.titleDraft || ""),
-        String(item?.hookDraft || ""),
-        String(item?.scriptDraft || ""),
-        String(item?.rewriteDraft || ""),
-        String(item?.translationDraft || ""),
-      ]),
-    ];
-
-    const csv = rows.map(row => row.map(esc).join(",")).join("\n");
+    const csv = rowsToCsv(buildDraftListCsvRows(list));
 
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="final-drafts-all-${Date.now()}.csv"`);
@@ -415,88 +400,132 @@ app.post("/api/export/final-drafts/excel", async (_req, res) => {
 });
 
 app.post("/api/export/feishu", async (req, res) => {
-  const { titleDraft = "", hookDraft = "", scriptDraft = "", rewriteDraft = "", translationDraft = "" } = req.body || {};
-
-  const markdown = [
-    "# 最终文案",
-    "",
-    "## 标题",
-    String(titleDraft || ""),
-    "",
-    "## 3 秒留存",
-    String(hookDraft || ""),
-    "",
-    "## 二创文案",
-    String(scriptDraft || ""),
-    "",
-    "## 风格转写结果",
-    String(rewriteDraft || ""),
-    "",
-    "## 中英翻译结果",
-    String(translationDraft || ""),
-  ].join("\n");
-
-  return res.json({
-    success: true,
-    message: "已生成可用于飞书文档的 Markdown 内容",
-    markdown,
+  const logger = createRequestLogger("api.export.feishu", req.headers["x-request-id"]);
+  logger.info("route.request.start", {
+    interface: "/api/export/feishu",
+    mode: "docx.write",
   });
-});
-
-app.post("/api/coze/workflows/chat", async (req, res) => {
-  if (!cozeToken) {
-    return res.status(500).json({
-      error: "Missing COZE_API_TOKEN",
-    });
-  }
-
-  const body = { ...req.body };
-
-  if (!body.workflow_id) {
-    return res.status(400).json({ error: "workflow_id is required" });
-  }
-
-  if (!Array.isArray(body.additional_messages) || body.additional_messages.length === 0) {
-    return res.status(400).json({ error: "additional_messages must be a non-empty array" });
-  }
-
-  if (typeof body.parameters !== "object" || body.parameters == null) {
-    body.parameters = {};
-  }
-
-  if (body.app_id && body.bot_id) {
-    return res.status(400).json({ error: "app_id and bot_id cannot be specified together" });
-  }
 
   try {
-    const response = await fetch(`${cozeBaseUrl}/v1/workflows/chat`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${cozeToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
+    const result = await writeFinalDraftToFeishu(req.body || {}, { logger });
+    logger.info("route.request.done", {
+      interface: "/api/export/feishu",
+      documentId: result.documentId,
+      blocksCreated: result.blocksCreated,
     });
-
-    res.status(response.status);
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-
-    if (!response.body) {
-      return res.end("event: error\ndata: {\"msg\":\"No stream body\"}\n\n");
-    }
-
-    const stream = Readable.fromWeb(response.body);
-    stream.on("error", () => {
-      if (!res.writableEnded) {
-        res.end();
-      }
+    return res.json({
+      success: true,
+      message: "已写入飞书文档",
+      ...result,
     });
-    stream.pipe(res);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Request failed";
-    return res.status(500).json({ error: message });
+    const message = error instanceof Error ? error.message : "Feishu export failed";
+    logger.error("route.request.error", {
+      interface: "/api/export/feishu",
+      code: error?.code,
+      error: message,
+    });
+    return res.status(error?.status || 500).json({
+      success: false,
+      error: message,
+      code: error?.code,
+      markdown: buildFinalDraftMarkdown(req.body || {}),
+    });
+  }
+});
+
+app.post("/api/export/bitable", async (req, res) => {
+  const logger = createRequestLogger("api.export.bitable", req.headers["x-request-id"]);
+  logger.info("route.request.start", {
+    interface: "/api/export/bitable",
+    mode: "bitable.write",
+  });
+
+  try {
+    const result = await writeFinalDraftToFeishuBitable(req.body || {}, { logger });
+    logger.info("route.request.done", {
+      interface: "/api/export/bitable",
+      appToken: result.appToken,
+      tableId: result.tableId,
+      recordCount: result.recordCount,
+      recordsCreated: result.recordsCreated,
+      appCreated: result.appCreated,
+      tableCreated: result.tableCreated,
+      fieldsCreated: result.fieldsCreated,
+    });
+    return res.json({
+      success: true,
+      message: "已写入飞书多维表格",
+      ...result,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Feishu bitable export failed";
+    logger.error("route.request.error", {
+      interface: "/api/export/bitable",
+      code: error?.code,
+      error: message,
+    });
+    return res.status(error?.status || 500).json({
+      success: false,
+      error: message,
+      code: error?.code,
+    });
+  }
+});
+
+app.post("/api/agent/translation", async (req, res) => {
+  const logger = createRequestLogger("api.agent.translation", req.headers["x-request-id"]);
+  const payload = req.body?.payload || req.body || {};
+  logger.info("route.request.start", {
+    interface: "/api/agent/translation",
+    titleCount: Array.isArray(payload?.titles) ? payload.titles.length : 0,
+    hookCount: Array.isArray(payload?.hooks) ? payload.hooks.length : 0,
+    scriptCount: Array.isArray(payload?.scripts) ? payload.scripts.length : 0,
+  });
+
+  try {
+    const result = await runTranslationAgent(payload, getContentAgentConfig(), { logger });
+    logger.info("route.request.done", {
+      interface: "/api/agent/translation",
+      resultCount: Array.isArray(result?.translations) ? result.translations.length : 0,
+    });
+    return res.json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Translation failed";
+    logger.error("route.request.error", {
+      interface: "/api/agent/translation",
+      code: error?.code,
+      error: message,
+    });
+    return res.status(error?.status || 500).json({ error: message, code: error?.code });
+  }
+});
+
+app.post("/api/agent/rewrite", async (req, res) => {
+  const logger = createRequestLogger("api.agent.rewrite", req.headers["x-request-id"]);
+  const scripts = Array.isArray(req.body?.scripts) ? req.body.scripts : [];
+  const targetPlatform = String(req.body?.targetPlatform || req.body?.target_platform || "douyin");
+  logger.info("route.request.start", {
+    interface: "/api/agent/rewrite",
+    targetPlatform,
+    scriptCount: scripts.length,
+  });
+
+  try {
+    const result = await runRewriteAgent({ targetPlatform, scripts }, getContentAgentConfig(), { logger });
+    logger.info("route.request.done", {
+      interface: "/api/agent/rewrite",
+      resultCount: Array.isArray(result?.results) ? result.results.length : 0,
+    });
+    return res.json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Rewrite failed";
+    logger.error("route.request.error", {
+      interface: "/api/agent/rewrite",
+      code: error?.code,
+      error: message,
+    });
+    return res.status(error?.status || 500).json({ error: message, code: error?.code });
   }
 });
 

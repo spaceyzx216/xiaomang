@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router";
-import { apiUrl } from "./api";
+import { apiUrl, fetchWithRetry } from "./api";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Badge } from "./components/ui/badge";
 import { Checkbox } from "./components/ui/checkbox";
@@ -13,13 +13,36 @@ import {
   AccordionTrigger,
 } from "./components/ui/accordion";
 import { Loader2, FileText, Layers, CheckCircle2, Sparkles, ChevronLeft, ChevronRight, Download } from "lucide-react";
+import { clearCachedFinalDrafts, readCachedFinalDrafts } from "./finalDraftCache";
 
 type TopicLike = {
   id?: string;
   title?: string;
   authorName?: string;
   link?: string;
+  stats?: {
+    comments?: number;
+    likes?: number;
+    shares?: number;
+    bookmarks?: number;
+  };
+  publishDate?: string;
+  hotTopics?: string[];
   rawData?: any;
+};
+
+type BenchmarkVideo = {
+  title: string;
+  link: string;
+  coverUrl: string;
+  durationSeconds: number;
+  authorName: string;
+  publishDate: string;
+  likes: number;
+  comments: number;
+  shares: number;
+  bookmarks: number;
+  hotTopics: string[];
 };
 
 type WorkflowHook = {
@@ -38,6 +61,10 @@ type WorkflowResultGroup = {
   id: string;
   shareLink: string;
   result: WorkflowResult;
+};
+
+type RunWorkflowOptions = {
+  force?: boolean;
 };
 
 type TranslationItem = {
@@ -106,6 +133,52 @@ const extractQuotedTitle = (line: string) => {
   return match?.[1]?.trim() || "";
 };
 
+const splitInlineTitleDetail = (value: string) => {
+  const text = normalizeTitleLine(value);
+  const detailStart = text.search(/(?:类型|优势|技巧)[:：]|【/);
+  if (detailStart < 0) return { title: text.trim(), rest: "" };
+  return {
+    title: text.slice(0, detailStart).trim(),
+    rest: text.slice(detailStart).trim(),
+  };
+};
+
+const normalizeTitleType = (value: string) =>
+  normalizeTitleLine(value)
+    .replace(/[+＋/|]/g, "、")
+    .replace(/\s*、\s*/g, "、")
+    .replace(/^类型[:：]\s*/, "")
+    .replace(/[。；;，,]\s*$/, "")
+    .trim();
+
+const readInlineField = (text: string, label: "类型" | "优势" | "技巧") => {
+  const pattern = new RegExp(`${label}[:：]\\s*([\\s\\S]*?)(?=(?:类型|优势|技巧)[:：]|$)`);
+  const matched = text.match(pattern)?.[1] || "";
+  return normalizeTitleLine(matched)
+    .replace(/[。；;]\s*$/, "")
+    .trim();
+};
+
+const parseTitleStartLine = (line: string) => {
+  const normalized = normalizeTitleLine(line)
+    .replace(/^\d+\s*[\.、]?\s*/, "")
+    .replace(/^标题[:：]\s*/, "")
+    .replace(/^标题\s*/, "")
+    .trim();
+  const quoted = extractQuotedTitle(normalized);
+  const closeIndex = normalized.indexOf("》");
+  const restAfterQuote = quoted && closeIndex >= 0 ? normalized.slice(closeIndex + 1).trim() : "";
+  const split = quoted ? { title: quoted, rest: restAfterQuote } : splitInlineTitleDetail(normalized);
+  const bracketType = split.rest.match(/【([^】]+)】/)?.[1] || "";
+
+  return {
+    title: split.title.replace(/^《?\s*/, "").replace(/\s*》?$/, "").trim(),
+    type: normalizeTitleType(readInlineField(split.rest, "类型") || bracketType),
+    advantage: readInlineField(split.rest, "优势"),
+    skill: readInlineField(split.rest, "技巧"),
+  };
+};
+
 const parseTitleBlocks = (titleText: string) => {
   const lines = splitByLine(titleText)
     .map(normalizeTitleLine)
@@ -125,26 +198,23 @@ const parseTitleBlocks = (titleText: string) => {
 
     if (isBlockStart) {
       pushCurrent();
-      current = { title: "", type: "", advantage: "", skill: "" };
-
-      const explicitTitle = extractQuotedTitle(line);
-      current.title = explicitTitle || line
-        .replace(/^\d+\s*[\.、]?\s*/, "")
-        .replace(/^标题[:：]\s*/, "")
-        .trim();
+      current = parseTitleStartLine(line);
       continue;
     }
 
     if (!current) continue;
 
     if (/^\*?\*?标题\*?\*?[:：]/.test(line)) {
-      const explicitTitle = extractQuotedTitle(line);
-      current.title = explicitTitle || line.replace(/^\*?\*?标题\*?\*?[:：]\s*/, "").trim();
+      const parsed = parseTitleStartLine(line.replace(/^\*?\*?标题\*?\*?[:：]\s*/, ""));
+      current.title = parsed.title || current.title;
+      current.type ||= parsed.type;
+      current.advantage ||= parsed.advantage;
+      current.skill ||= parsed.skill;
       continue;
     }
 
     if (/^\*?\*?类型\*?\*?[:：]/.test(line)) {
-      current.type = line.replace(/^\*?\*?类型\*?\*?[:：]\s*/, "").trim();
+      current.type = normalizeTitleType(line.replace(/^\*?\*?类型\*?\*?[:：]\s*/, ""));
       continue;
     }
 
@@ -175,6 +245,8 @@ const parseTitleBlocks = (titleText: string) => {
 
 const extractTitleLabel = (titleBlock: string) => {
   const firstLine = normalizeTitleLine(splitByLine(titleBlock)[0] || "");
+  const parsed = parseTitleStartLine(firstLine);
+  if (parsed.title) return parsed.title;
   const quoted = extractQuotedTitle(firstLine);
   if (quoted) return quoted;
   return firstLine
@@ -183,6 +255,23 @@ const extractTitleLabel = (titleBlock: string) => {
     .replace(/^《?\s*/, "")
     .replace(/\s*》?$/, "")
     .trim();
+};
+
+const formatTitleDisplay = (titleBlock: string) => {
+  const lines = splitByLine(titleBlock);
+  const firstLine = normalizeTitleLine(lines[0] || "");
+  const parsed = parseTitleStartLine(firstLine);
+  const fallbackLabel = extractTitleLabel(titleBlock);
+  const inlineDetailLines = [
+    parsed.type ? `类型：${parsed.type}` : "",
+    parsed.advantage ? `优势：${parsed.advantage}` : "",
+    parsed.skill ? `技巧：${parsed.skill}` : "",
+  ].filter(Boolean);
+
+  return {
+    titleLabel: parsed.title || fallbackLabel || titleBlock,
+    detailLines: lines.length > 1 ? lines.slice(1) : inlineDetailLines,
+  };
 };
 
 const getTopicShareLink = (topic: TopicLike) => {
@@ -194,6 +283,206 @@ const getTopicShareLink = (topic: TopicLike) => {
     topic?.link ||
     ""
   );
+};
+
+const toNumber = (value: any) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+};
+
+const readStat = (topic: TopicLike, statKey: keyof NonNullable<TopicLike["stats"]>, rawKeys: string[]) => {
+  const rawData = topic?.rawData || {};
+  const statBlocks = [
+    topic?.stats,
+    rawData?.statistics,
+    rawData?.stats,
+    rawData?.statistics_data,
+    rawData?.status,
+  ].filter(Boolean);
+
+  for (const block of statBlocks) {
+    const direct = (block as any)?.[statKey];
+    if (direct !== undefined && direct !== null) return toNumber(direct);
+    for (const key of rawKeys) {
+      const value = (block as any)?.[key];
+      if (value !== undefined && value !== null) return toNumber(value);
+    }
+  }
+  return 0;
+};
+
+const normalizePublishDate = (value: any) => {
+  if (!value) return "";
+  if (typeof value === "number" || /^\d+$/.test(String(value))) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) return "";
+    const ms = numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+    return new Date(ms).toISOString().slice(0, 10);
+  }
+  return String(value);
+};
+
+const firstHttpUrl = (...values: any[]): string => {
+  for (const value of values) {
+    if (Array.isArray(value)) {
+      const nested = firstHttpUrl(...value);
+      if (nested) return nested;
+      continue;
+    }
+    if (value && typeof value === "object") {
+      const nested = firstHttpUrl(value.url_list, value.url, value.uri);
+      if (nested) return nested;
+      continue;
+    }
+    const text = String(value || "").trim();
+    if (/^https?:\/\//i.test(text)) return text;
+  }
+  return "";
+};
+
+const normalizeDurationSeconds = (...values: any[]): number => {
+  for (const value of values) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) continue;
+    return Math.round(parsed > 10000 ? parsed / 1000 : parsed);
+  }
+  return 0;
+};
+
+const buildBenchmarkVideos = (topics: TopicLike[]): BenchmarkVideo[] => {
+  return topics.map((topic) => {
+    const rawData = topic?.rawData || {};
+    return {
+      title: String(topic?.title || rawData?.desc || rawData?.title || "未命名选题"),
+      link: getTopicShareLink(topic),
+      coverUrl: firstHttpUrl(
+        (topic as any)?.coverUrl,
+        (topic as any)?.cover,
+        rawData?.cover,
+        rawData?.cover_url,
+        rawData?.video?.cover,
+        rawData?.video?.origin_cover,
+        rawData?.video?.dynamic_cover,
+        rawData?.video?.animated_cover,
+      ),
+      durationSeconds: normalizeDurationSeconds(
+        (topic as any)?.durationSeconds,
+        (topic as any)?.duration,
+        rawData?.duration,
+        rawData?.video_duration,
+        rawData?.video?.duration,
+        rawData?.video?.duration_ms,
+      ),
+      authorName: String(topic?.authorName || rawData?.author?.nickname || rawData?.author_name || "未知"),
+      publishDate: normalizePublishDate(topic?.publishDate || rawData?.create_time || rawData?.createTime),
+      likes: readStat(topic, "likes", ["digg_count", "like_count", "likes"]),
+      comments: readStat(topic, "comments", ["comment_count", "comments"]),
+      shares: readStat(topic, "shares", ["share_count", "shares"]),
+      bookmarks: readStat(topic, "bookmarks", ["collect_count", "favorite_count", "bookmark_count", "bookmarks"]),
+      hotTopics: Array.isArray(topic?.hotTopics) ? topic.hotTopics : [],
+    };
+  });
+};
+
+const sameLink = (a?: string, b?: string) => {
+  const left = String(a || "").trim();
+  const right = String(b || "").trim();
+  if (!left || !right) return false;
+  return left === right;
+};
+
+const hasWorkflowResult = (group?: WorkflowResultGroup | null) => {
+  const result = group?.result;
+  return Boolean(
+    result &&
+      ((Array.isArray(result.titles) && result.titles.length > 0) ||
+        (Array.isArray(result.hooks) && result.hooks.length > 0) ||
+        (Array.isArray(result.scripts) && result.scripts.length > 0)),
+  );
+};
+
+const pickReusableWorkflowGroups = (links: string[], groups: WorkflowResultGroup[]) => {
+  const used = new Set<number>();
+  return links
+    .map((link, index) => {
+      const groupIndex = groups.findIndex((group, candidateIndex) =>
+        !used.has(candidateIndex) && sameLink(group.shareLink, link) && hasWorkflowResult(group),
+      );
+      if (groupIndex < 0) return null;
+      used.add(groupIndex);
+      return {
+        ...groups[groupIndex],
+        id: `link-${index + 1}`,
+        shareLink: link,
+      };
+    })
+    .filter(Boolean) as WorkflowResultGroup[];
+};
+
+const orderWorkflowGroupsByLinks = (links: string[], groups: WorkflowResultGroup[]) => {
+  const used = new Set<number>();
+  return links
+    .map((link, index) => {
+      const groupIndex = groups.findIndex((group, candidateIndex) =>
+        !used.has(candidateIndex) && sameLink(group.shareLink, link) && hasWorkflowResult(group),
+      );
+      if (groupIndex < 0) return null;
+      used.add(groupIndex);
+      return {
+        ...groups[groupIndex],
+        id: `link-${index + 1}`,
+        shareLink: link,
+      };
+    })
+    .filter(Boolean) as WorkflowResultGroup[];
+};
+
+const formatMetric = (value: number) => {
+  if (value >= 10000) return `${(value / 10000).toFixed(1)}万`;
+  return String(value || 0);
+};
+
+const formatBenchmarkVideo = (item: BenchmarkVideo, index: number) => [
+  `对标视频 ${index + 1}`,
+  `标题：${item.title || "未命名选题"}`,
+  `链接：${item.link || "未提供"}`,
+  `作者：${item.authorName || "未知"}`,
+  item.publishDate ? `发布时间：${item.publishDate}` : "",
+  `数据：点赞 ${formatMetric(item.likes)} / 评论 ${formatMetric(item.comments)} / 转发 ${formatMetric(item.shares)} / 收藏 ${formatMetric(item.bookmarks)}`,
+  item.hotTopics.length > 0 ? `热词：${item.hotTopics.join("、")}` : "",
+].filter(Boolean).join("\n");
+
+const formatBenchmarkSummary = (items: BenchmarkVideo[]) => {
+  if (!Array.isArray(items) || items.length === 0) return "";
+  return items.map(formatBenchmarkVideo).join("\n\n");
+};
+
+type BitableBinding = {
+  targetUrl?: string;
+  appToken?: string;
+  tableId?: string;
+  tableName?: string;
+  bitableUrl?: string;
+};
+
+const bitableTaskKey = (task: any) => {
+  const raw = String(task?._id || task?.customerName || "default").trim() || "default";
+  return `xiaomang.feishuBitable.${raw}`;
+};
+
+const readBitableBinding = (key: string): BitableBinding => {
+  if (typeof localStorage === "undefined") return {};
+  try {
+    const parsed = JSON.parse(localStorage.getItem(key) || "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+};
+
+const writeBitableBinding = (key: string, value: BitableBinding) => {
+  if (typeof localStorage === "undefined") return;
+  localStorage.setItem(key, JSON.stringify(value));
 };
 
 const parseWorkflowPayload = (payloadText: string): WorkflowResult => {
@@ -483,10 +772,12 @@ export default function ContentPage() {
   const [pendingDraftCount, setPendingDraftCount] = useState(0);
   const [batchExportLoading, setBatchExportLoading] = useState(false);
   const [batchExportMessage, setBatchExportMessage] = useState<string | null>(null);
+  const [bitableTargetUrl, setBitableTargetUrl] = useState("");
 
   const workflowInFlightRef = useRef(false);
   const workflowRunIdRef = useRef(0);
   const workflowAbortControllerRef = useRef<AbortController | null>(null);
+  const autoRunKeyRef = useRef("");
 
   const [rewriteEnabled, setRewriteEnabled] = useState(false);
   const [rewriteLoading, setRewriteLoading] = useState(false);
@@ -501,6 +792,19 @@ export default function ContentPage() {
   const selectedTopics = loadJson<TopicLike[]>("selectedTopics", []);
   const contentTasks = loadJson<any[]>("contentTasks", []);
   const activeTask = contentTasks?.[0];
+  const bitableBindingKey = useMemo(() => bitableTaskKey(activeTask), [activeTask?._id, activeTask?.customerName]);
+  const [cachedBitableBinding, setCachedBitableBinding] = useState<BitableBinding>(() => readBitableBinding(bitableTaskKey(activeTask)));
+  const taskTableName = [
+    activeTask?.customerName,
+    activeTask?.platformName,
+    "选题复盘",
+  ].filter(Boolean).join(" - ") || "选题复盘";
+
+  useEffect(() => {
+    const binding = readBitableBinding(bitableBindingKey);
+    setCachedBitableBinding(binding);
+    setBitableTargetUrl(binding.targetUrl || binding.bitableUrl || "");
+  }, [bitableBindingKey]);
 
   const shareLinks = useMemo(() => {
     return selectedTopics
@@ -512,6 +816,11 @@ export default function ContentPage() {
   const shareLinksText = useMemo(() => shareLinks.join("\n"), [shareLinks]);
   const activeGroup = workflowGroups[activeGroupIndex] || null;
   const workflowResult = activeGroup?.result || fallbackResult;
+  const benchmarkVideos = useMemo(() => buildBenchmarkVideos(selectedTopics), [selectedTopics]);
+  const activeBenchmarkVideos = useMemo(() => {
+    const matched = benchmarkVideos.filter(item => sameLink(item.link, activeGroup?.shareLink));
+    return matched.length > 0 ? matched : benchmarkVideos;
+  }, [benchmarkVideos, activeGroup?.shareLink]);
 
   const toggleSelection = (value: string, list: string[], setList: (v: string[]) => void) => {
     setList(list.includes(value) ? list.filter(item => item !== value) : [...list, value]);
@@ -574,13 +883,14 @@ export default function ContentPage() {
   }, [activeGroupIndex]);
 
   const refreshPendingDraftCount = async () => {
+    const cachedCount = readCachedFinalDrafts().length;
     try {
-      const response = await fetch(apiUrl("/api/final-drafts"));
+      const response = await fetchWithRetry(apiUrl("/api/final-drafts"));
       const data = await response.json();
       const list = Array.isArray(data?.items) ? data.items : [];
-      setPendingDraftCount(list.length);
+      setPendingDraftCount(Math.max(list.length, cachedCount));
     } catch {
-      setPendingDraftCount(0);
+      setPendingDraftCount(cachedCount);
     }
   };
 
@@ -721,88 +1031,35 @@ export default function ContentPage() {
     setTranslationItems([]);
 
     try {
-      const response = await fetch(apiUrl("/api/coze/workflow/stream-run"), {
+      const response = await fetchWithRetry(apiUrl("/api/agent/translation"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          workflow_id: "7619219558927253550",
-          parameters: {
-            input: JSON.stringify(payloadForTranslation),
-            content: JSON.stringify(payloadForTranslation),
-            selected_titles: payloadForTranslation.titles.join("\n"),
-            selected_hooks: payloadForTranslation.hooks.join("\n"),
-            selected_scripts: payloadForTranslation.scripts.join("\n\n"),
-          },
+          payload: payloadForTranslation,
         }),
       });
 
-      if (!response.ok || !response.body) {
+      if (!response.ok) {
         const t = await response.text();
         throw new Error(t || `HTTP ${response.status}`);
       }
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-      let buffer = "";
-      let donePayload = "";
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const chunks = buffer.split("\n\n");
-        buffer = chunks.pop() || "";
-
-        for (const chunk of chunks) {
-          const lines = chunk.split("\n");
-          let event = "";
-          let dataLine = "";
-
-          for (const line of lines) {
-            if (line.startsWith("event:")) event = line.slice(6).trim();
-            if (line.startsWith("data:")) dataLine += line.slice(5).trim();
-          }
-
-          if (!event) continue;
-
-          let data: any = {};
-          try {
-            data = dataLine ? JSON.parse(dataLine) : {};
-          } catch {
-            data = { raw: dataLine };
-          }
-
-          if (event === "Message") {
-            const content = String(data?.content || "");
-            if (content) {
-              setTranslationPreview(prev => prev + content);
-              donePayload = content;
-            }
-          }
-
-          if (event === "Error") {
-            throw new Error(data?.error_message || "翻译工作流执行失败");
-          }
-
-          if (event === "Done") {
-            const payloadText = donePayload || translationPreview;
-            const parsed = parseTranslationPayload(payloadText, payloadForTranslation)
-              .map((item) => {
-                const translatedOnly = String(item.translated || item.en || "").trim();
-                return {
-                  ...item,
-                  translated: translatedOnly,
-                  en: translatedOnly,
-                };
-              })
-              .filter((item) => String(item.translated || "").trim().length > 0);
-            setTranslationItems(parsed);
-          }
-        }
-      }
+      const data = await response.json();
+      const payloadText = JSON.stringify(data, null, 2);
+      setTranslationPreview(payloadText);
+      const parsed = parseTranslationPayload(payloadText, payloadForTranslation)
+        .map((item) => {
+          const translatedOnly = String(item.translated || item.en || "").trim();
+          return {
+            ...item,
+            translated: translatedOnly,
+            en: translatedOnly,
+          };
+        })
+        .filter((item) => String(item.translated || "").trim().length > 0);
+      setTranslationItems(parsed);
     } catch (error) {
       const message = error instanceof Error ? error.message : "翻译工作流执行失败";
       setTranslationError(message);
@@ -828,100 +1085,27 @@ export default function ContentPage() {
     setRewriteResults([]);
 
     try {
-      const systemPrompt = `你是资深新媒体编辑，请将用户给出的文案改写为${rewriteTarget}平台风格。输出必须是JSON：{"results":[{"id":"...","rewritten":"..."}]}`;
       const inputPayload = selectedRewriteScripts.map(item => ({ id: item.id, text: item.content }));
 
-      const response = await fetch(apiUrl("/api/coze/workflows/chat"), {
+      const response = await fetchWithRetry(apiUrl("/api/agent/rewrite"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          workflow_id: "7580278982190874675",
-          additional_messages: [
-            {
-              role: "user",
-              content_type: "text",
-              content: JSON.stringify({
-                task: "rewrite",
-                target_platform: rewriteTarget,
-                scripts: inputPayload,
-              }),
-            },
-          ],
-          parameters: {
-            SYSTEM_PROMPT: systemPrompt,
-          },
-          connector_id: "1024",
+          targetPlatform: rewriteTarget,
+          scripts: inputPayload,
         }),
       });
 
-      if (!response.ok || !response.body) {
+      if (!response.ok) {
         const t = await response.text();
         throw new Error(t || `HTTP ${response.status}`);
       }
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-      let buffer = "";
-      let finalAnswer = "";
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const chunks = buffer.split("\n\n");
-        buffer = chunks.pop() || "";
-
-        for (const chunk of chunks) {
-          const lines = chunk.split("\n");
-          let event = "";
-          let dataLine = "";
-
-          for (const line of lines) {
-            if (line.startsWith("event:")) event = line.slice(6).trim();
-            if (line.startsWith("data:")) dataLine += line.slice(5).trim();
-          }
-
-          if (!event) continue;
-
-          let data: any = {};
-          try {
-            data = dataLine ? JSON.parse(dataLine) : {};
-          } catch {
-            data = { raw: dataLine };
-          }
-
-          if (event === "conversation.message.delta" && data?.type === "answer") {
-            const part = String(data?.content || "");
-            if (part) {
-              setRewritePreview(prev => prev + part);
-              finalAnswer += part;
-            }
-          }
-
-          if (event === "conversation.message.completed" && data?.type === "answer") {
-            finalAnswer = String(data?.content || finalAnswer || "");
-          }
-
-          if (event === "conversation.chat.failed" || event === "error") {
-            throw new Error(data?.msg || data?.error_message || "转写对话流执行失败");
-          }
-        }
-      }
-
-      const answerText = String(finalAnswer || "").trim();
-      const startIdx = answerText.indexOf("{");
-      const endIdx = answerText.lastIndexOf("}");
-      const jsonText = startIdx >= 0 && endIdx > startIdx ? answerText.slice(startIdx, endIdx + 1) : answerText;
-
-      let parsed: any = null;
-      try {
-        parsed = JSON.parse(jsonText);
-      } catch {
-        parsed = null;
-      }
+      const parsed = await response.json();
+      const answerText = JSON.stringify(parsed, null, 2);
+      setRewritePreview(answerText);
 
       if (Array.isArray(parsed?.results)) {
         const mapped = parsed.results
@@ -987,76 +1171,182 @@ export default function ContentPage() {
   };
 
   const clearAllPendingDrafts = async () => {
-    const resp = await fetch(apiUrl("/api/final-drafts"), { method: "DELETE" });
-    if (!resp.ok) {
-      const text = await resp.text();
-      throw new Error(text || `清空待导出文案失败（HTTP ${resp.status}）`);
+    try {
+      const resp = await fetchWithRetry(apiUrl("/api/final-drafts"), { method: "DELETE" });
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error(text || `清空待导出文案失败（HTTP ${resp.status}）`);
+      }
+    } finally {
+      clearCachedFinalDrafts();
     }
   };
 
-  const exportAllPendingDrafts = async (format: "word" | "excel") => {
+  const readPendingDraftItems = async () => {
+    try {
+      const draftResp = await fetchWithRetry(apiUrl("/api/final-drafts"));
+      const draftData = await draftResp.json();
+      const list = Array.isArray(draftData?.items) ? draftData.items : [];
+      if (list.length > 0) return list;
+    } catch {
+      // fall back to browser cache below
+    }
+    return readCachedFinalDrafts();
+  };
+
+  const buildCombinedDraft = (items: any[]) => ({
+    titleDraft: items.map((item, idx) => `【选题 ${idx + 1}】\n${String(item?.titleDraft || "")}`).join("\n\n"),
+    hookDraft: items.map((item, idx) => `【选题 ${idx + 1}】\n${String(item?.hookDraft || "")}`).join("\n\n"),
+    scriptDraft: items.map((item, idx) => `【选题 ${idx + 1}】\n${String(item?.scriptDraft || "")}`).join("\n\n"),
+    rewriteDraft: items.map((item, idx) => `【选题 ${idx + 1}】\n${String(item?.rewriteDraft || "")}`).join("\n\n"),
+    translationDraft: items.map((item, idx) => `【选题 ${idx + 1}】\n${String(item?.translationDraft || "")}`).join("\n\n"),
+    benchmarkVideos: items.flatMap(item => Array.isArray(item?.benchmarkVideos) ? item.benchmarkVideos : []),
+    taskInfo: items.find(item => item?.taskInfo)?.taskInfo || {
+      id: String(activeTask?._id || ""),
+      customerName: String(activeTask?.customerName || ""),
+      ownerName: String(activeTask?.ownerName || ""),
+      platformName: String(activeTask?.platformName || ""),
+      contentDirection: String(activeTask?.contentDirection || ""),
+    },
+  });
+
+  const exportAllPendingDrafts = async (format: "word" | "excel" | "feishu" | "bitable") => {
     setBatchExportLoading(true);
     setBatchExportMessage(null);
+
+    const exportItemsLocally = (items: any[]) => {
+      if (items.length === 0) throw new Error("暂无可导出的已保存文案");
+
+      if (format === "excel") {
+        const esc = (v: any) => `"${String(v || "").replace(/"/g, '""')}"`;
+        const rows = [
+          ["序号", "保存时间", "对标选题视频", "标题", "3秒留存", "二创文案", "风格转写结果", "中英翻译结果"],
+          ...items.map((item: any, idx: number) => [
+            String(idx + 1),
+            String(item?.createdAt || ""),
+            formatBenchmarkSummary(Array.isArray(item?.benchmarkVideos) ? item.benchmarkVideos : []),
+            String(item?.titleDraft || ""),
+            String(item?.hookDraft || ""),
+            String(item?.scriptDraft || ""),
+            String(item?.rewriteDraft || ""),
+            String(item?.translationDraft || ""),
+          ]),
+        ];
+        const csv = rows.map((row: string[]) => row.map(esc).join(",")).join("\n");
+        triggerDownload(new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" }), `final-drafts-all-${Date.now()}.csv`);
+        return;
+      }
+
+      const text = [
+        "# 全部任务最终文案汇总",
+        `共 ${items.length} 份`,
+        "",
+        ...items.map((item: any, idx: number) => [
+          `# 任务 ${idx + 1}`,
+          `保存时间：${String(item?.createdAt || "")}`,
+          "",
+          "## 对标选题视频",
+          formatBenchmarkSummary(Array.isArray(item?.benchmarkVideos) ? item.benchmarkVideos : []) || "未提供",
+          "",
+          "## 标题",
+          String(item?.titleDraft || ""),
+          "",
+          "## 3 秒留存",
+          String(item?.hookDraft || ""),
+          "",
+          "## 二创文案",
+          String(item?.scriptDraft || ""),
+          "",
+          "## 风格转写结果",
+          String(item?.rewriteDraft || ""),
+          "",
+          "## 中英翻译结果",
+          String(item?.translationDraft || ""),
+          "",
+          "---",
+          "",
+        ].join("\n")),
+      ].join("\n");
+      triggerDownload(new Blob([text], { type: "application/msword;charset=utf-8" }), `final-drafts-all-${Date.now()}.doc`);
+    };
+
     try {
-      const response = await fetch(
-        apiUrl(format === "word" ? "/api/export/final-drafts/word" : "/api/export/final-drafts/excel"),
-        { method: "POST" },
-      );
+      const items = await readPendingDraftItems();
+      if (items.length === 0) throw new Error("暂无可导出的已保存文案");
 
-      if (response.status === 404) {
-        const draftResp = await fetch(apiUrl("/api/final-drafts"));
-        const draftData = await draftResp.json();
-        const items = Array.isArray(draftData?.items) ? draftData.items : [];
-        if (items.length === 0) throw new Error("暂无可导出的已保存文案");
-
-        if (format === "excel") {
-          const esc = (v: any) => `"${String(v || "").replace(/"/g, '""')}"`;
-          const rows = [
-            ["序号", "保存时间", "标题", "3秒留存", "二创文案", "风格转写结果", "中英翻译结果"],
-            ...items.map((item: any, idx: number) => [
-              String(idx + 1),
-              String(item?.createdAt || ""),
-              String(item?.titleDraft || ""),
-              String(item?.hookDraft || ""),
-              String(item?.scriptDraft || ""),
-              String(item?.rewriteDraft || ""),
-              String(item?.translationDraft || ""),
-            ]),
-          ];
-          const csv = rows.map((row: string[]) => row.map(esc).join(",")).join("\n");
-          triggerDownload(new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" }), `final-drafts-all-${Date.now()}.csv`);
-        } else {
-          const text = [
-            "# 全部任务最终文案汇总",
-            `共 ${items.length} 份`,
-            "",
-            ...items.map((item: any, idx: number) => [
-              `# 任务 ${idx + 1}`,
-              `保存时间：${String(item?.createdAt || "")}`,
-              "",
-              "## 标题",
-              String(item?.titleDraft || ""),
-              "",
-              "## 3 秒留存",
-              String(item?.hookDraft || ""),
-              "",
-              "## 二创文案",
-              String(item?.scriptDraft || ""),
-              "",
-              "## 风格转写结果",
-              String(item?.rewriteDraft || ""),
-              "",
-              "## 中英翻译结果",
-              String(item?.translationDraft || ""),
-              "",
-              "---",
-              "",
-            ].join("\n")),
-          ].join("\n");
-          triggerDownload(new Blob([text], { type: "application/msword;charset=utf-8" }), `final-drafts-all-${Date.now()}.doc`);
+      if (format === "feishu") {
+        const response = await fetchWithRetry(apiUrl("/api/export/feishu"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(buildCombinedDraft(items)),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.success) {
+          throw new Error(data?.error || `写入飞书文档失败（HTTP ${response.status}）`);
         }
+        const documentUrl = String(data?.documentUrl || "");
+        if (documentUrl) window.open(documentUrl, "_blank", "noopener,noreferrer");
+      } else if (format === "bitable") {
+        const targetUrl = bitableTargetUrl.trim() || cachedBitableBinding.targetUrl || cachedBitableBinding.bitableUrl || "";
+        if (!cachedBitableBinding.tableId && !targetUrl) {
+          throw new Error("请先粘贴一次飞书多维表格 URL，系统会自动创建并复用当前任务的数据表。");
+        }
+
+        let binding: BitableBinding = {
+          targetUrl,
+          appToken: cachedBitableBinding.appToken || "",
+          tableId: cachedBitableBinding.tableId || "",
+          tableName: cachedBitableBinding.tableName || taskTableName,
+          bitableUrl: cachedBitableBinding.bitableUrl || "",
+        };
+
+        for (const item of items) {
+          const response = await fetchWithRetry(apiUrl("/api/export/bitable"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ...item,
+              taskInfo: item?.taskInfo || buildCombinedDraft([item]).taskInfo,
+              feishuBitable: {
+                targetUrl: binding.targetUrl || "",
+                appToken: binding.appToken || "",
+                tableId: binding.tableId || "",
+                tableName: binding.tableName || taskTableName,
+              },
+            }),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok || !data?.success) {
+            throw new Error(data?.error || `写入飞书多维表格失败（HTTP ${response.status}）`);
+          }
+          binding = {
+            targetUrl: binding.targetUrl || targetUrl,
+            appToken: String(data?.appToken || binding.appToken || ""),
+            tableId: String(data?.tableId || binding.tableId || ""),
+            tableName: String(data?.tableName || binding.tableName || taskTableName),
+            bitableUrl: String(data?.bitableUrl || binding.bitableUrl || ""),
+          };
+          writeBitableBinding(bitableBindingKey, binding);
+          setCachedBitableBinding(binding);
+        }
+        if (binding.bitableUrl) window.open(binding.bitableUrl, "_blank", "noopener,noreferrer");
       } else {
-        await downloadBlobResponse(response, format === "word" ? "final-drafts-all.doc" : "final-drafts-all.csv");
+        try {
+        const response = await fetchWithRetry(
+          apiUrl(format === "word" ? "/api/export/final-drafts/word" : "/api/export/final-drafts/excel"),
+          { method: "POST" },
+        );
+
+        if (response.status === 404 || response.status === 400) {
+          exportItemsLocally(items);
+        } else {
+          await downloadBlobResponse(response, format === "word" ? "final-drafts-all.doc" : "final-drafts-all.csv");
+        }
+      } catch (requestError) {
+        const cachedItems = readCachedFinalDrafts();
+        if (cachedItems.length === 0) throw requestError;
+        exportItemsLocally(cachedItems);
+      }
       }
 
       await clearAllPendingDrafts();
@@ -1084,6 +1374,14 @@ export default function ContentPage() {
       selectedScripts: selectedScriptObjects,
       rewriteResults,
       translationItems,
+      benchmarkVideos: activeBenchmarkVideos,
+      taskInfo: activeTask ? {
+        id: String(activeTask._id || ""),
+        customerName: String(activeTask.customerName || ""),
+        ownerName: String(activeTask.ownerName || ""),
+        platformName: String(activeTask.platformName || ""),
+        contentDirection: String(activeTask.contentDirection || ""),
+      } : null,
       createdAt: Date.now(),
       sourceGroupId: activeGroup?.id || null,
       sourceGroupIndex: activeGroupIndex,
@@ -1102,13 +1400,38 @@ export default function ContentPage() {
     }, 1800);
   };
 
-  const runWorkflow = async () => {
+  const runWorkflow = async (options: RunWorkflowOptions = {}) => {
     if (workflowInFlightRef.current) {
       return;
     }
 
     if (!shareLinksText) {
       setWorkflowError("未检测到分享链接，请先在上一页选择选题并携带可用链接");
+      return;
+    }
+
+    const force = options.force !== false;
+    const reusableGroups = force ? [] : pickReusableWorkflowGroups(shareLinks, workflowGroups);
+    const linksToGenerate = force
+      ? shareLinks
+      : shareLinks.filter(link => !reusableGroups.some(group => sameLink(group.shareLink, link)));
+
+    if (!force) {
+      const orderedReusableGroups = orderWorkflowGroupsByLinks(shareLinks, reusableGroups);
+      setWorkflowRawDone("");
+      setWorkflowGroups(orderedReusableGroups);
+      sessionStorage.removeItem("workflowRawDone");
+      sessionStorage.setItem("contentWorkflowGroups", JSON.stringify(orderedReusableGroups));
+      setActiveGroupIndex(index => {
+        const nextIndex = Math.min(Math.max(0, index), Math.max(0, orderedReusableGroups.length - 1));
+        sessionStorage.setItem("contentActiveGroupIndex", String(nextIndex));
+        return nextIndex;
+      });
+    }
+
+    if (linksToGenerate.length === 0) {
+      setWorkflowError(null);
+      setStreamPreview("");
       return;
     }
 
@@ -1124,20 +1447,33 @@ export default function ContentPage() {
     setWorkflowLoading(true);
     setWorkflowError(null);
     setStreamPreview("");
-    setWorkflowRawDone("");
-    setWorkflowGroups([]);
-    setActiveGroupIndex(0);
-    sessionStorage.setItem("contentWorkflowGroups", "[]");
-    sessionStorage.setItem("contentActiveGroupIndex", "0");
+    if (force) {
+      setWorkflowRawDone("");
+      setWorkflowGroups([]);
+      setActiveGroupIndex(0);
+      sessionStorage.removeItem("workflowRawDone");
+      sessionStorage.setItem("contentWorkflowGroups", "[]");
+      sessionStorage.setItem("contentActiveGroupIndex", "0");
+    } else {
+      setWorkflowRawDone("");
+      sessionStorage.removeItem("workflowRawDone");
+      setWorkflowGroups(reusableGroups);
+      sessionStorage.setItem("contentWorkflowGroups", JSON.stringify(reusableGroups));
+      setActiveGroupIndex(index => {
+        const nextIndex = Math.min(Math.max(0, index), Math.max(0, reusableGroups.length - 1));
+        sessionStorage.setItem("contentActiveGroupIndex", String(nextIndex));
+        return nextIndex;
+      });
+    }
 
     try {
       const MAX_LINKS_PER_BATCH = 3;
       const batches: string[][] = [];
-      for (let i = 0; i < shareLinks.length; i += MAX_LINKS_PER_BATCH) {
-        batches.push(shareLinks.slice(i, i + MAX_LINKS_PER_BATCH));
+      for (let i = 0; i < linksToGenerate.length; i += MAX_LINKS_PER_BATCH) {
+        batches.push(linksToGenerate.slice(i, i + MAX_LINKS_PER_BATCH));
       }
 
-      const allGroups: WorkflowResultGroup[] = [];
+      const allGroups: WorkflowResultGroup[] = [...reusableGroups];
       const allRawPayloads: string[] = [];
 
       const ensureCurrentRun = () => {
@@ -1149,10 +1485,11 @@ export default function ContentPage() {
       const commitPartialResults = () => {
         ensureCurrentRun();
         const combinedPayload = allRawPayloads.join("\n\n");
+        const orderedGroups = orderWorkflowGroupsByLinks(shareLinks, allGroups);
         setWorkflowRawDone(combinedPayload);
         sessionStorage.setItem("workflowRawDone", combinedPayload);
-        setWorkflowGroups([...allGroups]);
-        sessionStorage.setItem("contentWorkflowGroups", JSON.stringify(allGroups));
+        setWorkflowGroups(orderedGroups);
+        sessionStorage.setItem("contentWorkflowGroups", JSON.stringify(orderedGroups));
       };
 
       for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
@@ -1161,7 +1498,7 @@ export default function ContentPage() {
         const batchLinks = batches[batchIndex];
         const batchLinksText = batchLinks.join("\n");
 
-        const response = await fetch(apiUrl("/api/coze/workflow/stream-run"), {
+        const response = await fetch(apiUrl("/api/agent/workflow/stream-run"), {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -1281,6 +1618,20 @@ export default function ContentPage() {
     }
   };
 
+  useEffect(() => {
+    const autoRunKey = sessionStorage.getItem("contentAutoRunKey") || "";
+    const consumedKey = sessionStorage.getItem("contentAutoRunConsumedKey") || "";
+    if (!shareLinksText || workflowInFlightRef.current) return;
+    const reusableGroups = pickReusableWorkflowGroups(shareLinks, workflowGroups);
+    const hasMissingLinks = shareLinks.some(link => !reusableGroups.some(group => sameLink(group.shareLink, link)));
+    if (autoRunKey && consumedKey === autoRunKey && !hasMissingLinks) return;
+    if (!autoRunKey || (autoRunKeyRef.current === autoRunKey && !hasMissingLinks)) return;
+
+    autoRunKeyRef.current = autoRunKey;
+    sessionStorage.setItem("contentAutoRunConsumedKey", autoRunKey);
+    runWorkflow({ force: false });
+  }, [shareLinksText, workflowGroups]);
+
   return (
     <div className="min-h-screen bg-slate-50">
       <header className="bg-white border-b border-slate-200 px-8 py-6">
@@ -1361,7 +1712,7 @@ export default function ContentPage() {
 
               <div className="flex flex-wrap gap-2 items-center">
                 <Button
-                  onClick={runWorkflow}
+                  onClick={() => runWorkflow({ force: true })}
                   disabled={workflowLoading || !shareLinksText}
                   className="bg-indigo-600 hover:bg-indigo-700 text-white"
                 >
@@ -1370,7 +1721,7 @@ export default function ContentPage() {
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                       生成中...
                     </>
-                  ) : "调用工作流生成内容"}
+                  ) : workflowGroups.length > 0 ? "重新生成" : "重新生成内容"}
                 </Button>
                 {workflowError && <span className="text-xs text-red-600">{workflowError}</span>}
               </div>
@@ -1406,6 +1757,10 @@ export default function ContentPage() {
                       </AccordionTrigger>
                       <AccordionContent className="px-3 pb-3 text-xs text-slate-600 space-y-2">
                         <div>作者：{topic?.authorName || "未知"}</div>
+                        <div>链接：{getTopicShareLink(topic) || "未提供"}</div>
+                        <div>
+                          数据：点赞 {formatMetric(readStat(topic, "likes", ["digg_count", "like_count", "likes"]))} / 评论 {formatMetric(readStat(topic, "comments", ["comment_count", "comments"]))} / 转发 {formatMetric(readStat(topic, "shares", ["share_count", "shares"]))} / 收藏 {formatMetric(readStat(topic, "bookmarks", ["collect_count", "favorite_count", "bookmark_count", "bookmarks"]))}
+                        </div>
                         <div>原始数据：</div>
                         <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-md bg-white p-2 text-[11px] text-slate-700 border border-slate-200">
                           {JSON.stringify(topic?.rawData ?? topic, null, 2)}
@@ -1461,8 +1816,7 @@ export default function ContentPage() {
                 </CardHeader>
                 <CardContent className="space-y-2 flex-1 min-h-0 overflow-auto pr-1">
                   {workflowResult.titles.map((titleBlock) => {
-                    const titleLabel = extractTitleLabel(titleBlock);
-                    const extraLines = splitByLine(titleBlock).slice(1);
+                    const { titleLabel, detailLines } = formatTitleDisplay(titleBlock);
                     return (
                       <div
                         key={titleBlock}
@@ -1479,9 +1833,9 @@ export default function ContentPage() {
                           />
                           <div className="min-w-0 flex-1">
                             <div className="text-slate-900 break-words leading-5 font-medium">{titleLabel || titleBlock}</div>
-                            {extraLines.length > 0 && (
+                            {detailLines.length > 0 && (
                               <div className="mt-1 text-xs text-slate-500 whitespace-pre-wrap break-words leading-5">
-                                {extraLines.join("\n")}
+                                {detailLines.join("\n")}
                               </div>
                             )}
                             {selectedTitles.includes(titleBlock) && (
@@ -1856,6 +2210,44 @@ export default function ContentPage() {
                     <Download className="h-4 w-4 mr-1" />
                     一键导出全部表格
                   </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="border-blue-200 text-blue-700"
+                    onClick={() => exportAllPendingDrafts("feishu")}
+                    disabled={batchExportLoading || pendingDraftCount === 0}
+                  >
+                    <Download className="h-4 w-4 mr-1" />
+                    写入飞书文档
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="border-blue-200 text-blue-700"
+                    onClick={() => exportAllPendingDrafts("bitable")}
+                    disabled={batchExportLoading || pendingDraftCount === 0}
+                  >
+                    <Download className="h-4 w-4 mr-1" />
+                    写入多维表格
+                  </Button>
+                </div>
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3 space-y-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-xs font-medium text-slate-700">飞书多维表格归档</div>
+                    <Badge className={cachedBitableBinding.tableId ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-700"}>
+                      {cachedBitableBinding.tableId ? "当前任务已绑定" : "粘贴一次即可"}
+                    </Badge>
+                  </div>
+                  <input
+                    value={bitableTargetUrl}
+                    onChange={(event) => setBitableTargetUrl(event.target.value)}
+                    placeholder="粘贴飞书多维表格 URL，首次写入会自动创建当前任务的数据表"
+                    className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-xs outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
+                  />
+                  <div className="text-[11px] text-slate-500">
+                    数据表：{cachedBitableBinding.tableName || taskTableName}
+                    {cachedBitableBinding.tableId ? ` · ${cachedBitableBinding.tableId}` : ""}
+                  </div>
                 </div>
                 {batchExportMessage && <div className="text-xs text-slate-500">{batchExportMessage}</div>}
               </CardContent>

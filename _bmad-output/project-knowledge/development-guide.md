@@ -27,10 +27,9 @@ Minimum recommended variables:
 - `PORT=8787`
 - `TIKHUB_BASE_URL`
 - `TIKHUB_API_TOKEN`
-- `COZE_BASE_URL`
-- `COZE_API_TOKEN`
-- `COZE_WORKFLOW_ID`
-- `VITE_COZE_PROXY_BASE=/tikhub-proxy` for reverse proxy deployment, or empty for same-origin `/api`
+- `DEEPSEEK_API_KEY`
+- `DOUBAO_API_KEY` or `DOUBAO_APP_KEY` / `DOUBAO_ACCESS_KEY`
+- `VITE_API_PROXY_BASE=/tikhub-proxy` for reverse proxy deployment, or empty for same-origin `/api`
 
 ## Run Modes
 
