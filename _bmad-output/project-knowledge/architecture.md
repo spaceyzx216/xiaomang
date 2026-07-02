@@ -9,14 +9,15 @@ flowchart LR
     C --> D["FinalEditorPage.tsx 最终编辑页"]
 
     B --> E["/api/tikhub/batch"]
-    C --> F["/api/coze/workflow/stream-run"]
-    C --> G["/api/coze/workflows/chat"]
+    C --> F["/api/agent/workflow/stream-run"]
+    C --> G["/api/agent/translation or rewrite"]
     D --> H["/api/final-drafts"]
     D --> I["/api/export/word or excel"]
 
     E --> J["Tikhub API"]
-    F --> K["Coze Workflow API"]
+    F --> K["Self-hosted Content Agent"]
     G --> K
+    K --> N["DeepSeek / Doubao / Tikhub"]
 
     H --> L["JSON 文件或内存 Store"]
     I --> M["Word / CSV 下载"]
@@ -28,7 +29,7 @@ flowchart LR
 
 - 前端由 Vite 提供开发服务器
 - `vite.config.ts` 将 `/api` 代理到 `http://localhost:8787`
-- `server/index.js` 作为统一代理层对接 Coze 与 Tikhub
+- `server/index.js` 作为统一代理层对接自研 Agent、DeepSeek、Doubao 与 Tikhub
 - 最终文案持久化到 `server/data/final-drafts.json`
 
 ### 2. Serverless Mode
@@ -51,7 +52,7 @@ flowchart LR
 ### `ContentPage.tsx`
 
 - 从 `sessionStorage` 读取选中的 topics、任务信息与历史工作流结果
-- 调用 Coze 流式工作流生成标题、hooks、scripts
+- 调用自研 Agent 流式生成标题、hooks、scripts
 - 通过可选开关执行翻译与平台转写
 - 管理待导出草稿数量
 - 支持批量导出全部待处理文案
@@ -78,16 +79,16 @@ flowchart LR
 ### Content Generation Flow
 
 1. `ContentPage.tsx` 从已选 topics 中抽取分享链接
-2. 按每批最多 3 条链接调用 `/api/coze/workflow/stream-run`
+2. 按每批最多 3 条链接调用 `/api/agent/workflow/stream-run`
 3. 以前端 SSE 读取方式持续拼接 `Message` / `Done` 事件
 4. 将最终文本解析为 `titles`、`hooks`、`scripts`
 5. 持久化到 `sessionStorage`
 
 ### Translation / Rewrite Flow
 
-- 翻译走 `workflow/stream-run`，输入是已选标题、留存文案和脚本
-- 平台转写走 `workflows/chat`，输入是选中的脚本和目标平台
-- 两条链路都以 SSE 流式更新预览，完成后再解析为结构化结果
+- 翻译走 `/api/agent/translation`，输入是已选标题、留存文案和脚本
+- 平台转写走 `/api/agent/rewrite`，输入是选中的脚本和目标平台
+- 两条链路返回结构化 JSON 结果
 
 ### Export Flow
 
@@ -98,12 +99,11 @@ flowchart LR
 
 ## Integration Points
 
-### Coze
+### Agent AI Providers
 
-- `POST /v1/workflow/stream_run`
-- `POST /v1/workflows/chat`
-- 使用 Bearer Token 鉴权
-- 前端依赖流式事件格式解析结果
+- DeepSeek Chat Completions：创作、翻译、平台转写
+- Doubao ASR：视频口播音频识别
+- Doubao video understanding：视频理解兜底
 
 ### Tikhub
 

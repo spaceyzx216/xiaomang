@@ -7,7 +7,7 @@
 
 ## Project Overview
 
-`xiaomang` 是一个面向内容运营场景的工作台。它把抖音链接批量解析、Coze 工作流内容生成、可选翻译与平台风格转写、最终文案编辑与导出串成一条连续流程，并同时提供本地 Node 代理模式与 `api/` Serverless 部署模式。
+`xiaomang` 是一个面向内容运营场景的工作台。它把抖音链接批量解析、自研 Agent 内容生成、可选翻译与平台风格转写、最终文案编辑与导出串成一条连续流程，并同时提供本地 Node 代理模式与 `api/` Serverless 部署模式。
 
 ## Quick Reference
 
@@ -43,7 +43,8 @@
 - Node.js 18+
 - npm
 - 可用的 `TIKHUB_API_TOKEN`
-- 可用的 `COZE_API_TOKEN`
+- 可用的 `DEEPSEEK_API_KEY`
+- 可用的 Doubao ASR / 视频理解凭证
 
 ### Setup
 

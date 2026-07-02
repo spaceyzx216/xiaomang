@@ -38,7 +38,7 @@ Key fields:
 
 ### `WorkflowResult`
 
-Parsed Coze workflow output.
+Parsed Agent workflow output.
 
 - `titles: string[]`
 - `hooks: { id, content, hookType }[]`

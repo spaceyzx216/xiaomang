@@ -25,7 +25,7 @@ xiaomang/
 - `app/App.tsx`
   首页，负责任务上下文读取、选题展示、Tikhub 链接解析与跳转到内容页
 - `app/ContentPage.tsx`
-  核心工作流页，负责 Coze 流式生成、翻译、平台转写、批量导出和进入最终编辑页
+  核心工作流页，负责 Agent 流式生成、翻译、平台转写、批量导出和进入最终编辑页
 - `app/FinalEditorPage.tsx`
   最终文案编辑与单份导出页
 - `app/api.ts`
@@ -41,7 +41,9 @@ xiaomang/
   本地代理服务入口，负责：
   - `/health` 健康检查
   - `/api/tikhub/batch` 链接批处理
-  - `/api/coze/workflow/stream-run` Coze SSE 透传
+  - `/api/agent/workflow/stream-run` Agent SSE 输出
+  - `/api/agent/translation` DeepSeek 翻译
+  - `/api/agent/rewrite` DeepSeek 平台转写
   - `/api/final-drafts` 临时文案存取
 - `.env.example`
   本地代理所需环境变量样例
@@ -52,10 +54,12 @@ xiaomang/
   环境变量读取、请求体解析、统一 JSON 响应
 - `_lib/draftStore.ts`
   Serverless 模式下的内存临时存储
-- `coze/workflow/stream-run.ts`
-  工作流流式转发
-- `coze/workflows/chat.ts`
-  对话式流式转发
+- `agent/workflow/stream-run.ts`
+  Agent 工作流流式输出
+- `agent/translation.ts`
+  翻译 Agent
+- `agent/rewrite.ts`
+  平台转写 Agent
 - `tikhub/batch.ts`
   Tikhub 批量解析接口
 - `final-drafts/*.ts`

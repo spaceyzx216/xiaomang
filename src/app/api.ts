@@ -1,6 +1,6 @@
 const RAW_PROXY_BASE =
+  import.meta.env.VITE_API_PROXY_BASE ||
   import.meta.env.VITE_TIKHUB_PROXY_BASE ||
-  import.meta.env.VITE_COZE_PROXY_BASE ||
   "";
 
 const normalizeProxyBase = (value: string) => {
@@ -23,6 +23,60 @@ export const apiUrl = (path: string) => {
 };
 
 type JsonObject = Record<string, any>;
+
+const RETRYABLE_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
+const NON_RETRYABLE_API_CODES = new Set([
+  "FEISHU_CONFIG_MISSING",
+  "TIKHUB_TOKEN_MISSING",
+  "DOUBAO_ASR_CREDENTIALS_MISSING",
+  "DOUBAO_VIDEO_CREDENTIALS_MISSING",
+  "DEEPSEEK_TOKEN_MISSING",
+  "ASR_INPUT_MISSING",
+  "VIDEO_URL_MISSING",
+  "FFMPEG_MISSING",
+]);
+
+const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const retryDelay = (attempt: number, baseDelayMs = 350) => {
+  const exponential = baseDelayMs * (2 ** Math.max(0, attempt - 1));
+  const jitter = Math.floor(Math.random() * baseDelayMs);
+  return Math.min(exponential + jitter, 3000);
+};
+
+export async function fetchWithRetry(
+  input: RequestInfo | URL,
+  init: RequestInit & { retries?: number; retryBaseDelayMs?: number } = {},
+): Promise<Response> {
+  const { retries = 2, retryBaseDelayMs = 350, ...fetchInit } = init;
+  const maxAttempts = Math.max(1, retries + 1);
+  let lastError: unknown = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const response = await fetch(input, fetchInit);
+      if (!RETRYABLE_STATUSES.has(response.status) || attempt >= maxAttempts) {
+        return response;
+      }
+      try {
+        const data = await response.clone().json();
+        const code = String(data?.code || "");
+        if (NON_RETRYABLE_API_CODES.has(code) || /_MISSING$/.test(code)) {
+          return response;
+        }
+      } catch {
+        // Non-JSON retryable responses may still be transient.
+      }
+      await wait(retryDelay(attempt, retryBaseDelayMs));
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxAttempts) break;
+      await wait(retryDelay(attempt, retryBaseDelayMs));
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("请求失败，请稍后重试");
+}
 
 const summarizeText = (value: string) => {
   const trimmed = value.trim();

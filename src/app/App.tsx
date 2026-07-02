@@ -4,7 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Checkbox } from "./components/ui/checkbox";
 import { Button } from "./components/ui/button";
 import { Badge } from "./components/ui/badge";
-import { apiUrl, parseApiJson } from "./api";
+import { apiUrl, fetchWithRetry, parseApiJson } from "./api";
 import {
   type CarouselApi,
   Carousel,
@@ -330,7 +330,7 @@ export default function App() {
     setTikhubError(null);
 
     try {
-      const response = await fetch(apiUrl("/api/tikhub/batch"), {
+      const response = await fetchWithRetry(apiUrl("/api/tikhub/batch"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -377,6 +377,8 @@ export default function App() {
     sessionStorage.setItem("selectedTopics", JSON.stringify(selectedData));
     sessionStorage.setItem("contentTasks", JSON.stringify(tasks));
     sessionStorage.setItem("selectedTopicIds", JSON.stringify(selectedTopics));
+    sessionStorage.setItem("contentActiveGroupIndex", "0");
+    sessionStorage.setItem("contentAutoRunKey", `${activeTask?._id || "task"}:${selectedTopics.join(",")}`);
     navigate("/content");
   };
 
@@ -607,7 +609,6 @@ export default function App() {
                   <div className="flex items-center gap-2">
                     <Target className="w-5 h-5 text-indigo-600" />
                     <CardTitle className="text-lg font-medium text-slate-900">批量获取主页作品数据</CardTitle>
-                    <Badge className="bg-indigo-100 text-indigo-700 ml-2">TikHub</Badge>
                   </div>
                   <div className="text-xs text-slate-500 flex items-center gap-2">
                     <TrendingUp className="w-3.5 h-3.5" />
@@ -633,7 +634,6 @@ export default function App() {
                   )}
                 </div>
                 <div className="flex items-center justify-between">
-                  <div className="text-xs text-slate-500">批量获取 sec_user_id 与主页作品</div>
                   <Button
                     onClick={runTikhubFetch}
                     disabled={tikhubLoading}

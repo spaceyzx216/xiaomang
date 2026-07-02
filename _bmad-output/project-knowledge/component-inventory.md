@@ -78,10 +78,12 @@
 
 ### Content / AI
 
-- `api/coze/workflow/stream-run.ts`
-  - 流式工作流转发
-- `api/coze/workflows/chat.ts`
-  - 流式对话转发
+- `api/agent/workflow/stream-run.ts`
+  - Agent 工作流流式输出
+- `api/agent/translation.ts`
+  - 翻译 Agent
+- `api/agent/rewrite.ts`
+  - 平台转写 Agent
 - `api/tikhub/batch.ts`
   - 抖音链接批量解析
 

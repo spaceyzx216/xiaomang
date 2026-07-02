@@ -31,9 +31,9 @@
 }
 ```
 
-### `POST /api/coze/workflow/stream-run`
+### `POST /api/agent/workflow/stream-run`
 
-- **Purpose:** 调用 Coze 工作流并将 SSE 事件透传给前端
+- **Purpose:** 调用自研内容 Agent 并将 SSE 事件返回给前端
 - **Typical Frontend Uses:**
   - 基础内容生成
   - 翻译工作流
@@ -43,15 +43,15 @@
   - `Done`
   - `Error`
 
-### `POST /api/coze/workflows/chat`
+### `POST /api/agent/rewrite`
 
-- **Purpose:** 调用 Coze 对话式工作流，执行平台风格转写
-- **Response Type:** `text/event-stream`
-- **Important Events:**
-  - `conversation.message.delta`
-  - `conversation.message.completed`
-  - `conversation.chat.failed`
-  - `error`
+- **Purpose:** 调用 DeepSeek 平台风格转写 Agent
+- **Response Type:** `application/json`
+
+### `POST /api/agent/translation`
+
+- **Purpose:** 调用 DeepSeek 中英翻译 Agent
+- **Response Type:** `application/json`
 
 ### `GET /api/final-drafts`
 
@@ -104,10 +104,11 @@
 - `GET /api/v1/douyin/web/get_sec_user_id`
 - `GET /api/v1/douyin/app/v3/fetch_user_post_videos`
 
-### Coze
+### DeepSeek / Doubao / Tikhub
 
-- `POST /v1/workflow/stream_run`
-- `POST /v1/workflows/chat`
+- DeepSeek Chat Completions: 创作、翻译、平台转写
+- Doubao ASR: 视频口播音频识别
+- Doubao video understanding: 视频理解兜底
 
 ## Contract Gaps
 
