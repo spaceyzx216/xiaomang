@@ -13,10 +13,11 @@ import {
   CarouselNext,
   CarouselPrevious,
 } from "./components/ui/carousel";
-import { Target, TrendingUp, MessageCircle, ThumbsUp, Share2, Bookmark, ExternalLink, User, CalendarDays, Phone, Layers, Sparkles } from "lucide-react";
+import { Target, TrendingUp, MessageCircle, ThumbsUp, Share2, Bookmark, ExternalLink, User, CalendarDays, Phone, Layers, Sparkles, CheckCircle2, RefreshCw } from "lucide-react";
 
 interface Topic {
   id: string;
+  platform?: "douyin" | "wechat_channels";
   title: string;
   tags: string[];
   isRecommended?: boolean;
@@ -30,8 +31,54 @@ interface Topic {
   authorName?: string;
   publishDate?: string;
   hotTopics?: string[];
+  source?: {
+    platform?: string;
+    objectId?: string;
+    objectNonceId?: string;
+    finderUsername?: string;
+    mediaUrl?: string;
+    decodeKey?: string;
+    coverUrl?: string;
+  };
   rawData?: unknown;
 }
+
+type SourcePlatform = "douyin" | "wechat_channels";
+
+type TikhubBatchResult = {
+  url?: string;
+  inputName?: string;
+  secUserId?: string;
+  finderUsername?: string;
+  authorName?: string;
+  videosCount?: number;
+  secUserResponse?: unknown;
+  videosResponse?: unknown;
+  topics?: Topic[];
+  pageCount?: number;
+  rawVideosCount?: number;
+  recentDays?: number;
+  hasMore?: boolean;
+  stopReason?: string;
+  error?: string | null;
+};
+
+type WeChatAccountCandidate = {
+  platform: "wechat_channels";
+  inputName: string;
+  displayName: string;
+  finderUsername: string;
+  signature?: string;
+  verifiedInfo?: string;
+  sampleVideos?: string[];
+  raw?: unknown;
+};
+
+type WeChatAccountSearchResult = {
+  inputName: string;
+  candidates: WeChatAccountCandidate[];
+  error?: string | null;
+};
 
 type TaskItem = {
   _id: string;
@@ -94,6 +141,7 @@ const mockData = {
 
 const TASK_AUTH_TOKEN_KEY = "kk_task_token";
 const TASK_USER_ID_KEY = "kk_task_user_id";
+const WECHAT_CHANNELS_ACCOUNT_CACHE_KEY = "wechatChannelsAccountCache";
 
 const base64UrlToUtf8 = (input: string) => {
   const normalized = String(input || "").replace(/-/g, "+").replace(/_/g, "/");
@@ -150,6 +198,36 @@ function getTaskAuthContext() {
   return { token, userId, urlTodayTasks };
 }
 
+const parseLines = (value: string) => Array.from(
+  new Set(
+    String(value || "")
+      .split(/[\n，,；;]+/)
+      .map(item => item.trim())
+      .filter(Boolean)
+  )
+);
+
+const readWeChatAccountCache = (): Record<string, WeChatAccountCandidate> => {
+  try {
+    const raw = localStorage.getItem(WECHAT_CHANNELS_ACCOUNT_CACHE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+};
+
+const writeWeChatAccountCache = (cache: Record<string, WeChatAccountCandidate>) => {
+  localStorage.setItem(WECHAT_CHANNELS_ACCOUNT_CACHE_KEY, JSON.stringify(cache));
+};
+
+const inferDefaultPlatform = (tasks: TaskItem[]): SourcePlatform => {
+  const text = tasks
+    .map(task => [task.platformName, task.benchmarkAccounts].filter(Boolean).join(" "))
+    .join(" ");
+  return /视频号|微信/i.test(text) ? "wechat_channels" : "douyin";
+};
+
 export default function App() {
   const navigate = useNavigate();
   const [selectedTopics, setSelectedTopics] = useState<string[]>(() => {
@@ -180,25 +258,31 @@ export default function App() {
   const [taskError, setTaskError] = useState<string | null>(null);
   const [taskIndex, setTaskIndex] = useState(0);
   const [taskCarouselApi, setTaskCarouselApi] = useState<CarouselApi | null>(null);
+  const [sourcePlatform, setSourcePlatform] = useState<SourcePlatform>(() => {
+    const stored = sessionStorage.getItem("sourcePlatform");
+    return stored === "wechat_channels" || stored === "douyin" ? stored : inferDefaultPlatform(tasks);
+  });
   const [tikhubInput, setTikhubInput] = useState(() => sessionStorage.getItem("tikhubInput") || "");
   const [tikhubLoading, setTikhubLoading] = useState(false);
   const [tikhubError, setTikhubError] = useState<string | null>(null);
-  const [tikhubResults, setTikhubResults] = useState<Array<{
-    url: string;
-    secUserId?: string;
-    authorName?: string;
-    videosCount?: number;
-    secUserResponse?: unknown;
-    videosResponse?: unknown;
-    error?: string | null;
-  }>>(() => {
+  const [tikhubResults, setTikhubResults] = useState<TikhubBatchResult[]>(() => {
     try {
       const raw = sessionStorage.getItem("tikhubResults");
-      return raw ? (JSON.parse(raw) as Array<{ url: string; secUserId?: string; authorName?: string; videosCount?: number; secUserResponse?: unknown; videosResponse?: unknown; error?: string | null; }>) : [];
+      return raw ? (JSON.parse(raw) as TikhubBatchResult[]) : [];
     } catch {
       return [];
     }
   });
+  const [wechatSearchResults, setWechatSearchResults] = useState<WeChatAccountSearchResult[]>(() => {
+    try {
+      const raw = sessionStorage.getItem("wechatAccountSearchResults");
+      return raw ? (JSON.parse(raw) as WeChatAccountSearchResult[]) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [confirmedWechatAccounts, setConfirmedWechatAccounts] = useState<Record<string, WeChatAccountCandidate>>(() => readWeChatAccountCache());
+  const [topicLinkLoadingId, setTopicLinkLoadingId] = useState<string | null>(null);
 
   const handleTopicToggle = (topicId: string) => {
     setSelectedTopics(prev => {
@@ -217,6 +301,9 @@ export default function App() {
     const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
 
     return tikhubResults.flatMap(result => {
+      if (Array.isArray(result.topics)) {
+        return result.topics;
+      }
       if (result.error || !result.videosResponse) return [];
       const dataBlock = (result.videosResponse as any)?.data;
       const videosList = Array.isArray(dataBlock)
@@ -252,6 +339,7 @@ export default function App() {
 
           return {
             id,
+            platform: "douyin",
             title,
             tags: [],
             stats: {
@@ -315,14 +403,25 @@ export default function App() {
     fetchTasks();
   }, [tasks.length]);
 
-  const runTikhubFetch = async () => {
-    const rawLinks = tikhubInput
-      .split("\n")
-      .map(link => link.trim())
-      .filter(Boolean);
+  useEffect(() => {
+    if (tasks.length === 0) return;
+    const inferred = inferDefaultPlatform(tasks);
+    const userLocked = sessionStorage.getItem("sourcePlatformUserLocked") === "1";
+    if (!userLocked && inferred !== sourcePlatform) {
+      setSourcePlatform(inferred);
+    }
+  }, [tasks, sourcePlatform]);
 
-    if (rawLinks.length === 0) {
-      setTikhubError("请输入抖音博主主页分享链接（每行一个）");
+  useEffect(() => {
+    sessionStorage.setItem("sourcePlatform", sourcePlatform);
+    setTikhubError(null);
+  }, [sourcePlatform]);
+
+  const runTikhubFetch = async () => {
+    const rawItems = parseLines(tikhubInput);
+
+    if (rawItems.length === 0) {
+      setTikhubError(sourcePlatform === "wechat_channels" ? "请输入视频号对标账号名称（每行一个）" : "请输入抖音博主主页分享链接（每行一个）");
       return;
     }
 
@@ -330,12 +429,45 @@ export default function App() {
     setTikhubError(null);
 
     try {
+      if (sourcePlatform === "wechat_channels") {
+        const missingNames = rawItems.filter(name => !confirmedWechatAccounts[name]);
+        if (missingNames.length > 0) {
+          const response = await fetchWithRetry(apiUrl("/api/platform/accounts/search"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              platform: "wechat_channels",
+              keywords: missingNames,
+            }),
+          });
+          const data = await parseApiJson(response);
+          if (!response.ok) {
+            throw new Error(data?.error || "账号搜索失败");
+          }
+          const results = Array.isArray(data?.results) ? data.results : [];
+          setWechatSearchResults(results);
+          sessionStorage.setItem("wechatAccountSearchResults", JSON.stringify(results));
+          sessionStorage.setItem("tikhubInput", tikhubInput);
+          if (results.some((item: WeChatAccountSearchResult) => item.candidates?.length > 0)) {
+            setTikhubError("请选择每个视频号名称对应的正确账号，然后点击获取已确认账号作品。");
+          } else {
+            setTikhubError("没有搜索到可确认的视频号账号，可换一个更完整的账号名称。");
+          }
+          return;
+        }
+
+        await fetchConfirmedWechatTopics(rawItems);
+        return;
+      }
+
       const response = await fetchWithRetry(apiUrl("/api/tikhub/batch"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ urls: rawLinks }),
+        body: JSON.stringify({ urls: rawItems }),
       });
 
       const data = await parseApiJson(response);
@@ -352,6 +484,126 @@ export default function App() {
       setTikhubError(message);
     } finally {
       setTikhubLoading(false);
+    }
+  };
+
+  const confirmWechatCandidate = (inputName: string, candidate: WeChatAccountCandidate) => {
+    const next = {
+      ...confirmedWechatAccounts,
+      [inputName]: candidate,
+    };
+    setConfirmedWechatAccounts(next);
+    writeWeChatAccountCache(next);
+    setTikhubError(null);
+  };
+
+  const resetWechatCandidate = (inputName: string) => {
+    const next = { ...confirmedWechatAccounts };
+    delete next[inputName];
+    setConfirmedWechatAccounts(next);
+    writeWeChatAccountCache(next);
+  };
+
+  const fetchConfirmedWechatTopics = async (names = parseLines(tikhubInput)) => {
+    const accounts = names
+      .map(name => confirmedWechatAccounts[name])
+      .filter(Boolean)
+      .map(candidate => ({
+        inputName: candidate.inputName,
+        displayName: candidate.displayName,
+        finderUsername: candidate.finderUsername,
+      }));
+
+    if (accounts.length === 0) {
+      setTikhubError("请先搜索并确认视频号账号。");
+      return;
+    }
+    const missingNames = names.filter(name => !confirmedWechatAccounts[name]);
+    if (missingNames.length > 0) {
+      setTikhubError(`还有账号未确认：${missingNames.join("、")}`);
+      return;
+    }
+
+    setTikhubLoading(true);
+    setTikhubError(null);
+    try {
+      const response = await fetchWithRetry(apiUrl("/api/platform/topics/batch"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          platform: "wechat_channels",
+          accounts,
+          count: 200,
+          days: 7,
+          maxPages: 10,
+        }),
+      });
+      const data = await parseApiJson(response);
+      if (!response.ok) {
+        throw new Error(data?.error || "获取视频号作品失败");
+      }
+      const results = Array.isArray(data?.results) ? data.results : [];
+      setTikhubResults(results);
+      sessionStorage.setItem("tikhubResults", JSON.stringify(results));
+      sessionStorage.setItem("tikhubInput", tikhubInput);
+      sessionStorage.setItem("sourcePlatform", "wechat_channels");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "获取视频号作品失败";
+      setTikhubError(message);
+    } finally {
+      setTikhubLoading(false);
+    }
+  };
+
+  const updateTopicLink = (topicId: string, link: string) => {
+    setTikhubResults(prev => {
+      const next = prev.map(result => ({
+        ...result,
+        topics: Array.isArray(result.topics)
+          ? result.topics.map(topic => topic.id === topicId ? { ...topic, link } : topic)
+          : result.topics,
+      }));
+      sessionStorage.setItem("tikhubResults", JSON.stringify(next));
+      return next;
+    });
+  };
+
+  const generateWechatShareLink = async (topic: Topic) => {
+    const objectId = String(topic.source?.objectId || "").trim();
+    if (!objectId) {
+      setTikhubError("该视频号作品缺少 objectId，无法生成分享链接。");
+      return;
+    }
+
+    setTopicLinkLoadingId(topic.id);
+    setTikhubError(null);
+    try {
+      const response = await fetchWithRetry(apiUrl("/api/platform/topics/share-link"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          platform: "wechat_channels",
+          objectId,
+        }),
+      });
+      const data = await parseApiJson(response);
+      if (!response.ok) {
+        throw new Error(data?.error || "生成视频号分享链接失败");
+      }
+      const shareUrl = String(data?.shareUrl || "").trim();
+      if (!shareUrl) {
+        throw new Error("接口未返回可用分享链接");
+      }
+      updateTopicLink(topic.id, shareUrl);
+      window.open(shareUrl, "_blank");
+    } catch (error) {
+      setTikhubError(error instanceof Error ? error.message : "生成视频号分享链接失败");
+    } finally {
+      setTopicLinkLoadingId(null);
     }
   };
 
@@ -608,17 +860,41 @@ export default function App() {
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="flex items-center gap-2">
                     <Target className="w-5 h-5 text-indigo-600" />
-                    <CardTitle className="text-lg font-medium text-slate-900">批量获取主页作品数据</CardTitle>
+                    <CardTitle className="text-lg font-medium text-slate-900">批量获取对标作品数据</CardTitle>
                   </div>
                   <div className="text-xs text-slate-500 flex items-center gap-2">
                     <TrendingUp className="w-3.5 h-3.5" />
-                    {tikhubLoading ? "请求中" : "每行一个主页链接"}
+                    {tikhubLoading ? "请求中" : sourcePlatform === "wechat_channels" ? "每行一个视频号名称" : "每行一个主页链接"}
                   </div>
                 </div>
               </CardHeader>
               <CardContent className="p-4 space-y-4">
+                <div className="flex flex-wrap gap-2">
+                  {[
+                    { id: "douyin", label: "抖音" },
+                    { id: "wechat_channels", label: "视频号" },
+                  ].map(option => (
+                    <button
+                      key={option.id}
+                      type="button"
+                      onClick={() => {
+                        sessionStorage.setItem("sourcePlatformUserLocked", "1");
+                        setSourcePlatform(option.id as SourcePlatform);
+                      }}
+                      className={`rounded-full border px-3 py-1.5 text-xs transition ${
+                        sourcePlatform === option.id
+                          ? "border-indigo-500 bg-indigo-50 text-indigo-700"
+                          : "border-slate-200 bg-white text-slate-600 hover:border-slate-300"
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
                 <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4">
-                  <div className="text-xs font-semibold text-slate-600">抖音博主主页分享链接（多行）</div>
+                  <div className="text-xs font-semibold text-slate-600">
+                    {sourcePlatform === "wechat_channels" ? "视频号对标账号名称（多行）" : "抖音博主主页分享链接（多行）"}
+                  </div>
                   <textarea
                     value={tikhubInput}
                     onChange={(event) => {
@@ -626,7 +902,7 @@ export default function App() {
                       setTikhubInput(nextValue);
                       sessionStorage.setItem("tikhubInput", nextValue);
                     }}
-                    placeholder="每行一个主页链接"
+                    placeholder={sourcePlatform === "wechat_channels" ? "每行一个账号名称，例如：人民日报" : "每行一个主页链接"}
                     className="mt-2 h-32 w-full resize-none rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-indigo-300 focus:ring-2 focus:ring-indigo-100"
                   />
                   {tikhubError && (
@@ -639,23 +915,126 @@ export default function App() {
                     disabled={tikhubLoading}
                     className="bg-indigo-600 hover:bg-indigo-700 text-white"
                   >
-                    {tikhubLoading ? "获取中..." : "开始获取"}
+                    {tikhubLoading ? "处理中..." : sourcePlatform === "wechat_channels" ? "搜索/获取视频号作品" : "开始获取"}
                   </Button>
+                  {sourcePlatform === "wechat_channels" && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={tikhubLoading}
+                      onClick={() => fetchConfirmedWechatTopics()}
+                      className="border-slate-200 text-slate-600 hover:text-slate-800"
+                    >
+                      <RefreshCw className="mr-2 h-4 w-4" />
+                      获取已确认账号作品
+                    </Button>
+                  )}
                 </div>
+
+                {sourcePlatform === "wechat_channels" && wechatSearchResults.length > 0 && (
+                  <div className="space-y-3">
+                    {wechatSearchResults.map(result => {
+                      const confirmed = confirmedWechatAccounts[result.inputName];
+                      return (
+                        <div key={result.inputName} className="rounded-xl border border-slate-200 bg-white px-4 py-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <div className="text-sm font-semibold text-slate-900">{result.inputName}</div>
+                              <div className="text-xs text-slate-500">
+                                {confirmed ? `已确认：${confirmed.displayName}` : "请选择正确的视频号账号"}
+                              </div>
+                            </div>
+                            {confirmed && (
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 px-2 text-slate-500 hover:text-slate-800"
+                                onClick={() => resetWechatCandidate(result.inputName)}
+                              >
+                                重新选择
+                              </Button>
+                            )}
+                          </div>
+                          {result.error ? (
+                            <div className="mt-2 text-xs text-red-500">{result.error}</div>
+                          ) : result.candidates.length === 0 ? (
+                            <div className="mt-3 rounded-lg border border-dashed border-slate-200 bg-slate-50 px-3 py-3 text-sm text-slate-500">
+                              未找到候选账号
+                            </div>
+                          ) : (
+                            <div className="mt-3 space-y-2">
+                              {result.candidates.map(candidate => {
+                                const isSelected = confirmed?.finderUsername === candidate.finderUsername;
+                                return (
+                                  <div
+                                    key={`${result.inputName}-${candidate.finderUsername}`}
+                                    className={`rounded-lg border px-3 py-3 ${
+                                      isSelected ? "border-indigo-300 bg-indigo-50" : "border-slate-200 bg-slate-50"
+                                    }`}
+                                  >
+                                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                                      <div className="min-w-0">
+                                        <div className="flex items-center gap-2 text-sm font-medium text-slate-900">
+                                          {candidate.displayName || result.inputName}
+                                          {isSelected && <CheckCircle2 className="h-4 w-4 text-indigo-600" />}
+                                        </div>
+                                        <div className="mt-1 break-all text-xs text-slate-500">{candidate.finderUsername}</div>
+                                        {candidate.signature && (
+                                          <div className="mt-1 text-xs text-slate-600">{candidate.signature}</div>
+                                        )}
+                                        {candidate.sampleVideos && candidate.sampleVideos.length > 0 && (
+                                          <div className="mt-2 text-xs text-slate-500">
+                                            样例作品：{candidate.sampleVideos.join(" / ")}
+                                          </div>
+                                        )}
+                                      </div>
+                                      <Button
+                                        type="button"
+                                        size="sm"
+                                        onClick={() => confirmWechatCandidate(result.inputName, candidate)}
+                                        className={isSelected ? "bg-slate-700 hover:bg-slate-800 text-white" : "bg-indigo-600 hover:bg-indigo-700 text-white"}
+                                      >
+                                        {isSelected ? "已选择" : "选择账号"}
+                                      </Button>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
 
                 {tikhubResults.length > 0 && (
                   <div className="space-y-3">
                     {tikhubResults.map((item, index) => (
-                      <div key={`${item.url}-${index}`} className="rounded-xl border border-slate-200 bg-white px-4 py-3">
-                        <div className="text-xs text-slate-500">{item.url}</div>
+                      <div key={`${item.url || item.inputName || index}-${index}`} className="rounded-xl border border-slate-200 bg-white px-4 py-3">
+                        <div className="text-xs text-slate-500">{item.url || item.inputName}</div>
                         {item.error ? (
                           <div className="mt-2 text-sm text-red-600">{item.error}</div>
                         ) : (
                           <div className="mt-2 space-y-3 text-sm text-slate-700">
                             <div className="space-y-1">
                               <div>作者：{item.authorName || "未知"}</div>
-                              <div>sec_user_id：{item.secUserId || "未获取"}</div>
+                              {sourcePlatform === "wechat_channels" ? (
+                                <div>finderUsername：{item.finderUsername || "未获取"}</div>
+                              ) : (
+                                <div>sec_user_id：{item.secUserId || "未获取"}</div>
+                              )}
                               <div>作品数量：{item.videosCount ?? 0}</div>
+                              {sourcePlatform === "wechat_channels" && (
+                                <div className="text-xs text-slate-500">
+                                  已拉取 {item.rawVideosCount ?? item.videosCount ?? 0} 条原始作品，
+                                  近 {item.recentDays ?? 7} 天命中 {item.videosCount ?? 0} 条，
+                                  翻页 {item.pageCount ?? 1} 次
+                                  {item.hasMore ? "，可能仍有下一页" : "，已停止翻页"}
+                                  {item.stopReason ? `（${item.stopReason}）` : ""}
+                                </div>
+                              )}
                             </div>
                             {item.secUserResponse && (
                               <details className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
@@ -748,6 +1127,9 @@ export default function App() {
                           </div>
                           <div className="flex flex-wrap gap-2 mb-3">
                             <Badge variant="secondary" className="bg-white text-slate-600 border-slate-200 text-xs">
+                              {topic.platform === "wechat_channels" ? "视频号" : "抖音"}
+                            </Badge>
+                            <Badge variant="secondary" className="bg-white text-slate-600 border-slate-200 text-xs">
                               作者：{topic.authorName || "未知"}
                             </Badge>
                             <Badge variant="secondary" className="bg-white text-slate-600 border-slate-200 text-xs">
@@ -791,9 +1173,24 @@ export default function App() {
                           variant="ghost"
                           size="sm"
                           className="text-indigo-600 hover:text-indigo-700 hover:bg-indigo-50 px-3 h-8 sm:-mr-2"
-                          onClick={() => window.open(topic.link, '_blank')}
+                          disabled={topicLinkLoadingId === topic.id || (!topic.link && topic.platform !== "wechat_channels")}
+                          onClick={() => {
+                            if (topic.link) {
+                              window.open(topic.link, "_blank");
+                              return;
+                            }
+                            if (topic.platform === "wechat_channels") {
+                              generateWechatShareLink(topic);
+                            }
+                          }}
                         >
-                          查看链接
+                          {topicLinkLoadingId === topic.id
+                            ? "生成中..."
+                            : topic.link
+                              ? "查看链接"
+                              : topic.platform === "wechat_channels"
+                                ? "生成链接"
+                                : "暂无链接"}
                           <ExternalLink className="ml-1 w-3.5 h-3.5" />
                         </Button>
                       </div>

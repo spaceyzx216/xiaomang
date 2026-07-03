@@ -17,6 +17,18 @@ export const getShareLinksFromBody = (body) => {
   );
 };
 
+export const getBenchmarkTopicsFromBody = (body) => {
+  const value =
+    body?.parameters?.benchmark_topics ||
+    body?.parameters?.benchmarkTopics ||
+    body?._input?.benchmark_topics ||
+    body?._input?.benchmarkTopics ||
+    body?.benchmark_topics ||
+    body?.benchmarkTopics ||
+    [];
+  return Array.isArray(value) ? value.filter(item => item && typeof item === "object") : [];
+};
+
 const asStringArray = (value) => {
   if (!Array.isArray(value)) return [];
   return value.map(item => String(item || "").trim()).filter(Boolean);

@@ -43,6 +43,7 @@ export const getContentAgentConfig = () => {
     ffmpegEnabled: String(process.env.FFMPEG_ENABLED || "true").toLowerCase() !== "false",
     ffmpegTimeoutMs: toInt(process.env.FFMPEG_TIMEOUT_MS, 90000),
     ffmpegAudioMaxBytes: toInt(process.env.FFMPEG_AUDIO_MAX_BYTES, 24 * 1024 * 1024),
+    wechatMediaMaxBytes: toInt(process.env.WECHAT_CHANNELS_MEDIA_MAX_BYTES, 220 * 1024 * 1024),
     doubaoAsrEndpoint:
       process.env.DOUBAO_ASR_ENDPOINT ||
       "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash",

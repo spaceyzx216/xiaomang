@@ -1,20 +1,54 @@
-import { buildWorkflowCompatiblePayload, getShareLinksFromBody, validateWorkflowCompatiblePayload } from "./adapter.js";
+import { buildWorkflowCompatiblePayload, getBenchmarkTopicsFromBody, getShareLinksFromBody, validateWorkflowCompatiblePayload } from "./adapter.js";
 import { getContentAgentConfig, shouldUseContentAgent } from "./config.js";
 import { AgentError, sendSseEvent, setSseHeaders } from "./http.js";
 import { createRequestLogger, safeLink } from "./logger.js";
-import { buildCreativeFallback, resolveTikHubVideo, runCreativeAgents, transcribeVideo } from "./providers.js";
+import { buildCreativeFallback, resolveTikHubVideo, resolveWeChatChannelsTopicVideo, runCreativeAgents, transcribeVideo } from "./providers.js";
 
 export { shouldUseContentAgent } from "./config.js";
 
-export const runContentAgent = async (shareLinks, options = {}) => {
+const topicWorkflowKey = (topic = {}) => {
+  const source = topic?.source || {};
+  const rawData = topic?.rawData || {};
+  const id =
+    source.objectId ||
+    rawData.id ||
+    rawData.object_id ||
+    rawData.objectId ||
+    topic.id ||
+    source.objectNonceId ||
+    rawData.object_nonce_id ||
+    rawData.objectNonceId ||
+    topic.title ||
+    "";
+  return `wechat_channels:${String(id || "topic").replace(/^wechat_channels:/, "")}`;
+};
+
+const buildContentAgentInputs = ({ shareLinks = [], benchmarkTopics = [] } = {}) => [
+  ...shareLinks.map(link => ({
+    platform: "douyin",
+    shareLink: link,
+  })),
+  ...benchmarkTopics
+    .filter(topic => topic?.platform === "wechat_channels" || topic?.source?.platform === "wechat_channels")
+    .map(topic => ({
+      platform: "wechat_channels",
+      shareLink: topicWorkflowKey(topic),
+      topic,
+    })),
+];
+
+export const runContentAgent = async (shareLinksOrInputs, options = {}) => {
   const config = options.config || getContentAgentConfig();
   const onProgress = typeof options.onProgress === "function" ? options.onProgress : () => {};
   const logger = options.logger;
+  const inputs = Array.isArray(shareLinksOrInputs) && shareLinksOrInputs.some(item => item && typeof item === "object")
+    ? shareLinksOrInputs
+    : buildContentAgentInputs({ shareLinks: shareLinksOrInputs });
 
-  if (!Array.isArray(shareLinks) || shareLinks.length === 0) {
+  if (!Array.isArray(inputs) || inputs.length === 0) {
     throw new AgentError("share_links is required", { code: "SHARE_LINKS_EMPTY", status: 400 });
   }
-  if (shareLinks.length > config.maxLinksPerRun) {
+  if (inputs.length > config.maxLinksPerRun) {
     throw new AgentError(`Too many links in one run, max is ${config.maxLinksPerRun}`, {
       code: "TOO_MANY_LINKS",
       status: 400,
@@ -22,22 +56,28 @@ export const runContentAgent = async (shareLinks, options = {}) => {
   }
 
   const results = [];
-  for (let index = 0; index < shareLinks.length; index += 1) {
-    const shareLink = shareLinks[index];
-    const progressBase = { index, total: shareLinks.length, shareLink };
+  for (let index = 0; index < inputs.length; index += 1) {
+    const input = inputs[index];
+    const shareLink = input.shareLink;
+    const progressBase = { index, total: inputs.length, shareLink, platform: input.platform };
     const itemStartedAt = Date.now();
     logger?.info("agent.item.start", {
       index: index + 1,
-      total: shareLinks.length,
+      total: inputs.length,
       shareLink: safeLink(shareLink),
+      platform: input.platform,
     });
 
     onProgress({
       ...progressBase,
       step: "resolve-video",
-      message: `正在解析第 ${index + 1}/${shareLinks.length} 条对标视频链接`,
+      message: input.platform === "wechat_channels"
+        ? `正在准备第 ${index + 1}/${inputs.length} 条视频号媒体`
+        : `正在解析第 ${index + 1}/${inputs.length} 条对标视频链接`,
     });
-    const video = await resolveTikHubVideo(shareLink, config, { logger });
+    const video = input.platform === "wechat_channels"
+      ? resolveWeChatChannelsTopicVideo(input.topic)
+      : await resolveTikHubVideo(shareLink, config, { logger });
     onProgress({
       ...progressBase,
       step: "video-resolved",
@@ -102,7 +142,7 @@ export const runContentAgent = async (shareLinks, options = {}) => {
     results.push({ shareLink, video, transcript, creative });
     logger?.info("agent.item.end", {
       index: index + 1,
-      total: shareLinks.length,
+      total: inputs.length,
       durationMs: Date.now() - itemStartedAt,
       transcriptProvider: transcript.provider,
       title: video.title,
@@ -110,19 +150,19 @@ export const runContentAgent = async (shareLinks, options = {}) => {
     onProgress({
       ...progressBase,
       step: "completed",
-      message: `第 ${index + 1}/${shareLinks.length} 条视频处理完成`,
+      message: `第 ${index + 1}/${inputs.length} 条视频处理完成`,
     });
   }
 
   const payload = buildWorkflowCompatiblePayload(results);
   onProgress({
     step: "payload-ready",
-    total: shareLinks.length,
+    total: inputs.length,
     message: "全部结果已生成，正在输出工作流兼容 payload",
   });
-  const validated = validateWorkflowCompatiblePayload(payload, shareLinks.length);
+  const validated = validateWorkflowCompatiblePayload(payload, inputs.length);
   logger?.info("agent.payload.ready", {
-    resultCount: shareLinks.length,
+    resultCount: inputs.length,
   });
   return validated;
 };
@@ -131,10 +171,14 @@ export const runContentAgentWorkflow = async (_req, res, options = {}) => {
   const config = options.config || getContentAgentConfig();
   const body = options.body || {};
   const shareLinks = getShareLinksFromBody(body);
+  const benchmarkTopics = getBenchmarkTopicsFromBody(body);
+  const inputs = buildContentAgentInputs({ shareLinks, benchmarkTopics });
   const logger = options.logger || createRequestLogger("content-agent");
   logger.info("workflow.agent.start", {
     workflowId: body?.workflow_id,
     linkCount: shareLinks.length,
+    topicCount: benchmarkTopics.length,
+    inputCount: inputs.length,
     provider: config.provider,
     transcriptProviders: Array.isArray(config.transcriptProviders) ? config.transcriptProviders.join(",") : "",
     doubaoResourceId: config.doubaoResourceId,
@@ -149,11 +193,11 @@ export const runContentAgentWorkflow = async (_req, res, options = {}) => {
   try {
     sendSseEvent(res, "Progress", {
       message: "content-agent-started",
-      total: shareLinks.length,
+      total: inputs.length,
       step: "content-agent-started",
     });
 
-    const payload = await runContentAgent(shareLinks, {
+    const payload = await runContentAgent(inputs, {
       config,
       logger,
       onProgress: progress => sendSseEvent(res, "Progress", progress),
@@ -165,6 +209,8 @@ export const runContentAgentWorkflow = async (_req, res, options = {}) => {
     sendSseEvent(res, "Done", {});
     logger.info("workflow.agent.done", {
       linkCount: shareLinks.length,
+      topicCount: benchmarkTopics.length,
+      inputCount: inputs.length,
     });
     res.end();
   } catch (error) {

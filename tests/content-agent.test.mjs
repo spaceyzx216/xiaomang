@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   buildWorkflowCompatiblePayload,
+  getBenchmarkTopicsFromBody,
   getShareLinksFromBody,
   normalizeEndingHook,
   parseJsonAgentOutput,
@@ -11,9 +12,11 @@ import {
 import { runContentAgentWorkflow } from "../api/_lib/contentAgent/index.js";
 import { getContentAgentConfig, shouldUseContentAgent } from "../api/_lib/contentAgent/config.js";
 import { fetchJson } from "../api/_lib/contentAgent/http.js";
-import { buildCreativeFallback, describeVideoUrlForDiagnostics, isDirectMp4Url, recognizeDoubaoAudio, runCreativeAgents } from "../api/_lib/contentAgent/providers.js";
+import { buildCreativeFallback, decryptWeChatChannelsMediaBuffer, describeVideoUrlForDiagnostics, isDirectMp4Url, recognizeDoubaoAudio, resolveWeChatChannelsTopicVideo, runCreativeAgents } from "../api/_lib/contentAgent/providers.js";
+import { generateKeystream } from "../api/_lib/contentAgent/vendor/wechatKeystream.mjs";
 import { buildFinalDraftMarkdown, normalizeBenchmarkVideos } from "../api/_lib/exportFormatters.js";
 import { BITABLE_FIELDS, finalDraftToBitableRecords, markdownToFeishuBlocks, parseFeishuBitableUrl } from "../api/_lib/feishuClient.js";
+import { isWithinRecentDays, normalizePlatform, normalizeWeChatChannelsTopic } from "../api/_lib/platformAdapters.js";
 
 test("extracts newline separated share links from workflow-style input", () => {
   const body = {
@@ -26,6 +29,126 @@ test("extracts newline separated share links from workflow-style input", () => {
     "https://example.com/a",
     "https://example.com/b",
   ]);
+});
+
+test("extracts benchmark topics from workflow-style input", () => {
+  const topic = { platform: "wechat_channels", title: "视频号选题" };
+  assert.deepEqual(getBenchmarkTopicsFromBody({ parameters: { benchmark_topics: [topic, null, "bad"] } }), [topic]);
+  assert.deepEqual(getBenchmarkTopicsFromBody({ benchmarkTopics: [topic] }), [topic]);
+});
+
+test("normalizes wechat channels aliases", () => {
+  assert.equal(normalizePlatform("wechat_channels"), "wechat_channels");
+  assert.equal(normalizePlatform("视频号"), "wechat_channels");
+  assert.equal(normalizePlatform("douyin"), "douyin");
+});
+
+test("resolves WeChat Channels topic metadata for content generation", () => {
+  const video = resolveWeChatChannelsTopicVideo({
+    id: "wechat_channels:14941130915890399732",
+    platform: "wechat_channels",
+    title: "测试视频号标题",
+    source: {
+      platform: "wechat_channels",
+      objectId: "14941130915890399732",
+      mediaUrl: "https://example.com/encrypted.mp4",
+      decodeKey: "1859544503",
+      coverUrl: "https://example.com/cover.jpg",
+    },
+    rawData: {
+      media: {
+        duration: 40,
+      },
+    },
+  });
+
+  assert.equal(video.platform, "wechat_channels");
+  assert.equal(video.shareLink, "wechat_channels:14941130915890399732");
+  assert.equal(video.videoUrl, "https://example.com/encrypted.mp4");
+  assert.equal(video.decodeKey, "1859544503");
+  assert.equal(video.title, "测试视频号标题");
+  assert.equal(video.cover, "https://example.com/cover.jpg");
+});
+
+test("decrypts WeChat Channels Isaac64-encrypted media buffers", async () => {
+  // 视频号加密机制：Isaac64 PRNG 以 decodeKey 为 seed 生成 131072 字节密钥流（reverse 后），
+  // 仅与文件前 131072 字节 XOR，其余明文。这里用真实密钥流构造加密样本，验证解密还原。
+  const decodeKey = "1859544503";
+  const keystream = await generateKeystream(decodeKey);
+  assert.equal(keystream.length, 131072, "keystream 必须为 131072 字节");
+
+  // 构造一个合法 mp4 明文：[boxSize=32][ftyp][brand]
+  const plain = Buffer.alloc(200000, 0);
+  plain.writeUInt32BE(32, 0);
+  plain.write("ftyp", 4, "latin1");
+  plain.write("isom", 8, "latin1");
+  for (let i = 12; i < plain.length; i += 1) plain[i] = (i * 7 + 3) & 0xff;
+
+  // 用 keystream 加密前 131072 字节（模拟视频号加密）
+  const encrypted = Buffer.from(plain);
+  for (let i = 0; i < 131072; i += 1) encrypted[i] ^= keystream[i];
+  assert.notEqual(encrypted.toString("latin1", 4, 8), "ftyp", "加密后头部不应是 ftyp");
+
+  // 解密
+  const decrypted = await decryptWeChatChannelsMediaBuffer(encrypted, decodeKey);
+  assert.equal(decrypted.strategy, "isaac64");
+  assert.equal(decrypted.buffer.toString("latin1", 4, 8), "ftyp", "解密后应还原 ftyp 签名");
+  assert.equal(decrypted.buffer.equals(plain), true, "解密后整段数据应与明文一致（含明文部分原样保留）");
+
+  // 已是明文的 buffer 应直接返回 plain 策略
+  const alreadyPlain = await decryptWeChatChannelsMediaBuffer(plain, decodeKey);
+  assert.equal(alreadyPlain.strategy, "plain");
+  assert.equal(alreadyPlain.buffer.equals(plain), true);
+});
+
+test("normalizes WeChat Channels videos without losing large ids", () => {
+  const topic = normalizeWeChatChannelsTopic(
+    {
+      id: "14941130915890399732",
+      object_nonce_id: "18446744073709551615",
+      username: "v2_example@finder",
+      nickname: "人民日报",
+      title: [{ shortTitle: "测试视频号标题" }],
+      like_count: "1200",
+      comment_count: "34",
+      forward_count: "56",
+      fav_count: "78",
+      create_time: "1783070000",
+      media: {
+        full_url: "https://example.com/encrypted.mp4",
+        decode_key: "123456",
+        cover_url: "https://example.com/cover",
+        cover_url_token: "?token=abc",
+        duration: 40,
+      },
+    },
+    { inputName: "人民日报" },
+  );
+
+  assert.equal(topic.platform, "wechat_channels");
+  assert.equal(topic.title, "测试视频号标题");
+  assert.equal(topic.link, "");
+  assert.equal(topic.coverUrl, "https://example.com/cover?token=abc");
+  assert.equal(topic.durationSeconds, 40);
+  assert.equal(topic.id, "wechat_channels:14941130915890399732");
+  assert.equal(topic.source.objectId, "14941130915890399732");
+  assert.equal(topic.source.objectNonceId, "18446744073709551615");
+  assert.equal(topic.source.finderUsername, "v2_example@finder");
+  assert.equal(topic.source.mediaUrl, "https://example.com/encrypted.mp4");
+  assert.equal(topic.source.decodeKey, "123456");
+  assert.deepEqual(topic.stats, {
+    comments: 34,
+    likes: 1200,
+    shares: 56,
+    bookmarks: 78,
+  });
+});
+
+test("checks WeChat Channels publish time against a seven day window", () => {
+  const now = Date.parse("2026-07-03T12:00:00Z");
+  assert.equal(isWithinRecentDays(Date.parse("2026-06-27T12:00:00Z") / 1000, 7, now), true);
+  assert.equal(isWithinRecentDays(Date.parse("2026-06-25T11:59:59Z") / 1000, 7, now), false);
+  assert.equal(isWithinRecentDays(Date.parse("2026-07-04T00:00:00Z") / 1000, 7, now), false);
 });
 
 test("routes the main content workflow to the agent", () => {

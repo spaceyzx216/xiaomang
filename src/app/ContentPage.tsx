@@ -17,6 +17,7 @@ import { clearCachedFinalDrafts, readCachedFinalDrafts } from "./finalDraftCache
 
 type TopicLike = {
   id?: string;
+  platform?: "douyin" | "wechat_channels";
   title?: string;
   authorName?: string;
   link?: string;
@@ -28,6 +29,15 @@ type TopicLike = {
   };
   publishDate?: string;
   hotTopics?: string[];
+  source?: {
+    platform?: string;
+    objectId?: string;
+    objectNonceId?: string;
+    finderUsername?: string;
+    mediaUrl?: string;
+    decodeKey?: string;
+    coverUrl?: string;
+  };
   rawData?: any;
 };
 
@@ -283,6 +293,39 @@ const getTopicShareLink = (topic: TopicLike) => {
     topic?.link ||
     ""
   );
+};
+
+const isWeChatChannelsTopic = (topic: TopicLike) =>
+  topic?.platform === "wechat_channels" ||
+  topic?.source?.platform === "wechat_channels" ||
+  topic?.rawData?.platform === "wechat_channels";
+
+const getTopicWorkflowKey = (topic: TopicLike) => {
+  if (!isWeChatChannelsTopic(topic)) return getTopicShareLink(topic);
+  const rawData = topic?.rawData || {};
+  const source = topic?.source || {};
+  const id =
+    source.objectId ||
+    rawData.id ||
+    rawData.object_id ||
+    rawData.objectId ||
+    topic.id ||
+    source.objectNonceId ||
+    rawData.object_nonce_id ||
+    rawData.objectNonceId ||
+    topic.title ||
+    "topic";
+  return `wechat_channels:${String(id).replace(/^wechat_channels:/, "")}`;
+};
+
+const describeTopicSource = (topic: TopicLike) => {
+  if (!isWeChatChannelsTopic(topic)) return getTopicShareLink(topic);
+  const source = topic?.source || {};
+  return [
+    source.finderUsername ? `finderUsername: ${source.finderUsername}` : "",
+    source.objectId ? `objectId: ${source.objectId}` : "",
+    source.objectNonceId ? `objectNonceId: ${source.objectNonceId}` : "",
+  ].filter(Boolean).join(" / ");
 };
 
 const toNumber = (value: any) => {
@@ -808,19 +851,27 @@ export default function ContentPage() {
 
   const shareLinks = useMemo(() => {
     return selectedTopics
+      .filter(topic => !isWeChatChannelsTopic(topic))
       .map(getTopicShareLink)
       .map(link => String(link || "").trim())
       .filter(Boolean);
   }, [selectedTopics]);
 
-  const shareLinksText = useMemo(() => shareLinks.join("\n"), [shareLinks]);
+  const wechatTopics = useMemo(() => selectedTopics.filter(isWeChatChannelsTopic), [selectedTopics]);
+  const workflowInputs = useMemo(() => [
+    ...shareLinks.map(link => ({ id: link, kind: "share_link" as const, link, topic: null as TopicLike | null })),
+    ...wechatTopics.map(topic => ({ id: getTopicWorkflowKey(topic), kind: "wechat_topic" as const, link: "", topic })),
+  ], [shareLinks, wechatTopics]);
+  const workflowInputIds = useMemo(() => workflowInputs.map(item => item.id), [workflowInputs]);
   const activeGroup = workflowGroups[activeGroupIndex] || null;
   const workflowResult = activeGroup?.result || fallbackResult;
   const benchmarkVideos = useMemo(() => buildBenchmarkVideos(selectedTopics), [selectedTopics]);
   const activeBenchmarkVideos = useMemo(() => {
+    const matchedTopics = selectedTopics.filter(topic => sameLink(getTopicWorkflowKey(topic), activeGroup?.shareLink));
+    if (matchedTopics.length > 0) return buildBenchmarkVideos(matchedTopics);
     const matched = benchmarkVideos.filter(item => sameLink(item.link, activeGroup?.shareLink));
     return matched.length > 0 ? matched : benchmarkVideos;
-  }, [benchmarkVideos, activeGroup?.shareLink]);
+  }, [selectedTopics, benchmarkVideos, activeGroup?.shareLink]);
 
   const toggleSelection = (value: string, list: string[], setList: (v: string[]) => void) => {
     setList(list.includes(value) ? list.filter(item => item !== value) : [...list, value]);
@@ -1405,19 +1456,19 @@ export default function ContentPage() {
       return;
     }
 
-    if (!shareLinksText) {
-      setWorkflowError("未检测到分享链接，请先在上一页选择选题并携带可用链接");
+    if (workflowInputs.length === 0) {
+      setWorkflowError("未检测到可生成内容的选题，请先在上一页选择选题");
       return;
     }
 
     const force = options.force !== false;
-    const reusableGroups = force ? [] : pickReusableWorkflowGroups(shareLinks, workflowGroups);
-    const linksToGenerate = force
-      ? shareLinks
-      : shareLinks.filter(link => !reusableGroups.some(group => sameLink(group.shareLink, link)));
+    const reusableGroups = force ? [] : pickReusableWorkflowGroups(workflowInputIds, workflowGroups);
+    const inputsToGenerate = force
+      ? workflowInputs
+      : workflowInputs.filter(input => !reusableGroups.some(group => sameLink(group.shareLink, input.id)));
 
     if (!force) {
-      const orderedReusableGroups = orderWorkflowGroupsByLinks(shareLinks, reusableGroups);
+      const orderedReusableGroups = orderWorkflowGroupsByLinks(workflowInputIds, reusableGroups);
       setWorkflowRawDone("");
       setWorkflowGroups(orderedReusableGroups);
       sessionStorage.removeItem("workflowRawDone");
@@ -1429,7 +1480,7 @@ export default function ContentPage() {
       });
     }
 
-    if (linksToGenerate.length === 0) {
+    if (inputsToGenerate.length === 0) {
       setWorkflowError(null);
       setStreamPreview("");
       return;
@@ -1467,10 +1518,10 @@ export default function ContentPage() {
     }
 
     try {
-      const MAX_LINKS_PER_BATCH = 1;
-      const batches: string[][] = [];
-      for (let i = 0; i < linksToGenerate.length; i += MAX_LINKS_PER_BATCH) {
-        batches.push(linksToGenerate.slice(i, i + MAX_LINKS_PER_BATCH));
+      const MAX_INPUTS_PER_BATCH = 1;
+      const batches: typeof workflowInputs[] = [];
+      for (let i = 0; i < inputsToGenerate.length; i += MAX_INPUTS_PER_BATCH) {
+        batches.push(inputsToGenerate.slice(i, i + MAX_INPUTS_PER_BATCH));
       }
 
       const allGroups: WorkflowResultGroup[] = [...reusableGroups];
@@ -1485,7 +1536,7 @@ export default function ContentPage() {
       const commitPartialResults = () => {
         ensureCurrentRun();
         const combinedPayload = allRawPayloads.join("\n\n");
-        const orderedGroups = orderWorkflowGroupsByLinks(shareLinks, allGroups);
+        const orderedGroups = orderWorkflowGroupsByLinks(workflowInputIds, allGroups);
         setWorkflowRawDone(combinedPayload);
         sessionStorage.setItem("workflowRawDone", combinedPayload);
         setWorkflowGroups(orderedGroups);
@@ -1495,8 +1546,15 @@ export default function ContentPage() {
       for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
         ensureCurrentRun();
 
-        const batchLinks = batches[batchIndex];
-        const batchLinksText = batchLinks.join("\n");
+        const batchInputs = batches[batchIndex];
+        const batchIds = batchInputs.map(item => item.id);
+        const batchLinksText = batchInputs
+          .filter(item => item.kind === "share_link")
+          .map(item => item.link)
+          .join("\n");
+        const batchWechatTopics = batchInputs
+          .filter(item => item.kind === "wechat_topic" && item.topic)
+          .map(item => item.topic);
 
         const response = await fetch(apiUrl("/api/agent/workflow/stream-run"), {
           method: "POST",
@@ -1507,6 +1565,7 @@ export default function ContentPage() {
             workflow_id: "7618854964156563519",
             parameters: {
               share_links: batchLinksText,
+              benchmark_topics: batchWechatTopics,
             },
           }),
           signal: controller.signal,
@@ -1573,13 +1632,13 @@ export default function ContentPage() {
               const payloadText = donePayload || batchPreview;
               allRawPayloads.push(payloadText);
 
-              const grouped = parseWorkflowPayloadGroups(payloadText, batchLinks);
+              const grouped = parseWorkflowPayloadGroups(payloadText, batchIds);
               const normalized = grouped.length > 0
                 ? grouped
                 : [
                     {
                       id: `link-${allGroups.length + 1}`,
-                      shareLink: batchLinks[0] || "",
+                      shareLink: batchIds[0] || "",
                       result: parseWorkflowPayload(payloadText),
                     },
                   ];
@@ -1621,16 +1680,16 @@ export default function ContentPage() {
   useEffect(() => {
     const autoRunKey = sessionStorage.getItem("contentAutoRunKey") || "";
     const consumedKey = sessionStorage.getItem("contentAutoRunConsumedKey") || "";
-    if (!shareLinksText || workflowInFlightRef.current) return;
-    const reusableGroups = pickReusableWorkflowGroups(shareLinks, workflowGroups);
-    const hasMissingLinks = shareLinks.some(link => !reusableGroups.some(group => sameLink(group.shareLink, link)));
+    if (workflowInputs.length === 0 || workflowInFlightRef.current) return;
+    const reusableGroups = pickReusableWorkflowGroups(workflowInputIds, workflowGroups);
+    const hasMissingLinks = workflowInputIds.some(id => !reusableGroups.some(group => sameLink(group.shareLink, id)));
     if (autoRunKey && consumedKey === autoRunKey && !hasMissingLinks) return;
     if (!autoRunKey || (autoRunKeyRef.current === autoRunKey && !hasMissingLinks)) return;
 
     autoRunKeyRef.current = autoRunKey;
     sessionStorage.setItem("contentAutoRunConsumedKey", autoRunKey);
     runWorkflow({ force: false });
-  }, [shareLinksText, workflowGroups]);
+  }, [workflowInputs, workflowInputIds, workflowGroups]);
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -1709,11 +1768,16 @@ export default function ContentPage() {
               <div>
                 当前已选选题：{selectedTopics.length} 条。后续标题、3 秒留存、二创文案将基于这些真实选题数据生成。
               </div>
+              {wechatTopics.length > 0 && (
+                <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
+                  已包含 {wechatTopics.length} 条视频号选题。系统将使用媒体地址和 decode_key 解密后进入转写生成。
+                </div>
+              )}
 
               <div className="flex flex-wrap gap-2 items-center">
                 <Button
                   onClick={() => runWorkflow({ force: true })}
-                  disabled={workflowLoading || !shareLinksText}
+                  disabled={workflowLoading || workflowInputs.length === 0}
                   className="bg-indigo-600 hover:bg-indigo-700 text-white"
                 >
                   {workflowLoading ? (
@@ -1757,7 +1821,7 @@ export default function ContentPage() {
                       </AccordionTrigger>
                       <AccordionContent className="px-3 pb-3 text-xs text-slate-600 space-y-2">
                         <div>作者：{topic?.authorName || "未知"}</div>
-                        <div>链接：{getTopicShareLink(topic) || "未提供"}</div>
+                        <div>{isWeChatChannelsTopic(topic) ? "视频号来源" : "链接"}：{describeTopicSource(topic) || "未提供"}</div>
                         <div>
                           数据：点赞 {formatMetric(readStat(topic, "likes", ["digg_count", "like_count", "likes"]))} / 评论 {formatMetric(readStat(topic, "comments", ["comment_count", "comments"]))} / 转发 {formatMetric(readStat(topic, "shares", ["share_count", "shares"]))} / 收藏 {formatMetric(readStat(topic, "bookmarks", ["collect_count", "favorite_count", "bookmark_count", "bookmarks"]))}
                         </div>

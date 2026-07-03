@@ -1,5 +1,7 @@
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
+import { Transform } from "stream";
+import { Readable } from "stream";
 import {
   AgentError,
   appendQuery,
@@ -9,6 +11,7 @@ import {
   safeJsonParse,
   retryDelayMs,
   sleep,
+  withTimeout,
 } from "./http.js";
 import {
   DOUBAO_VIDEO_TRANSCRIPT_PROMPT,
@@ -18,8 +21,13 @@ import {
   TITLE_PROMPT,
 } from "./prompts.js";
 import { normalizeEndingHook, normalizeOpeningHook, parseJsonAgentOutput } from "./adapter.js";
+import { generateKeystream } from "./vendor/wechatKeystream.mjs";
 
 const transcriptCache = new Map();
+
+// 视频号 Isaac64 加密仅作用于文件前 KEYSTREAM_SIZE 字节，其余为明文。
+// KEYSTREAM_SIZE 同时也是密钥流长度（见 vendor/wechatKeystream.mjs）。
+const WECHAT_KEYSTREAM_SIZE = 131072;
 
 const isObject = value => value && typeof value === "object" && !Array.isArray(value);
 
@@ -114,6 +122,64 @@ const isVideoUrl = value => {
   if (/\/user\//i.test(text)) return false;
   if (/\.(jpe?g|png|webp|gif)(\?|$)/i.test(text)) return false;
   return /(\.mp4(\?|$)|\/aweme\/v1\/play|video_id=|play_addr|download_addr|douyin.*play)/i.test(text);
+};
+
+const isWeChatChannelsVideo = (videoMeta) =>
+  videoMeta?.platform === "wechat_channels" ||
+  videoMeta?.source?.platform === "wechat_channels" ||
+  Boolean(videoMeta?.decodeKey && videoMeta?.videoUrl);
+
+const wechatTopicKey = (topic = {}) => {
+  const source = topic?.source || {};
+  const rawData = topic?.rawData || {};
+  const objectId =
+    source.objectId ||
+    rawData.id ||
+    rawData.object_id ||
+    rawData.objectId ||
+    topic.id ||
+    source.objectNonceId ||
+    rawData.object_nonce_id ||
+    rawData.objectNonceId ||
+    "";
+  return `wechat_channels:${String(objectId || topic.title || "topic").replace(/^wechat_channels:/, "")}`;
+};
+
+export const resolveWeChatChannelsTopicVideo = (topic = {}) => {
+  const source = topic?.source || {};
+  const rawData = topic?.rawData || {};
+  const media = rawData?.media || {};
+  const videoUrl = String(source.mediaUrl || media.full_url || media.url || "").trim();
+  const decodeKey = String(source.decodeKey || media.decode_key || "").trim();
+  const title = String(topic.title || rawData.desc || rawData.title?.[0]?.shortTitle || rawData.nickname || "未识别标题").trim();
+  const cover = String(source.coverUrl || topic.coverUrl || media.cover_url || rawData.cover_img_url || "").trim();
+
+  if (!videoUrl) {
+    throw new AgentError("WeChat Channels topic is missing mediaUrl", {
+      code: "WECHAT_MEDIA_URL_MISSING",
+      status: 400,
+      details: { topicId: topic.id, title },
+    });
+  }
+  if (!decodeKey) {
+    throw new AgentError("WeChat Channels topic is missing decodeKey", {
+      code: "WECHAT_DECODE_KEY_MISSING",
+      status: 400,
+      details: { topicId: topic.id, title },
+    });
+  }
+
+  return {
+    shareLink: wechatTopicKey(topic),
+    awemeId: wechatTopicKey(topic),
+    platform: "wechat_channels",
+    title,
+    cover,
+    videoUrl,
+    decodeKey,
+    source,
+    raw: rawData || topic,
+  };
 };
 
 const parseAwemeIdFromShareLink = (shareLink) => {
@@ -427,6 +493,272 @@ const loadFfmpegPath = async () => {
   return ffmpegPath;
 };
 
+// 视频号文件是否已是明文 MP4：偏移 4-8 处应为 "ftyp"（ISO BMFF 文件类型盒签名）。
+const isPlainMp4Header = (buffer) =>
+  Buffer.isBuffer(buffer) && buffer.length >= 8 && buffer.toString("latin1", 4, 8) === "ftyp";
+
+/**
+ * 解密视频号媒体 buffer。
+ *
+ * 加密机制（经逆向确认，见 vendor/wechatKeystream.mjs 与 aynakeya 的分析）：
+ *   - decodeKey 作为 seed（内部 stoull 转 uint64）初始化 Isaac64 PRNG
+ *   - 生成 131072 字节密钥流并 reverse() 后，与文件【前 131072 字节】逐字节 XOR
+ *   - 文件其余部分为明文，原样保留
+ *
+ * 因此本函数不再像旧实现那样尝试 15 种猜测策略：密钥流由 decodeKey 唯一确定，
+ * 解密后偏移 4-8 处必然出现 "ftyp"，可作为成功判据。
+ *
+ * 注意：从同步变异步——generateKeystream 需等待 wasm 实例化（进程内仅一次）。
+ */
+export const decryptWeChatChannelsMediaBuffer = async (buffer, decodeKey) => {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+    throw new AgentError("WeChat Channels media buffer is empty", { code: "WECHAT_MEDIA_EMPTY" });
+  }
+  if (isPlainMp4Header(buffer)) {
+    return { buffer, strategy: "plain" };
+  }
+  if (!decodeKey) {
+    throw new AgentError("WeChat Channels media missing decodeKey", { code: "WECHAT_DECODE_KEY_MISSING" });
+  }
+
+  const keystream = await generateKeystream(String(decodeKey)); // Uint8Array(131072)
+  const decrypted = Buffer.from(buffer); // 拷贝，明文部分原样保留
+  const len = Math.min(WECHAT_KEYSTREAM_SIZE, decrypted.length, keystream.length);
+  for (let i = 0; i < len; i += 1) {
+    decrypted[i] = buffer[i] ^ keystream[i];
+  }
+
+  if (!isPlainMp4Header(decrypted)) {
+    throw new AgentError("WeChat Channels media decrypt failed (no ftyp signature after XOR)", {
+      code: "WECHAT_MEDIA_DECRYPT_FAILED",
+      details: { decodeKey: String(decodeKey).slice(0, 16) },
+    });
+  }
+  return { buffer: decrypted, strategy: "isaac64" };
+};
+
+const mediaEndpointForLogs = (url) => {
+  const diagnostics = describeVideoUrlForDiagnostics(url);
+  return diagnostics.host ? `${diagnostics.host}${diagnostics.path || ""}` : "wechat-media";
+};
+
+const fetchBinary = async (url, config, options = {}) => {
+  const logger = options.logger;
+  const maxAttempts = Math.max(1, Number(config.apiRetryAttempts || 0) + 1);
+  const maxBytes = Number(config.wechatMediaMaxBytes || 220 * 1024 * 1024);
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const timeout = withTimeout(config.requestTimeoutMs || 120000);
+    const startedAt = Date.now();
+    const endpoint = mediaEndpointForLogs(url);
+    logger?.info("external.request.start", {
+      interface: "wechat_channels:media-download",
+      method: "GET",
+      endpoint,
+      attempt,
+      maxAttempts,
+    });
+
+    try {
+      const response = await fetch(url, { signal: timeout.signal });
+      const contentLength = Number(response.headers.get("content-length") || 0);
+      if (contentLength > maxBytes) {
+        throw new AgentError("WeChat Channels media exceeded download limit", {
+          code: "WECHAT_MEDIA_TOO_LARGE",
+          status: 413,
+          details: { contentLength, maxBytes },
+        });
+      }
+      if (!response.ok) {
+        throw new AgentError(`HTTP ${response.status} from WeChat Channels media`, {
+          code: "HTTP_ERROR",
+          status: response.status,
+        });
+      }
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.length > maxBytes) {
+        throw new AgentError("WeChat Channels media exceeded download limit", {
+          code: "WECHAT_MEDIA_TOO_LARGE",
+          status: 413,
+          details: { bytes: buffer.length, maxBytes },
+        });
+      }
+      logger?.info("external.request.end", {
+        interface: "wechat_channels:media-download",
+        method: "GET",
+        endpoint,
+        status: response.status,
+        durationMs: Date.now() - startedAt,
+        bytes: buffer.length,
+        attempt,
+        maxAttempts,
+      });
+      return buffer;
+    } catch (error) {
+      lastError = error;
+      logger?.warn("external.request.error", {
+        interface: "wechat_channels:media-download",
+        method: "GET",
+        endpoint,
+        durationMs: Date.now() - startedAt,
+        attempt,
+        maxAttempts,
+        error: error instanceof Error ? error.message : "Media download failed",
+        code: error?.code,
+      });
+      if (attempt >= maxAttempts) break;
+      await sleep(retryDelayMs(attempt, config.apiRetryBaseDelayMs));
+    } finally {
+      timeout.cancel();
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new AgentError("WeChat Channels media download failed", { code: "WECHAT_MEDIA_DOWNLOAD_FAILED" });
+};
+
+/**
+ * 流式下载视频号媒体，返回 response（含 body 流），供下游边读边处理。
+ * 与 fetchBinary 共用重试/超时/大小上限逻辑，但不把整个 buffer 读进内存。
+ * 成功返回的 response 由调用方负责消费/取消；body 在调用方读完后会自动关闭。
+ */
+const fetchMediaResponse = async (url, config, options = {}) => {
+  const logger = options.logger;
+  const maxAttempts = Math.max(1, Number(config.apiRetryAttempts || 0) + 1);
+  const maxBytes = Number(config.wechatMediaMaxBytes || 220 * 1024 * 1024);
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const timeout = withTimeout(config.requestTimeoutMs || 120000);
+    const startedAt = Date.now();
+    const endpoint = mediaEndpointForLogs(url);
+    logger?.info("external.request.start", {
+      interface: "wechat_channels:media-download-stream",
+      method: "GET",
+      endpoint,
+      attempt,
+      maxAttempts,
+    });
+
+    try {
+      const response = await fetch(url, { signal: timeout.signal });
+      const contentLength = Number(response.headers.get("content-length") || 0);
+      if (contentLength > maxBytes) {
+        throw new AgentError("WeChat Channels media exceeded download limit", {
+          code: "WECHAT_MEDIA_TOO_LARGE",
+          status: 413,
+          details: { contentLength, maxBytes },
+        });
+      }
+      if (!response.ok) {
+        throw new AgentError(`HTTP ${response.status} from WeChat Channels media`, {
+          code: "HTTP_ERROR",
+          status: response.status,
+        });
+      }
+      logger?.info("external.request.end", {
+        interface: "wechat_channels:media-download-stream",
+        method: "GET",
+        endpoint,
+        status: response.status,
+        durationMs: Date.now() - startedAt,
+        contentLength,
+        attempt,
+        maxAttempts,
+      });
+      // response.body 可能因运行时而 null，规范化为已取消的可读流
+      const body = response.body || Readable.from([]);
+      return { response, body, contentLength, cancelTimeout: () => timeout.cancel() };
+    } catch (error) {
+      lastError = error;
+      timeout.cancel();
+      logger?.warn("external.request.error", {
+        interface: "wechat_channels:media-download-stream",
+        method: "GET",
+        endpoint,
+        durationMs: Date.now() - startedAt,
+        attempt,
+        maxAttempts,
+        error: error instanceof Error ? error.message : "Media stream failed",
+        code: error?.code,
+      });
+      if (attempt >= maxAttempts) break;
+      await sleep(retryDelayMs(attempt, config.apiRetryBaseDelayMs));
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new AgentError("WeChat Channels media download failed", { code: "WECHAT_MEDIA_DOWNLOAD_FAILED" });
+};
+
+/**
+ * 创建一个 Transform 流，对经过的数据前 KEYSTREAM_SIZE 字节做 XOR 解密，其余原样透传。
+ * 这样可把"下载流 → 解密 → ffmpeg stdin"串成管道，无需把整段视频读进内存或落盘。
+ * 仅前 128KB 需解密，故用 processedBytes 计数控制何时停止 XOR。
+ */
+const createWeChatDecryptTransform = (keystream) => {
+  let processedBytes = 0;
+  return new Transform({
+    transform(chunk, encoding, callback) {
+      try {
+        if (processedBytes < WECHAT_KEYSTREAM_SIZE && chunk.length > 0) {
+          const limit = Math.min(chunk.length, WECHAT_KEYSTREAM_SIZE - processedBytes);
+          for (let i = 0; i < limit; i += 1) {
+            chunk[i] = chunk[i] ^ keystream[processedBytes + i];
+          }
+          processedBytes += limit;
+        }
+        callback(null, chunk);
+      } catch (error) {
+        callback(error);
+      }
+    },
+  });
+};
+
+const prepareVideoInput = async (videoMeta, config, options = {}) => {
+  if (!isWeChatChannelsVideo(videoMeta)) {
+    return { videoUrl: videoMeta.videoUrl, cleanup: async () => {}, localFile: false };
+  }
+
+  const logger = options.logger;
+  logger?.info("wechat_channels.media.prepare.start", {
+    title: videoMeta.title,
+    ...describeVideoUrlForDiagnostics(videoMeta.videoUrl),
+  });
+
+  // 流式管道：下载 → 解密 transform → 返回给 transcribeVideo 喂 ffmpeg stdin。
+  // 与旧的"全量下载到内存→解密→写临时文件"相比，内存恒定且无磁盘 I/O。
+  // keystream 可在下载前同步生成（Isaac64 密钥流只依赖 decodeKey），无需等下载。
+  const keystream = await generateKeystream(String(videoMeta.decodeKey));
+  const { body, cancelTimeout } = await fetchMediaResponse(videoMeta.videoUrl, config, { logger });
+  const decryptTransform = createWeChatDecryptTransform(keystream);
+  // web stream (response.body) 转 Node readable 后过解密 transform
+  const decryptedStream = Readable.fromWeb(body).pipe(decryptTransform);
+
+  logger?.info("wechat_channels.media.prepare.end", {
+    title: videoMeta.title,
+    strategy: "isaac64-stream",
+  });
+
+  return {
+    videoUrl: null,
+    stream: decryptedStream,
+    localFile: false,
+    cleanup: async () => {
+      cancelTimeout();
+      try {
+        if (!decryptedStream.destroyed) decryptedStream.destroy();
+      } catch {
+        /* ignore */
+      }
+    },
+  };
+};
+
 const extractAudioWithFfmpeg = async (videoUrl, config, options = {}) => {
   if (!config.ffmpegEnabled) {
     throw new AgentError("ffmpeg transcript provider is disabled", { code: "FFMPEG_DISABLED" });
@@ -529,6 +861,122 @@ const extractAudioWithFfmpeg = async (videoUrl, config, options = {}) => {
   });
 };
 
+/**
+ * 从可读流（如视频号解密后的流）提取音频，ffmpeg 通过 stdin (pipe:0) 读取输入。
+ * 与 extractAudioWithFfmpeg 的区别仅在于输入：stdin 流 vs -i url/路径。
+ * 用于视频号流式管道，避免把整段解密视频写临时文件再读回。
+ */
+const extractAudioFromStream = async (inputStream, config, options = {}) => {
+  if (!config.ffmpegEnabled) {
+    throw new AgentError("ffmpeg transcript provider is disabled", { code: "FFMPEG_DISABLED" });
+  }
+  const ffmpegPath = await loadFfmpegPath();
+  const logger = options.logger;
+  const startedAt = Date.now();
+  logger?.info("ffmpeg.extract.start", {
+    interface: "ffmpeg-static",
+    input: "stdin-stream",
+    output: "mp3-base64",
+  });
+
+  return await new Promise((resolve, reject) => {
+    const chunks = [];
+    let totalBytes = 0;
+    let stderr = "";
+    let finished = false;
+    const child = spawn(ffmpegPath, [
+      "-nostdin",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      "pipe:0",
+      "-vn",
+      "-map",
+      "0:a:0",
+      "-ac",
+      "1",
+      "-ar",
+      "16000",
+      "-b:a",
+      "32k",
+      "-f",
+      "mp3",
+      "pipe:1",
+    ]);
+
+    const timer = setTimeout(() => {
+      if (!finished) {
+        child.kill("SIGKILL");
+        reject(new AgentError("ffmpeg audio extraction timed out", { code: "FFMPEG_TIMEOUT" }));
+      }
+    }, config.ffmpegTimeoutMs);
+
+    child.stdout.on("data", chunk => {
+      totalBytes += chunk.length;
+      if (totalBytes > config.ffmpegAudioMaxBytes) {
+        child.kill("SIGKILL");
+        reject(new AgentError("ffmpeg audio output exceeded limit", { code: "FFMPEG_OUTPUT_TOO_LARGE" }));
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    child.stderr.on("data", chunk => {
+      stderr += chunk.toString("utf8");
+      if (stderr.length > 4000) stderr = stderr.slice(-4000);
+    });
+
+    child.on("error", error => {
+      clearTimeout(timer);
+      logger?.error("ffmpeg.extract.error", {
+        interface: "ffmpeg-static",
+        durationMs: Date.now() - startedAt,
+        error: error.message,
+      });
+      reject(new AgentError(error.message, { code: "FFMPEG_SPAWN_FAILED", cause: error }));
+    });
+
+    child.on("close", code => {
+      finished = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        logger?.error("ffmpeg.extract.error", {
+          interface: "ffmpeg-static",
+          durationMs: Date.now() - startedAt,
+          exitCode: code,
+          error: stderr.trim(),
+        });
+        reject(new AgentError("ffmpeg audio extraction failed", {
+          code: "FFMPEG_FAILED",
+          details: stderr.trim(),
+        }));
+        return;
+      }
+      const buffer = Buffer.concat(chunks);
+      if (buffer.length === 0) {
+        reject(new AgentError("ffmpeg produced empty audio", { code: "FFMPEG_EMPTY" }));
+        return;
+      }
+      logger?.info("ffmpeg.extract.end", {
+        interface: "ffmpeg-static",
+        durationMs: Date.now() - startedAt,
+        bytes: buffer.length,
+      });
+      resolve(buffer.toString("base64"));
+    });
+
+    // 把输入流泵入 ffmpeg stdin；输入结束即关闭 stdin 通知 ffmpeg 收尾
+    inputStream.on("error", error => {
+      if (!finished) {
+        child.kill("SIGKILL");
+        reject(new AgentError("ffmpeg input stream failed", { code: "FFMPEG_INPUT_STREAM_FAILED", cause: error }));
+      }
+    });
+    inputStream.pipe(child.stdin);
+  });
+};
+
 const callDoubaoVideoUnderstanding = async (videoUrl, config, options = {}) => {
   if (!config.doubaoVideoEndpoint || !config.doubaoVideoApiKey) {
     throw new AgentError("Missing Doubao video understanding endpoint or credentials", {
@@ -600,77 +1048,91 @@ export const transcribeVideo = async (videoMeta, config, options = {}) => {
   }
 
   const warnings = [];
-  for (const provider of config.transcriptProviders) {
-    try {
-      logger?.info("transcript.provider.start", {
-        provider,
-        videoTitle: videoMeta.title,
-      });
-      onProgress({
-        step: "transcript-provider-start",
-        provider,
-        message: `尝试转写方案：${provider}`,
-      });
-      if (provider === "ffmpeg") {
-        const audioDataBase64 = await extractAudioWithFfmpeg(videoMeta.videoUrl, config, { logger });
-        onProgress({
-          step: "audio-extracted",
+  const prepared = await prepareVideoInput(videoMeta, config, { logger });
+  try {
+    for (const provider of config.transcriptProviders) {
+      try {
+        logger?.info("transcript.provider.start", {
           provider,
-          message: "ffmpeg-static 已提取音频，开始调用豆包 ASR",
-        });
-        const asr = await recognizeDoubaoAudio({ audioDataBase64 }, config, { logger });
-        const value = { ...asr, provider: "ffmpeg+doubao-asr", warnings };
-        logger?.info("transcript.provider.success", {
-          provider: value.provider,
-          textLength: value.text.length,
-          duration: value.duration,
+          videoTitle: videoMeta.title,
         });
         onProgress({
-          step: "transcript-provider-success",
-          provider: value.provider,
-          message: `转写方案成功：${value.provider}`,
+          step: "transcript-provider-start",
+          provider,
+          message: `尝试转写方案：${provider}`,
         });
-        transcriptCache.set(cacheKey, { createdAt: Date.now(), value });
-        return value;
-      }
-      if (provider === "doubao-video") {
-        const text = await callDoubaoVideoUnderstanding(videoMeta.videoUrl, config, { logger });
-        const value = { text, utterances: [], provider: "doubao-video", warnings };
-        logger?.info("transcript.provider.success", {
-          provider: value.provider,
-          textLength: value.text.length,
+        if (provider === "ffmpeg") {
+          // 视频号走流式管道（prepared.stream）；抖音/直链用 prepared.videoUrl
+          const audioDataBase64 = prepared.stream
+            ? await extractAudioFromStream(prepared.stream, config, { logger })
+            : await extractAudioWithFfmpeg(prepared.videoUrl, config, { logger });
+          onProgress({
+            step: "audio-extracted",
+            provider,
+            message: "ffmpeg-static 已提取音频，开始调用豆包 ASR",
+          });
+          const asr = await recognizeDoubaoAudio({ audioDataBase64 }, config, { logger });
+          const value = { ...asr, provider: "ffmpeg+doubao-asr", warnings };
+          logger?.info("transcript.provider.success", {
+            provider: value.provider,
+            textLength: value.text.length,
+            duration: value.duration,
+          });
+          onProgress({
+            step: "transcript-provider-success",
+            provider: value.provider,
+            message: `转写方案成功：${value.provider}`,
+          });
+          transcriptCache.set(cacheKey, { createdAt: Date.now(), value });
+          return value;
+        }
+        if (provider === "doubao-video") {
+          // doubao-video 需要可公网访问的 URL，无法消费本地解密流/文件
+          if (prepared.localFile || prepared.stream) {
+            throw new AgentError("doubao-video cannot access local decrypted WeChat Channels media", {
+              code: "DOUBAO_VIDEO_LOCAL_FILE_UNSUPPORTED",
+            });
+          }
+          const text = await callDoubaoVideoUnderstanding(prepared.videoUrl, config, { logger });
+          const value = { text, utterances: [], provider: "doubao-video", warnings };
+          logger?.info("transcript.provider.success", {
+            provider: value.provider,
+            textLength: value.text.length,
+          });
+          onProgress({
+            step: "transcript-provider-success",
+            provider: value.provider,
+            message: "多模态视频理解兜底成功：doubao-video",
+          });
+          transcriptCache.set(cacheKey, { createdAt: Date.now(), value });
+          return value;
+        }
+        warnings.push({ provider, message: "Unknown transcript provider" });
+      } catch (error) {
+        logger?.warn("transcript.provider.failed", {
+          provider,
+          code: error?.code,
+          status: error?.status,
+          error: error instanceof Error ? error.message : "Transcript provider failed",
+          details: compactDetails(error?.details),
         });
         onProgress({
-          step: "transcript-provider-success",
-          provider: value.provider,
-          message: "多模态视频理解兜底成功：doubao-video",
+          step: "transcript-provider-failed",
+          provider,
+          level: "warn",
+          message: `转写方案失败：${provider}`,
+          detail: error instanceof Error ? error.message : "Transcript provider failed",
+          code: error?.code,
         });
-        transcriptCache.set(cacheKey, { createdAt: Date.now(), value });
-        return value;
+        warnings.push({
+          provider,
+          message: error instanceof Error ? error.message : "Transcript provider failed",
+          code: error?.code,
+        });
       }
-      warnings.push({ provider, message: "Unknown transcript provider" });
-    } catch (error) {
-      logger?.warn("transcript.provider.failed", {
-        provider,
-        code: error?.code,
-        status: error?.status,
-        error: error instanceof Error ? error.message : "Transcript provider failed",
-        details: compactDetails(error?.details),
-      });
-      onProgress({
-        step: "transcript-provider-failed",
-        provider,
-        level: "warn",
-        message: `转写方案失败：${provider}`,
-        detail: error instanceof Error ? error.message : "Transcript provider failed",
-        code: error?.code,
-      });
-      warnings.push({
-        provider,
-        message: error instanceof Error ? error.message : "Transcript provider failed",
-        code: error?.code,
-      });
     }
+  } finally {
+    await prepared.cleanup();
   }
 
   throw new AgentError("All transcript providers failed", {
