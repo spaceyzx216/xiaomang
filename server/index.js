@@ -8,7 +8,7 @@ import { getContentAgentConfig } from "../api/_lib/contentAgent/config.js";
 import { appendQuery, fetchJson } from "../api/_lib/contentAgent/http.js";
 import { createRequestLogger, safeLink } from "../api/_lib/contentAgent/logger.js";
 import { runRewriteAgent, runTranslationAgent } from "../api/_lib/contentAgent/providers.js";
-import { fetchPlatformTopics, fetchWeChatChannelsShareLink, searchPlatformAccounts } from "../api/_lib/platformAdapters.js";
+import { platformRouter } from "../api/_lib/routers/platform.js";
 import {
   buildDraftListCsvRows,
   buildFinalDraftCsvRows,
@@ -220,83 +220,11 @@ app.post("/api/tikhub/batch", async (req, res) => {
   return res.json({ results });
 });
 
-app.post("/api/platform/accounts/search", async (req, res) => {
-  const logger = createRequestLogger("api.platform.accounts.search", req.headers["x-request-id"]);
-  logger.info("route.request.start", {
-    interface: "/api/platform/accounts/search",
-    platform: req.body?.platform,
-    keywordCount: Array.isArray(req.body?.keywords) ? req.body.keywords.length : 0,
-  });
-
-  try {
-    const payload = await searchPlatformAccounts(req.body || {}, getContentAgentConfig(), { logger });
-    logger.info("route.request.done", {
-      interface: "/api/platform/accounts/search",
-      resultCount: Array.isArray(payload?.results) ? payload.results.length : 0,
-    });
-    return res.json(payload);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Account search failed";
-    logger.error("route.request.error", {
-      interface: "/api/platform/accounts/search",
-      code: error?.code,
-      error: message,
-    });
-    return res.status(error?.status || 500).json({ error: message, code: error?.code });
-  }
-});
-
-app.post("/api/platform/topics/batch", async (req, res) => {
-  const logger = createRequestLogger("api.platform.topics.batch", req.headers["x-request-id"]);
-  logger.info("route.request.start", {
-    interface: "/api/platform/topics/batch",
-    platform: req.body?.platform,
-    accountCount: Array.isArray(req.body?.accounts) ? req.body.accounts.length : 0,
-  });
-
-  try {
-    const payload = await fetchPlatformTopics(req.body || {}, getContentAgentConfig(), { logger });
-    logger.info("route.request.done", {
-      interface: "/api/platform/topics/batch",
-      resultCount: Array.isArray(payload?.results) ? payload.results.length : 0,
-    });
-    return res.json(payload);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Topic fetch failed";
-    logger.error("route.request.error", {
-      interface: "/api/platform/topics/batch",
-      code: error?.code,
-      error: message,
-    });
-    return res.status(error?.status || 500).json({ error: message, code: error?.code });
-  }
-});
-
-app.post("/api/platform/topics/share-link", async (req, res) => {
-  const logger = createRequestLogger("api.platform.topics.share-link", req.headers["x-request-id"]);
-  logger.info("route.request.start", {
-    interface: "/api/platform/topics/share-link",
-    platform: req.body?.platform,
-    objectId: req.body?.objectId || req.body?.object_id,
-  });
-
-  try {
-    const payload = await fetchWeChatChannelsShareLink(req.body || {}, getContentAgentConfig(), { logger });
-    logger.info("route.request.done", {
-      interface: "/api/platform/topics/share-link",
-      objectId: payload.objectId,
-    });
-    return res.json(payload);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Share link generation failed";
-    logger.error("route.request.error", {
-      interface: "/api/platform/topics/share-link",
-      code: error?.code,
-      error: message,
-    });
-    return res.status(error?.status || 500).json({ error: message, code: error?.code });
-  }
-});
+// platform 路由（accounts/search、topics/batch、topics/share-link）合并为单个 handler。
+// 共享 handler 同时服务线上 Vercel（api/platform.ts）与本地 Express，按 req.url 末尾分发。
+app.post("/api/platform/accounts/search", (req, res) => platformRouter(req, res));
+app.post("/api/platform/topics/batch", (req, res) => platformRouter(req, res));
+app.post("/api/platform/topics/share-link", (req, res) => platformRouter(req, res));
 
 app.post("/api/agent/workflow/stream-run", async (req, res) => {
   const logger = createRequestLogger("api.agent.workflow.stream-run", req.headers["x-request-id"]);

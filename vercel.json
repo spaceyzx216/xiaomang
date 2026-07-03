@@ -9,11 +9,22 @@
     "api/agent/rewrite.ts": {
       "maxDuration": 120
     },
-    "api/export/feishu.ts": {
+    "api/platform.ts": {
       "maxDuration": 120
     },
-    "api/export/bitable.ts": {
+    "api/export.ts": {
       "maxDuration": 120
     }
-  }
+  },
+  "rewrites": [
+    { "source": "/api/platform/accounts/search", "destination": "/api/platform" },
+    { "source": "/api/platform/topics/batch", "destination": "/api/platform" },
+    { "source": "/api/platform/topics/share-link", "destination": "/api/platform" },
+    { "source": "/api/export/feishu", "destination": "/api/export" },
+    { "source": "/api/export/bitable", "destination": "/api/export" },
+    { "source": "/api/export/excel", "destination": "/api/export" },
+    { "source": "/api/export/word", "destination": "/api/export" },
+    { "source": "/api/export/final-drafts/word", "destination": "/api/export" },
+    { "source": "/api/export/final-drafts/excel", "destination": "/api/export" }
+  ]
 }
