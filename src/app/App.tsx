@@ -17,7 +17,7 @@ import { Target, TrendingUp, MessageCircle, ThumbsUp, Share2, Bookmark, External
 
 interface Topic {
   id: string;
-  platform?: "douyin" | "wechat_channels";
+  platform?: "douyin" | "wechat_channels" | "tiktok";
   title: string;
   tags: string[];
   isRecommended?: boolean;
@@ -43,10 +43,11 @@ interface Topic {
   rawData?: unknown;
 }
 
-type SourcePlatform = "douyin" | "wechat_channels";
+type SourcePlatform = "douyin" | "wechat_channels" | "tiktok";
 
 type TikhubBatchResult = {
   url?: string;
+  platform?: "douyin" | "tiktok";
   inputName?: string;
   secUserId?: string;
   finderUsername?: string;
@@ -299,12 +300,24 @@ export default function App() {
   const tikhubTopics = useMemo(() => {
     const now = Date.now();
     const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    // result.platform 由后端 batch 返回标记；抖音/C TikTok 走同一套 aweme 字段映射，
+    // 仅 platform 标记与 link 兜底域名不同。
+    const resolveTopicPlatform = (result: TikhubBatchResult): Topic["platform"] =>
+      result.platform === "tiktok" ? "tiktok" : "douyin";
+    const fallbackLink = (id: string, platform: Topic["platform"], authorName?: string) => {
+      if (platform === "tiktok") {
+        const handle = authorName ? `@${String(authorName).replace(/^@/, "")}` : "user";
+        return `https://www.tiktok.com/${handle}/video/${id}`;
+      }
+      return `https://www.douyin.com/video/${id}`;
+    };
 
     return tikhubResults.flatMap(result => {
       if (Array.isArray(result.topics)) {
         return result.topics;
       }
       if (result.error || !result.videosResponse) return [];
+      const topicPlatform = resolveTopicPlatform(result);
       const dataBlock = (result.videosResponse as any)?.data;
       const videosList = Array.isArray(dataBlock)
         ? dataBlock
@@ -324,7 +337,7 @@ export default function App() {
           const title = video?.desc || "未命名视频";
           const authorName = video?.author?.nickname || result.authorName || "未知";
           const publishDate = createdAt ? new Date(createdAt).toISOString().slice(0, 10) : undefined;
-          const link = video?.share_url || `https://www.douyin.com/video/${id}`;
+          const link = video?.share_url || fallbackLink(id, topicPlatform, authorName);
           const hotTopics = Array.isArray(video?.suggest_words)
             ? Array.from(
                 new Set(
@@ -339,7 +352,7 @@ export default function App() {
 
           return {
             id,
-            platform: "douyin",
+            platform: topicPlatform,
             title,
             tags: [],
             stats: {
@@ -421,7 +434,13 @@ export default function App() {
     const rawItems = parseLines(tikhubInput);
 
     if (rawItems.length === 0) {
-      setTikhubError(sourcePlatform === "wechat_channels" ? "请输入视频号对标账号名称（每行一个）" : "请输入抖音博主主页分享链接（每行一个）");
+      setTikhubError(
+        sourcePlatform === "wechat_channels"
+          ? "请输入视频号对标账号名称（每行一个）"
+          : sourcePlatform === "tiktok"
+            ? "请输入 TikTok 博主主页链接（每行一个，如 https://www.tiktok.com/@username）"
+            : "请输入抖音博主主页分享链接（每行一个）",
+      );
       return;
     }
 
@@ -467,7 +486,7 @@ export default function App() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ urls: rawItems }),
+        body: JSON.stringify({ urls: rawItems, platform: sourcePlatform }),
       });
 
       const data = await parseApiJson(response);
@@ -864,7 +883,7 @@ export default function App() {
                   </div>
                   <div className="text-xs text-slate-500 flex items-center gap-2">
                     <TrendingUp className="w-3.5 h-3.5" />
-                    {tikhubLoading ? "请求中" : sourcePlatform === "wechat_channels" ? "每行一个视频号名称" : "每行一个主页链接"}
+                    {tikhubLoading ? "请求中" : sourcePlatform === "wechat_channels" ? "每行一个视频号名称" : sourcePlatform === "tiktok" ? "每行一个 TikTok 主页链接" : "每行一个主页链接"}
                   </div>
                 </div>
               </CardHeader>
@@ -873,6 +892,7 @@ export default function App() {
                   {[
                     { id: "douyin", label: "抖音" },
                     { id: "wechat_channels", label: "视频号" },
+                    { id: "tiktok", label: "TikTok" },
                   ].map(option => (
                     <button
                       key={option.id}
@@ -893,7 +913,7 @@ export default function App() {
                 </div>
                 <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4">
                   <div className="text-xs font-semibold text-slate-600">
-                    {sourcePlatform === "wechat_channels" ? "视频号对标账号名称（多行）" : "抖音博主主页分享链接（多行）"}
+                    {sourcePlatform === "wechat_channels" ? "视频号对标账号名称（多行）" : sourcePlatform === "tiktok" ? "TikTok 博主主页链接（多行）" : "抖音博主主页分享链接（多行）"}
                   </div>
                   <textarea
                     value={tikhubInput}
@@ -902,7 +922,7 @@ export default function App() {
                       setTikhubInput(nextValue);
                       sessionStorage.setItem("tikhubInput", nextValue);
                     }}
-                    placeholder={sourcePlatform === "wechat_channels" ? "每行一个账号名称，例如：人民日报" : "每行一个主页链接"}
+                    placeholder={sourcePlatform === "wechat_channels" ? "每行一个账号名称，例如：人民日报" : sourcePlatform === "tiktok" ? "每行一个 TikTok 主页，例如：https://www.tiktok.com/@username" : "每行一个主页链接"}
                     className="mt-2 h-32 w-full resize-none rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-indigo-300 focus:ring-2 focus:ring-indigo-100"
                   />
                   {tikhubError && (
@@ -1127,7 +1147,7 @@ export default function App() {
                           </div>
                           <div className="flex flex-wrap gap-2 mb-3">
                             <Badge variant="secondary" className="bg-white text-slate-600 border-slate-200 text-xs">
-                              {topic.platform === "wechat_channels" ? "视频号" : "抖音"}
+                              {topic.platform === "wechat_channels" ? "视频号" : topic.platform === "tiktok" ? "TikTok" : "抖音"}
                             </Badge>
                             <Badge variant="secondary" className="bg-white text-slate-600 border-slate-200 text-xs">
                               作者：{topic.authorName || "未知"}

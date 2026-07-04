@@ -5,6 +5,9 @@ export const normalizePlatform = (value) => {
   if (text === "wechat" || text === "wechat_channels" || text === "channels" || text === "视频号") {
     return "wechat_channels";
   }
+  if (text === "tiktok" || text === "抖音国际版" || text === "international") {
+    return "tiktok";
+  }
   return "douyin";
 };
 

@@ -11,7 +11,7 @@
  *   final-drafts/word           —— 全部已存文案汇总为 doc
  *   final-drafts/excel          —— 全部已存文案汇总为 csv
  */
-import { json, readBody } from "../common.js";
+import { json, readBody } from "./http-util.js";
 import { createRequestLogger } from "../contentAgent/logger.js";
 import {
   buildDraftListCsvRows,

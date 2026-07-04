@@ -13,12 +13,33 @@ const toInt = (value, fallback) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 };
 
+const toFfmpegSize = (value, fallback) => {
+  const text = String(value || "").trim();
+  return /^[1-9]\d*(?:[kKmMgG])?$/.test(text) ? text : fallback;
+};
+
+const normalizeAsrAudioFormat = (value) => {
+  const format = String(value || "").toLowerCase();
+  return ["auto", "mp3", "wav"].includes(format) ? format : "auto";
+};
+
+const normalizeTranscriptProvider = (value) => {
+  const provider = String(value || "").toLowerCase();
+  if (provider === "tikhub") return "tikhub-ffmpeg";
+  return provider;
+};
+
 const getTranscriptProviders = () => {
-  const allowed = new Set(["ffmpeg", "doubao-video"]);
+  const allowed = new Set(["tikhub-ffmpeg", "ffmpeg", "doubao-video"]);
+  const enableTikHubProvider = String(process.env.TIKHUB_TRANSCRIPT_PROVIDER_ENABLED || "true").toLowerCase() !== "false";
   const providers = splitCsv(process.env.TRANSCRIPT_PROVIDERS, ["ffmpeg", "doubao-video"])
-    .map(item => item.toLowerCase())
+    .map(normalizeTranscriptProvider)
     .filter(item => allowed.has(item));
-  return providers.length > 0 ? providers : ["ffmpeg", "doubao-video"];
+  const normalized = providers.length > 0 ? providers : ["ffmpeg", "doubao-video"];
+  if (enableTikHubProvider && normalized.includes("ffmpeg") && !normalized.includes("tikhub-ffmpeg")) {
+    normalized.unshift("tikhub-ffmpeg");
+  }
+  return Array.from(new Set(normalized));
 };
 
 export const getContentAgentConfig = () => {
@@ -43,6 +64,13 @@ export const getContentAgentConfig = () => {
     ffmpegEnabled: String(process.env.FFMPEG_ENABLED || "true").toLowerCase() !== "false",
     ffmpegTimeoutMs: toInt(process.env.FFMPEG_TIMEOUT_MS, 90000),
     ffmpegAudioMaxBytes: toInt(process.env.FFMPEG_AUDIO_MAX_BYTES, 24 * 1024 * 1024),
+    ffmpegFastProbeSize: toFfmpegSize(process.env.FFMPEG_FAST_PROBE_SIZE, "1048576"),
+    ffmpegFastAnalyzeDuration: toFfmpegSize(process.env.FFMPEG_FAST_ANALYZE_DURATION, "1000000"),
+    asrAudioFormat: normalizeAsrAudioFormat(process.env.ASR_AUDIO_FORMAT || "auto"),
+    asrWavMaxBytes: toInt(process.env.ASR_WAV_MAX_BYTES, 20 * 1024 * 1024),
+    tikhubMediaUrlMaxAttempts: toInt(process.env.TIKHUB_MEDIA_URL_MAX_ATTEMPTS, 6),
+    mediaProxyUrl: process.env.TIKTOK_MEDIA_PROXY_URL || process.env.TIKHUB_MEDIA_PROXY_URL || process.env.MEDIA_PROXY_URL || "",
+    mediaUseEnvProxy: String(process.env.MEDIA_USE_ENV_PROXY || "true").toLowerCase() !== "false",
     wechatMediaMaxBytes: toInt(process.env.WECHAT_CHANNELS_MEDIA_MAX_BYTES, 220 * 1024 * 1024),
     doubaoAsrEndpoint:
       process.env.DOUBAO_ASR_ENDPOINT ||

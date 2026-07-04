@@ -2,6 +2,7 @@ import { spawn } from "child_process";
 import { randomUUID } from "crypto";
 import { Transform } from "stream";
 import { Readable } from "stream";
+import { EnvHttpProxyAgent, ProxyAgent, fetch as undiciFetch } from "undici";
 import {
   AgentError,
   appendQuery,
@@ -41,6 +42,43 @@ const compactDetails = (value) => {
   }
 };
 
+const mediaProxyDispatchers = new Map();
+
+const hasEnvProxy = () => Boolean(
+  process.env.HTTPS_PROXY ||
+  process.env.https_proxy ||
+  process.env.HTTP_PROXY ||
+  process.env.http_proxy ||
+  process.env.ALL_PROXY ||
+  process.env.all_proxy,
+);
+
+const getMediaFetchDispatcher = (config = {}) => {
+  const proxyUrl = String(config.mediaProxyUrl || "").trim();
+  if (proxyUrl) {
+    const cacheKey = `proxy:${proxyUrl}`;
+    if (!mediaProxyDispatchers.has(cacheKey)) {
+      mediaProxyDispatchers.set(cacheKey, new ProxyAgent(proxyUrl));
+    }
+    return mediaProxyDispatchers.get(cacheKey);
+  }
+  if (config.mediaUseEnvProxy && hasEnvProxy()) {
+    const cacheKey = "env";
+    if (!mediaProxyDispatchers.has(cacheKey)) {
+      mediaProxyDispatchers.set(cacheKey, new EnvHttpProxyAgent());
+    }
+    return mediaProxyDispatchers.get(cacheKey);
+  }
+  return null;
+};
+
+const fetchErrorDetails = error => ({
+  reason: error instanceof Error ? error.message : "Media stream failed",
+  causeName: error?.cause?.name,
+  causeCode: error?.cause?.code,
+  causeMessage: error?.cause?.message,
+});
+
 const collectStrings = (value, out = [], path = "", depth = 0) => {
   if (depth > 8 || out.length > 2500) return out;
   if (typeof value === "string") {
@@ -67,6 +105,12 @@ const firstByPath = (payload, pathRegexes, valuePredicate = () => true) => {
   return found?.value || "";
 };
 
+const uniqueStrings = values => Array.from(new Set(
+  values
+    .map(value => String(value || "").trim())
+    .filter(Boolean),
+));
+
 const isHttpUrl = value => /^https?:\/\//i.test(String(value || ""));
 
 export const isDirectMp4Url = (value) => {
@@ -78,6 +122,16 @@ export const isDirectMp4Url = (value) => {
   }
 };
 
+// 识别 CDN 直链（TikTok/抖音的真实视频流）。
+// 这类 URL 可能不以 .mp4 结尾，但域名/路径能表明它是实际媒体流。
+const isCdnDirectVideoUrl = value => {
+  const text = String(value || "");
+  if (!isHttpUrl(text)) return false;
+  if (/\.(jpe?g|png|webp|gif|heic|heif|avif)(\?|$)/i.test(text)) return false;
+  if (/(tos-[^/?]*-avt-|avatar|cropcenter|cover|image|img|tplv-tiktokx-cropcenter)/i.test(text)) return false;
+  return /(tiktokcdn|\.bytecdn|\.byteimg|douyincdn|\.akamaized|\/video\/tos\/|\/tos\/(alisg|useast|cvb))/i.test(text);
+};
+
 export const describeVideoUrlForDiagnostics = (value) => {
   const text = String(value || "");
   try {
@@ -85,6 +139,8 @@ export const describeVideoUrlForDiagnostics = (value) => {
     let kind = "http-url";
     if (isDirectMp4Url(text)) {
       kind = "direct-mp4";
+    } else if (isCdnDirectVideoUrl(text)) {
+      kind = "cdn-direct-video";
     } else if (/\/aweme\/v1\/play/i.test(parsed.pathname)) {
       kind = "douyin-aweme-play-api";
     } else if (parsed.searchParams.has("video_id")) {
@@ -208,30 +264,47 @@ const extractVideoMeta = (payload, shareLink) => {
       value => value.length > 0 && value.length < 600 && !isHttpUrl(value),
     ) || "";
   const cover = strings.find(item => isImageUrl(item.value))?.value || "";
-  const videoUrl =
-    firstByPath(data, [/original_video_url$/i, /video_url$/i, /play_addr/i, /download_addr/i], isDirectMp4Url) ||
-    strings.find(item => isDirectMp4Url(item.value))?.value ||
-    firstByPath(data, [/original_video_url$/i, /video_url$/i, /play_addr/i, /download_addr/i], isVideoUrl) ||
-    strings.find(item => isVideoUrl(item.value))?.value ||
-    "";
+  // URL 选择优先级：
+  //   1. .mp4 直链（最稳，ffmpeg/doubao 都能直接用）
+  //   2. CDN 直链（tiktokcdn/bytecdn 等真实视频流，TikTok 常见，不以 .mp4 结尾但可访问）
+  //   3. play_addr/download_addr 里的跳转链接（含 aweme/v1/play，部分场景可用作兜底）
+  const preferredPaths = [/original_video_url$/i, /video_url$/i, /play_addr/i, /download_addr/i, /url_list/i];
+  const pathMatches = item => preferredPaths.some(regex => regex.test(item.path));
+  const videoUrls = uniqueStrings([
+    ...strings.filter(item => pathMatches(item) && isDirectMp4Url(item.value)).map(item => item.value),
+    ...strings.filter(item => isDirectMp4Url(item.value)).map(item => item.value),
+    ...strings.filter(item => pathMatches(item) && isCdnDirectVideoUrl(item.value)).map(item => item.value),
+    ...strings.filter(item => isCdnDirectVideoUrl(item.value)).map(item => item.value),
+    ...strings.filter(item => pathMatches(item) && isVideoUrl(item.value)).map(item => item.value),
+    ...strings.filter(item => isVideoUrl(item.value)).map(item => item.value),
+  ]);
+  const videoUrl = videoUrls[0] || "";
 
   return {
     awemeId: extractAwemeId(data, shareLink),
     title,
     cover,
     videoUrl,
+    videoUrls,
     raw: data,
   };
 };
 
 const mergeMeta = (base, next, options = {}) => {
   const preferVideo = Boolean(options.preferVideo);
+  const videoUrls = uniqueStrings([
+    ...(preferVideo ? next.videoUrls || [] : base.videoUrls || []),
+    ...(preferVideo ? base.videoUrls || [] : next.videoUrls || []),
+    next.videoUrl,
+    base.videoUrl,
+  ]);
   return {
     ...base,
     awemeId: base.awemeId || next.awemeId || "",
     title: base.title || next.title || "",
     cover: base.cover || next.cover || "",
     videoUrl: preferVideo ? next.videoUrl || base.videoUrl || "" : base.videoUrl || next.videoUrl || "",
+    videoUrls,
     raw: base.raw || next.raw || null,
   };
 };
@@ -254,19 +327,23 @@ const fetchTikHub = async (path, params, config, logger) => {
   return data;
 };
 
-export const resolveTikHubVideo = async (shareLink, config, options = {}) => {
-  const logger = options.logger;
-  let meta = {
-    shareLink,
-    awemeId: parseAwemeIdFromShareLink(shareLink),
-    title: "",
-    cover: "",
-    videoUrl: "",
-    raw: null,
-  };
-  const warnings = [];
-
-  const attempts = [
+// 按 platform 构造 TikHub 端点轮询列表。
+// 抖音与 TikTok 的端点路径不同，但请求参数与返回字段结构一致（同为 aweme 协议），
+// 故 extractVideoMeta 的通用递归提取逻辑可同时服务两者。
+export const buildTikHubVideoAttempts = (shareLink, platform, config) => {
+  if (platform === "tiktok") {
+    // TikTok：实测仅 fetch_one_video_by_share_url 有效（返回含 play_addr CDN 直链），
+    // fetch_video_high_quality_play_url / web 系列端点均 404，故不列入。
+    return [
+      {
+        path: "/api/v1/tiktok/app/v3/fetch_one_video_by_share_url",
+        params: { share_url: shareLink },
+        preferVideo: true,
+      },
+    ];
+  }
+  // 默认抖音：混合端点 + douyin app/web 端点
+  return [
     {
       path: "/api/v1/hybrid/video_data",
       params: { url: shareLink, minimal: false },
@@ -293,6 +370,24 @@ export const resolveTikHubVideo = async (shareLink, config, options = {}) => {
       preferVideo: true,
     },
   ];
+};
+
+export const resolveTikHubVideo = async (shareLink, config, options = {}) => {
+  const logger = options.logger;
+  const platform = options.platform === "tiktok" ? "tiktok" : "douyin";
+  let meta = {
+    shareLink,
+    platform,
+    awemeId: parseAwemeIdFromShareLink(shareLink),
+    title: "",
+    cover: "",
+    videoUrl: "",
+    videoUrls: [],
+    raw: null,
+  };
+  const warnings = [];
+
+  const attempts = buildTikHubVideoAttempts(shareLink, platform, config);
 
   for (const attempt of attempts) {
     try {
@@ -319,11 +414,13 @@ export const resolveTikHubVideo = async (shareLink, config, options = {}) => {
     provider: "tikhub",
     title: meta.title || "未识别标题",
     awemeId: meta.awemeId,
+    candidateCount: Array.isArray(meta.videoUrls) ? meta.videoUrls.length : 0,
     ...describeVideoUrlForDiagnostics(meta.videoUrl),
   });
 
   return {
     ...meta,
+    sourceProvider: "tikhub",
     title: meta.title || "未识别标题",
     cover: meta.cover || "",
     warnings,
@@ -376,7 +473,9 @@ const isRetryableDoubaoAsrStatus = (statusCode) => {
   return code === "55000031" || /^55\d+/.test(code);
 };
 
-export const recognizeDoubaoAudio = async ({ audioDataBase64 }, config, options = {}) => {
+const normalizeAudioFormat = value => String(value || "mp3").toLowerCase() === "wav" ? "wav" : "mp3";
+
+export const recognizeDoubaoAudio = async ({ audioDataBase64, audioFormat = "mp3", audioBytes = 0 }, config, options = {}) => {
   if (!audioDataBase64) {
     throw new AgentError("audioDataBase64 is required for ffmpeg + Doubao flash ASR", {
       code: "ASR_INPUT_MISSING",
@@ -384,6 +483,7 @@ export const recognizeDoubaoAudio = async ({ audioDataBase64 }, config, options 
     });
   }
 
+  const normalizedAudioFormat = normalizeAudioFormat(audioFormat);
   const uid = getDoubaoUid(config);
   const logger = options.logger;
   const maxAttempts = Math.max(1, Number(config.apiRetryAttempts || 0) + 1);
@@ -400,6 +500,8 @@ export const recognizeDoubaoAudio = async ({ audioDataBase64 }, config, options 
       interfaceName: "doubao:asr.flash",
       logFields: {
         inputType: "base64",
+        audioFormat: normalizedAudioFormat,
+        audioBytes,
         resourceId: config.doubaoResourceId,
         asrAttempt: attempt,
         asrMaxAttempts: maxAttempts,
@@ -425,6 +527,8 @@ export const recognizeDoubaoAudio = async ({ audioDataBase64 }, config, options 
       logid,
       requestId,
       transcriptLength: transcript.length,
+      audioFormat: normalizedAudioFormat,
+      audioBytes,
     });
 
     if (statusCode && statusCode !== "20000000") {
@@ -493,6 +597,53 @@ const loadFfmpegPath = async () => {
   return ffmpegPath;
 };
 
+export const buildFfmpegAudioExtractArgs = ({ input = "pipe:0", fastProbe = false, audioFormat = "mp3", config = {} } = {}) => {
+  const format = normalizeAudioFormat(audioFormat);
+  const args = [
+    "-nostdin",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+  ];
+  if (fastProbe) {
+    args.push(
+      "-probesize",
+      String(config.ffmpegFastProbeSize || "1048576"),
+      "-analyzeduration",
+      String(config.ffmpegFastAnalyzeDuration || "1000000"),
+    );
+  }
+  args.push(
+    "-i",
+    input,
+    "-vn",
+    "-map",
+    "0:a:0",
+    "-ac",
+    "1",
+    "-ar",
+    "16000",
+  );
+  if (format === "wav") {
+    args.push(
+      "-c:a",
+      "pcm_s16le",
+      "-f",
+      "wav",
+      "pipe:1",
+    );
+  } else {
+    args.push(
+      "-b:a",
+      "32k",
+      "-f",
+      "mp3",
+      "pipe:1",
+    );
+  }
+  return args;
+};
+
 // 视频号文件是否已是明文 MP4：偏移 4-8 处应为 "ftyp"（ISO BMFF 文件类型盒签名）。
 const isPlainMp4Header = (buffer) =>
   Buffer.isBuffer(buffer) && buffer.length >= 8 && buffer.toString("latin1", 4, 8) === "ftyp";
@@ -540,6 +691,22 @@ export const decryptWeChatChannelsMediaBuffer = async (buffer, decodeKey) => {
 const mediaEndpointForLogs = (url) => {
   const diagnostics = describeVideoUrlForDiagnostics(url);
   return diagnostics.host ? `${diagnostics.host}${diagnostics.path || ""}` : "wechat-media";
+};
+
+const VIDEO_STREAM_FETCH_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  Accept: "video/mp4,video/*;q=0.9,*/*;q=0.8",
+  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+};
+
+const toNodeReadable = (body) => {
+  if (!body) return Readable.from([]);
+  if (typeof body.pipe === "function") return body;
+  if (typeof Readable.fromWeb === "function" && typeof body.getReader === "function") {
+    return Readable.fromWeb(body);
+  }
+  if (typeof body[Symbol.asyncIterator] === "function") return Readable.from(body);
+  return Readable.from([]);
 };
 
 const fetchBinary = async (url, config, options = {}) => {
@@ -626,8 +793,15 @@ const fetchBinary = async (url, config, options = {}) => {
  */
 const fetchMediaResponse = async (url, config, options = {}) => {
   const logger = options.logger;
-  const maxAttempts = Math.max(1, Number(config.apiRetryAttempts || 0) + 1);
-  const maxBytes = Number(config.wechatMediaMaxBytes || 220 * 1024 * 1024);
+  const maxAttempts = Math.max(1, Number(options.maxAttempts || Number(config.apiRetryAttempts || 0) + 1));
+  const maxBytes = Number(options.maxBytes || config.wechatMediaMaxBytes || 220 * 1024 * 1024);
+  const interfaceName = options.interfaceName || "wechat_channels:media-download-stream";
+  const errorLabel = options.errorLabel || "WeChat Channels media";
+  const tooLargeCode = options.tooLargeCode || "WECHAT_MEDIA_TOO_LARGE";
+  const failureCode = options.failureCode || "WECHAT_MEDIA_DOWNLOAD_FAILED";
+  const logFields = options.logFields || {};
+  const dispatcher = options.dispatcher || getMediaFetchDispatcher(config);
+  const proxyEnabled = Boolean(dispatcher);
   let lastError = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -635,31 +809,37 @@ const fetchMediaResponse = async (url, config, options = {}) => {
     const startedAt = Date.now();
     const endpoint = mediaEndpointForLogs(url);
     logger?.info("external.request.start", {
-      interface: "wechat_channels:media-download-stream",
+      interface: interfaceName,
       method: "GET",
       endpoint,
       attempt,
       maxAttempts,
+      proxyEnabled,
+      ...logFields,
     });
 
     try {
-      const response = await fetch(url, { signal: timeout.signal });
+      const response = await undiciFetch(url, {
+        signal: timeout.signal,
+        headers: options.headers,
+        ...(dispatcher ? { dispatcher } : {}),
+      });
       const contentLength = Number(response.headers.get("content-length") || 0);
       if (contentLength > maxBytes) {
-        throw new AgentError("WeChat Channels media exceeded download limit", {
-          code: "WECHAT_MEDIA_TOO_LARGE",
+        throw new AgentError(`${errorLabel} exceeded download limit`, {
+          code: tooLargeCode,
           status: 413,
           details: { contentLength, maxBytes },
         });
       }
       if (!response.ok) {
-        throw new AgentError(`HTTP ${response.status} from WeChat Channels media`, {
+        throw new AgentError(`HTTP ${response.status} from ${errorLabel}`, {
           code: "HTTP_ERROR",
           status: response.status,
         });
       }
       logger?.info("external.request.end", {
-        interface: "wechat_channels:media-download-stream",
+        interface: interfaceName,
         method: "GET",
         endpoint,
         status: response.status,
@@ -667,15 +847,17 @@ const fetchMediaResponse = async (url, config, options = {}) => {
         contentLength,
         attempt,
         maxAttempts,
+        proxyEnabled,
+        ...logFields,
       });
-      // response.body 可能因运行时而 null，规范化为已取消的可读流
+      // response.body 可能因运行时而 null，调用方会规范化为可读流
       const body = response.body || Readable.from([]);
       return { response, body, contentLength, cancelTimeout: () => timeout.cancel() };
     } catch (error) {
       lastError = error;
       timeout.cancel();
       logger?.warn("external.request.error", {
-        interface: "wechat_channels:media-download-stream",
+        interface: interfaceName,
         method: "GET",
         endpoint,
         durationMs: Date.now() - startedAt,
@@ -683,15 +865,23 @@ const fetchMediaResponse = async (url, config, options = {}) => {
         maxAttempts,
         error: error instanceof Error ? error.message : "Media stream failed",
         code: error?.code,
+        details: compactDetails(fetchErrorDetails(error)),
+        proxyEnabled,
+        ...logFields,
       });
       if (attempt >= maxAttempts) break;
       await sleep(retryDelayMs(attempt, config.apiRetryBaseDelayMs));
     }
   }
 
-  throw lastError instanceof Error
-    ? lastError
-    : new AgentError("WeChat Channels media download failed", { code: "WECHAT_MEDIA_DOWNLOAD_FAILED" });
+  if (lastError instanceof AgentError) {
+    throw lastError;
+  }
+  throw new AgentError(lastError instanceof Error ? lastError.message : `${errorLabel} download failed`, {
+    code: failureCode,
+    cause: lastError,
+    details: fetchErrorDetails(lastError),
+  });
 };
 
 /**
@@ -737,7 +927,7 @@ const prepareVideoInput = async (videoMeta, config, options = {}) => {
   const { body, cancelTimeout } = await fetchMediaResponse(videoMeta.videoUrl, config, { logger });
   const decryptTransform = createWeChatDecryptTransform(keystream);
   // web stream (response.body) 转 Node readable 后过解密 transform
-  const decryptedStream = Readable.fromWeb(body).pipe(decryptTransform);
+  const decryptedStream = toNodeReadable(body).pipe(decryptTransform);
 
   logger?.info("wechat_channels.media.prepare.end", {
     title: videoMeta.title,
@@ -759,17 +949,170 @@ const prepareVideoInput = async (videoMeta, config, options = {}) => {
   };
 };
 
+export const shouldStreamVideoInputForFfmpeg = value => isCdnDirectVideoUrl(value);
+
+const shouldUseTikHubFfmpegProvider = videoMeta =>
+  videoMeta?.sourceProvider === "tikhub" && getTikHubMediaCandidates(videoMeta).some(shouldStreamVideoInputForFfmpeg);
+
+const getTikHubMediaCandidates = videoMeta => uniqueStrings([
+  ...(Array.isArray(videoMeta?.videoUrls) ? videoMeta.videoUrls : []),
+  videoMeta?.videoUrl,
+]).filter(shouldStreamVideoInputForFfmpeg);
+
+const audioOutputLimitBytes = (config, audioFormat) => {
+  const format = normalizeAudioFormat(audioFormat);
+  if (format === "wav") return Number(config.asrWavMaxBytes || 20 * 1024 * 1024);
+  return Number(config.ffmpegAudioMaxBytes || 24 * 1024 * 1024);
+};
+
+const audioOutputLimitCode = audioFormat =>
+  normalizeAudioFormat(audioFormat) === "wav" ? "ASR_WAV_TOO_LARGE" : "FFMPEG_OUTPUT_TOO_LARGE";
+
+const extractAudioFromFetchedMedia = async (videoUrl, config, options = {}) => {
+  const logger = options.logger;
+  const { body, cancelTimeout } = await fetchMediaResponse(videoUrl, config, {
+    logger,
+    interfaceName: options.interfaceName || "video:media-download-stream",
+    errorLabel: options.errorLabel || "video media",
+    tooLargeCode: options.tooLargeCode || "MEDIA_TOO_LARGE",
+    failureCode: options.failureCode || "MEDIA_DOWNLOAD_FAILED",
+    headers: VIDEO_STREAM_FETCH_HEADERS,
+  });
+  const inputStream = toNodeReadable(body);
+
+  try {
+    return await extractAudioFromStream(inputStream, config, {
+      logger,
+      inputLabel: options.inputLabel || "http-media-stream",
+      strategy: options.strategy || "stream",
+      fastProbe: Boolean(options.fastProbe),
+      audioFormat: options.audioFormat || "mp3",
+    });
+  } finally {
+    cancelTimeout();
+    try {
+      if (!inputStream.destroyed) inputStream.destroy();
+    } catch {
+      /* ignore */
+    }
+  }
+};
+
+const shouldRetryFfmpegConservatively = error => (
+  error?.code === "FFMPEG_FAILED" ||
+  error?.code === "FFMPEG_EMPTY"
+);
+
+const tikhubAudioFormatAttempts = config => {
+  const format = String(config.asrAudioFormat || "auto").toLowerCase();
+  if (format === "wav") return ["wav"];
+  if (format === "mp3") return ["mp3"];
+  return ["wav", "mp3"];
+};
+
+const shouldFallbackAudioFormat = error => (
+  error?.code === "ASR_WAV_TOO_LARGE" ||
+  error?.code === "DOUBAO_ASR_EMPTY" ||
+  error?.code === "DOUBAO_ASR_FAILED" ||
+  String(error?.details?.statusCode || "") === "45000151"
+);
+
+const extractAudioWithTikHubFfmpegProvider = async (videoMeta, config, options = {}) => {
+  if (!shouldUseTikHubFfmpegProvider(videoMeta)) {
+    throw new AgentError("TikHub ffmpeg provider only handles TikHub CDN media URLs", {
+      code: "TIKHUB_FFMPEG_NOT_APPLICABLE",
+      status: 422,
+      details: describeVideoUrlForDiagnostics(videoMeta?.videoUrl),
+    });
+  }
+  const baseOptions = {
+    ...options,
+    interfaceName: "tikhub:media-download-stream",
+    errorLabel: "TikHub media",
+    tooLargeCode: "TIKHUB_MEDIA_TOO_LARGE",
+    failureCode: "TIKHUB_MEDIA_DOWNLOAD_FAILED",
+    inputLabel: "tikhub-media-stream",
+    maxAttempts: 1,
+  };
+  const candidates = getTikHubMediaCandidates(videoMeta).slice(0, Math.max(1, Number(config.tikhubMediaUrlMaxAttempts || 6)));
+  let lastError = null;
+
+  for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+    const candidateUrl = candidates[candidateIndex];
+    const candidateOptions = {
+      ...baseOptions,
+      logFields: {
+        candidateIndex: candidateIndex + 1,
+        candidateCount: candidates.length,
+      },
+    };
+    try {
+      return await extractAudioFromFetchedMedia(candidateUrl, config, {
+        ...candidateOptions,
+        strategy: "tikhub-fast-probe",
+        fastProbe: true,
+        audioFormat: options.audioFormat || "mp3",
+      });
+    } catch (error) {
+      lastError = error;
+      if (shouldRetryFfmpegConservatively(error)) {
+        options.logger?.warn("tikhub.ffmpeg.fast_probe.retry_conservative", {
+          code: error?.code,
+          error: error instanceof Error ? error.message : "TikHub fast ffmpeg probe failed",
+          details: compactDetails(error?.details),
+          title: videoMeta.title,
+          candidateIndex: candidateIndex + 1,
+          candidateCount: candidates.length,
+          ...describeVideoUrlForDiagnostics(candidateUrl),
+        });
+        try {
+          return await extractAudioFromFetchedMedia(candidateUrl, config, {
+            ...candidateOptions,
+            strategy: "tikhub-conservative-probe",
+            fastProbe: false,
+            audioFormat: options.audioFormat || "mp3",
+          });
+        } catch (retryError) {
+          lastError = retryError;
+        }
+      }
+      if (candidateIndex < candidates.length - 1) {
+        options.logger?.warn("tikhub.media.candidate.fallback", {
+          code: lastError?.code,
+          error: lastError instanceof Error ? lastError.message : "TikHub media candidate failed",
+          details: compactDetails(lastError?.details),
+          title: videoMeta.title,
+          candidateIndex: candidateIndex + 1,
+          nextCandidateIndex: candidateIndex + 2,
+          candidateCount: candidates.length,
+          ...describeVideoUrlForDiagnostics(candidateUrl),
+        });
+        continue;
+      }
+    }
+  }
+
+  throw lastError || new AgentError("TikHub media candidates failed", {
+    code: "TIKHUB_MEDIA_CANDIDATES_FAILED",
+  });
+};
+
 const extractAudioWithFfmpeg = async (videoUrl, config, options = {}) => {
   if (!config.ffmpegEnabled) {
     throw new AgentError("ffmpeg transcript provider is disabled", { code: "FFMPEG_DISABLED" });
   }
+  if (shouldStreamVideoInputForFfmpeg(videoUrl)) {
+    return extractAudioFromFetchedMedia(videoUrl, config, options);
+  }
   const ffmpegPath = await loadFfmpegPath();
   const logger = options.logger;
   const startedAt = Date.now();
+  const audioFormat = normalizeAudioFormat(options.audioFormat || "mp3");
   logger?.info("ffmpeg.extract.start", {
     interface: "ffmpeg-static",
     input: "video-url",
-    output: "mp3-base64",
+    output: `${audioFormat}-base64`,
+    audioFormat,
   });
 
   return await new Promise((resolve, reject) => {
@@ -777,26 +1120,7 @@ const extractAudioWithFfmpeg = async (videoUrl, config, options = {}) => {
     let totalBytes = 0;
     let stderr = "";
     let finished = false;
-    const child = spawn(ffmpegPath, [
-      "-nostdin",
-      "-hide_banner",
-      "-loglevel",
-      "error",
-      "-i",
-      videoUrl,
-      "-vn",
-      "-map",
-      "0:a:0",
-      "-ac",
-      "1",
-      "-ar",
-      "16000",
-      "-b:a",
-      "32k",
-      "-f",
-      "mp3",
-      "pipe:1",
-    ]);
+    const child = spawn(ffmpegPath, buildFfmpegAudioExtractArgs({ input: videoUrl, audioFormat, config }));
 
     const timer = setTimeout(() => {
       if (!finished) {
@@ -807,9 +1131,12 @@ const extractAudioWithFfmpeg = async (videoUrl, config, options = {}) => {
 
     child.stdout.on("data", chunk => {
       totalBytes += chunk.length;
-      if (totalBytes > config.ffmpegAudioMaxBytes) {
+      if (totalBytes > audioOutputLimitBytes(config, audioFormat)) {
         child.kill("SIGKILL");
-        reject(new AgentError("ffmpeg audio output exceeded limit", { code: "FFMPEG_OUTPUT_TOO_LARGE" }));
+        reject(new AgentError("ffmpeg audio output exceeded limit", {
+          code: audioOutputLimitCode(audioFormat),
+          details: { audioFormat, bytes: totalBytes, maxBytes: audioOutputLimitBytes(config, audioFormat) },
+        }));
         return;
       }
       chunks.push(chunk);
@@ -855,8 +1182,13 @@ const extractAudioWithFfmpeg = async (videoUrl, config, options = {}) => {
         interface: "ffmpeg-static",
         durationMs: Date.now() - startedAt,
         bytes: buffer.length,
+        audioFormat,
       });
-      resolve(buffer.toString("base64"));
+      resolve({
+        audioDataBase64: buffer.toString("base64"),
+        audioFormat,
+        audioBytes: buffer.length,
+      });
     });
   });
 };
@@ -873,10 +1205,14 @@ const extractAudioFromStream = async (inputStream, config, options = {}) => {
   const ffmpegPath = await loadFfmpegPath();
   const logger = options.logger;
   const startedAt = Date.now();
+  const audioFormat = normalizeAudioFormat(options.audioFormat || "mp3");
   logger?.info("ffmpeg.extract.start", {
     interface: "ffmpeg-static",
-    input: "stdin-stream",
-    output: "mp3-base64",
+    input: options.inputLabel || "stdin-stream",
+    output: `${audioFormat}-base64`,
+    strategy: options.strategy || "standard",
+    fastProbe: Boolean(options.fastProbe),
+    audioFormat,
   });
 
   return await new Promise((resolve, reject) => {
@@ -884,26 +1220,12 @@ const extractAudioFromStream = async (inputStream, config, options = {}) => {
     let totalBytes = 0;
     let stderr = "";
     let finished = false;
-    const child = spawn(ffmpegPath, [
-      "-nostdin",
-      "-hide_banner",
-      "-loglevel",
-      "error",
-      "-i",
-      "pipe:0",
-      "-vn",
-      "-map",
-      "0:a:0",
-      "-ac",
-      "1",
-      "-ar",
-      "16000",
-      "-b:a",
-      "32k",
-      "-f",
-      "mp3",
-      "pipe:1",
-    ]);
+    const child = spawn(ffmpegPath, buildFfmpegAudioExtractArgs({
+      input: "pipe:0",
+      fastProbe: Boolean(options.fastProbe),
+      audioFormat,
+      config,
+    }));
 
     const timer = setTimeout(() => {
       if (!finished) {
@@ -914,9 +1236,12 @@ const extractAudioFromStream = async (inputStream, config, options = {}) => {
 
     child.stdout.on("data", chunk => {
       totalBytes += chunk.length;
-      if (totalBytes > config.ffmpegAudioMaxBytes) {
+      if (totalBytes > audioOutputLimitBytes(config, audioFormat)) {
         child.kill("SIGKILL");
-        reject(new AgentError("ffmpeg audio output exceeded limit", { code: "FFMPEG_OUTPUT_TOO_LARGE" }));
+        reject(new AgentError("ffmpeg audio output exceeded limit", {
+          code: audioOutputLimitCode(audioFormat),
+          details: { audioFormat, bytes: totalBytes, maxBytes: audioOutputLimitBytes(config, audioFormat) },
+        }));
         return;
       }
       chunks.push(chunk);
@@ -962,8 +1287,13 @@ const extractAudioFromStream = async (inputStream, config, options = {}) => {
         interface: "ffmpeg-static",
         durationMs: Date.now() - startedAt,
         bytes: buffer.length,
+        audioFormat,
       });
-      resolve(buffer.toString("base64"));
+      resolve({
+        audioDataBase64: buffer.toString("base64"),
+        audioFormat,
+        audioBytes: buffer.length,
+      });
     });
 
     // 把输入流泵入 ffmpeg stdin；输入结束即关闭 stdin 通知 ffmpeg 收尾
@@ -1049,8 +1379,31 @@ export const transcribeVideo = async (videoMeta, config, options = {}) => {
 
   const warnings = [];
   const prepared = await prepareVideoInput(videoMeta, config, { logger });
+  const providers = Array.isArray(config.transcriptProviders) ? config.transcriptProviders : [];
+  const hasTikHubProvider = providers.includes("tikhub-ffmpeg");
   try {
-    for (const provider of config.transcriptProviders) {
+    for (const provider of providers) {
+      if (provider === "tikhub-ffmpeg" && !shouldUseTikHubFfmpegProvider(videoMeta)) {
+        logger?.info("transcript.provider.skipped", {
+          provider,
+          reason: "not TikHub CDN media",
+          videoTitle: videoMeta.title,
+        });
+        continue;
+      }
+      if (provider === "ffmpeg" && hasTikHubProvider && shouldUseTikHubFfmpegProvider(videoMeta)) {
+        logger?.info("transcript.provider.skipped", {
+          provider,
+          reason: "tikhub-ffmpeg handles TikHub CDN media",
+          videoTitle: videoMeta.title,
+        });
+        onProgress({
+          step: "transcript-provider-skipped",
+          provider,
+          message: "已跳过通用 ffmpeg：TikHub CDN 媒体由 tikhub-ffmpeg 专用方案处理",
+        });
+        continue;
+      }
       try {
         logger?.info("transcript.provider.start", {
           provider,
@@ -1061,18 +1414,71 @@ export const transcribeVideo = async (videoMeta, config, options = {}) => {
           provider,
           message: `尝试转写方案：${provider}`,
         });
+        if (provider === "tikhub-ffmpeg") {
+          const audioFormats = tikhubAudioFormatAttempts(config);
+          let lastAudioFormatError = null;
+          for (let formatIndex = 0; formatIndex < audioFormats.length; formatIndex += 1) {
+            const audioFormat = audioFormats[formatIndex];
+            try {
+              const audio = await extractAudioWithTikHubFfmpegProvider(videoMeta, config, { logger, audioFormat });
+              onProgress({
+                step: "audio-extracted",
+                provider,
+                audioFormat: audio.audioFormat,
+                audioBytes: audio.audioBytes,
+                message: `TikHub 媒体流已提取 ${audio.audioFormat.toUpperCase()} 音频，开始调用豆包 ASR`,
+              });
+              const asr = await recognizeDoubaoAudio(audio, config, { logger });
+              const value = { ...asr, provider: `tikhub-ffmpeg+doubao-asr:${audio.audioFormat}`, warnings };
+              logger?.info("transcript.provider.success", {
+                provider: value.provider,
+                textLength: value.text.length,
+                duration: value.duration,
+                audioFormat: audio.audioFormat,
+                audioBytes: audio.audioBytes,
+              });
+              onProgress({
+                step: "transcript-provider-success",
+                provider: value.provider,
+                message: `转写方案成功：${value.provider}`,
+              });
+              transcriptCache.set(cacheKey, { createdAt: Date.now(), value });
+              return value;
+            } catch (error) {
+              lastAudioFormatError = error;
+              const canFallbackFormat = formatIndex < audioFormats.length - 1 && shouldFallbackAudioFormat(error);
+              if (!canFallbackFormat) throw error;
+              logger?.warn("tikhub.asr.audio_format.fallback", {
+                from: audioFormat,
+                to: audioFormats[formatIndex + 1],
+                code: error?.code,
+                error: error instanceof Error ? error.message : "TikHub ASR audio format failed",
+                details: compactDetails(error?.details),
+                title: videoMeta.title,
+              });
+              warnings.push({
+                provider,
+                message: `TikHub ${audioFormat.toUpperCase()} audio failed, fallback to ${audioFormats[formatIndex + 1].toUpperCase()}`,
+                code: error?.code,
+              });
+            }
+          }
+          throw lastAudioFormatError || new AgentError("TikHub ASR audio format attempts failed", {
+            code: "TIKHUB_AUDIO_FORMAT_FAILED",
+          });
+        }
         if (provider === "ffmpeg") {
           // 视频号走流式管道（prepared.stream）；抖音/直链用 prepared.videoUrl
-          const audioDataBase64 = prepared.stream
-            ? await extractAudioFromStream(prepared.stream, config, { logger })
-            : await extractAudioWithFfmpeg(prepared.videoUrl, config, { logger });
+          const audio = prepared.stream
+            ? await extractAudioFromStream(prepared.stream, config, { logger, audioFormat: "mp3" })
+            : await extractAudioWithFfmpeg(prepared.videoUrl, config, { logger, audioFormat: "mp3" });
           onProgress({
             step: "audio-extracted",
             provider,
             message: "ffmpeg-static 已提取音频，开始调用豆包 ASR",
           });
-          const asr = await recognizeDoubaoAudio({ audioDataBase64 }, config, { logger });
-          const value = { ...asr, provider: "ffmpeg+doubao-asr", warnings };
+          const asr = await recognizeDoubaoAudio(audio, config, { logger });
+          const value = { ...asr, provider: `ffmpeg+doubao-asr:${audio.audioFormat}`, warnings };
           logger?.info("transcript.provider.success", {
             provider: value.provider,
             textLength: value.text.length,

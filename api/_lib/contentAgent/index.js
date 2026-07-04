@@ -23,9 +23,9 @@ const topicWorkflowKey = (topic = {}) => {
   return `wechat_channels:${String(id || "topic").replace(/^wechat_channels:/, "")}`;
 };
 
-const buildContentAgentInputs = ({ shareLinks = [], benchmarkTopics = [] } = {}) => [
+const buildContentAgentInputs = ({ shareLinks = [], benchmarkTopics = [], shareLinkPlatform = "douyin" } = {}) => [
   ...shareLinks.map(link => ({
-    platform: "douyin",
+    platform: shareLinkPlatform,
     shareLink: link,
   })),
   ...benchmarkTopics
@@ -77,7 +77,7 @@ export const runContentAgent = async (shareLinksOrInputs, options = {}) => {
     });
     const video = input.platform === "wechat_channels"
       ? resolveWeChatChannelsTopicVideo(input.topic)
-      : await resolveTikHubVideo(shareLink, config, { logger });
+      : await resolveTikHubVideo(shareLink, config, { logger, platform: input.platform });
     onProgress({
       ...progressBase,
       step: "video-resolved",
@@ -172,7 +172,12 @@ export const runContentAgentWorkflow = async (_req, res, options = {}) => {
   const body = options.body || {};
   const shareLinks = getShareLinksFromBody(body);
   const benchmarkTopics = getBenchmarkTopicsFromBody(body);
-  const inputs = buildContentAgentInputs({ shareLinks, benchmarkTopics });
+  // 前端通过 source_platform 标记分享链接来源平台（douyin/tiktok），默认 douyin。
+  // 视频号走 benchmark_topics，平台由 topic 自身标记，不依赖此字段。
+  const shareLinkPlatform = String(body?.source_platform || body?.sourcePlatform || "douyin").toLowerCase() === "tiktok"
+    ? "tiktok"
+    : "douyin";
+  const inputs = buildContentAgentInputs({ shareLinks, benchmarkTopics, shareLinkPlatform });
   const logger = options.logger || createRequestLogger("content-agent");
   logger.info("workflow.agent.start", {
     workflowId: body?.workflow_id,

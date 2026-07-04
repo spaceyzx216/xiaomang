@@ -12,7 +12,7 @@ import {
 import { runContentAgentWorkflow } from "../api/_lib/contentAgent/index.js";
 import { getContentAgentConfig, shouldUseContentAgent } from "../api/_lib/contentAgent/config.js";
 import { fetchJson } from "../api/_lib/contentAgent/http.js";
-import { buildCreativeFallback, decryptWeChatChannelsMediaBuffer, describeVideoUrlForDiagnostics, isDirectMp4Url, recognizeDoubaoAudio, resolveWeChatChannelsTopicVideo, runCreativeAgents } from "../api/_lib/contentAgent/providers.js";
+import { buildCreativeFallback, buildFfmpegAudioExtractArgs, buildTikHubVideoAttempts, decryptWeChatChannelsMediaBuffer, describeVideoUrlForDiagnostics, isDirectMp4Url, recognizeDoubaoAudio, resolveTikHubVideo, resolveWeChatChannelsTopicVideo, runCreativeAgents, shouldStreamVideoInputForFfmpeg } from "../api/_lib/contentAgent/providers.js";
 import { generateKeystream } from "../api/_lib/contentAgent/vendor/wechatKeystream.mjs";
 import { buildFinalDraftMarkdown, normalizeBenchmarkVideos } from "../api/_lib/exportFormatters.js";
 import { BITABLE_FIELDS, finalDraftToBitableRecords, markdownToFeishuBlocks, parseFeishuBitableUrl } from "../api/_lib/feishuClient.js";
@@ -41,6 +41,82 @@ test("normalizes wechat channels aliases", () => {
   assert.equal(normalizePlatform("wechat_channels"), "wechat_channels");
   assert.equal(normalizePlatform("视频号"), "wechat_channels");
   assert.equal(normalizePlatform("douyin"), "douyin");
+  assert.equal(normalizePlatform("tiktok"), "tiktok");
+  assert.equal(normalizePlatform("TikTok"), "tiktok");
+  assert.equal(normalizePlatform("抖音国际版"), "tiktok");
+  assert.equal(normalizePlatform(""), "douyin");
+  assert.equal(normalizePlatform("unknown"), "douyin");
+});
+
+test("builds TikTok-specific TikHub video resolve endpoints", () => {
+  const config = { tikhubRegion: "CN" };
+  const link = "https://vm.tiktok.com/Z123abc/";
+
+  const tiktokAttempts = buildTikHubVideoAttempts(link, "tiktok", config);
+  assert.equal(tiktokAttempts.length > 0, true);
+  // TikTok 必须走 /tiktok/ 端点，不能混入 /douyin/ 或 /hybrid/
+  for (const attempt of tiktokAttempts) {
+    assert.match(attempt.path, /\/api\/v1\/tiktok\//, `TikTok 端点应含 /tiktok/，实际：${attempt.path}`);
+    assert.equal(attempt.params.share_url, link);
+  }
+  // 应至少有一个 preferVideo:true 的直链端点
+  assert.equal(tiktokAttempts.some(a => a.preferVideo), true);
+
+  // 抖音（默认）端点保持原样：含 hybrid 或 douyin
+  const douyinAttempts = buildTikHubVideoAttempts("https://v.douyin.com/abc/", "douyin", config);
+  assert.equal(douyinAttempts.some(a => /\/hybrid\//.test(a.path) || /\/douyin\//.test(a.path)), true);
+  assert.equal(douyinAttempts.some(a => /\/tiktok\//.test(a.path)), false, "抖音端点不应含 /tiktok/");
+});
+
+test("preserves multiple TikHub CDN video candidates for failover", async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => new Response(JSON.stringify({
+    data: {
+      aweme_id: "7658162275022277895",
+      desc: "候选视频",
+      cover: "https://example.com/cover.jpg",
+      video: {
+        play_addr: {
+          url_list: [
+            "https://v16m.tiktokcdn-us.com/a/video/tos/alisg/demo?mime_type=video_mp4",
+            "https://v19.tiktokcdn-us.com/b/video/tos/alisg/demo?mime_type=video_mp4",
+          ],
+        },
+      },
+    },
+  }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+
+  try {
+    const video = await resolveTikHubVideo(
+      "https://www.tiktok.com/@demo/video/7658162275022277895",
+      {
+        tikhubApiToken: "test-token",
+        tikhubBaseUrl: "https://api.tikhub.dev",
+        requestTimeoutMs: 1000,
+        apiRetryAttempts: 0,
+        apiRetryBaseDelayMs: 1,
+      },
+      {
+        platform: "tiktok",
+        logger: {
+          info() {},
+          warn() {},
+          error() {},
+        },
+      },
+    );
+
+    assert.equal(video.videoUrl, "https://v16m.tiktokcdn-us.com/a/video/tos/alisg/demo?mime_type=video_mp4");
+    assert.deepEqual(video.videoUrls, [
+      "https://v16m.tiktokcdn-us.com/a/video/tos/alisg/demo?mime_type=video_mp4",
+      "https://v19.tiktokcdn-us.com/b/video/tos/alisg/demo?mime_type=video_mp4",
+    ]);
+  } finally {
+    global.fetch = originalFetch;
+  }
 });
 
 test("resolves WeChat Channels topic metadata for content generation", () => {
@@ -156,7 +232,7 @@ test("routes the main content workflow to the agent", () => {
   assert.equal(shouldUseContentAgent({ workflow_id: "translation-workflow" }), false);
 });
 
-test("configures ffmpeg primary provider and Doubao video fallback", () => {
+test("configures TikHub media provider, ffmpeg fallback, and Doubao video fallback", () => {
   const original = {
     TRANSCRIPT_PROVIDERS: process.env.TRANSCRIPT_PROVIDERS,
     AGENT_CREATIVE_RETRY_ATTEMPTS: process.env.AGENT_CREATIVE_RETRY_ATTEMPTS,
@@ -165,10 +241,26 @@ test("configures ffmpeg primary provider and Doubao video fallback", () => {
     DOUBAO_ASR_ENDPOINT: process.env.DOUBAO_ASR_ENDPOINT,
     DOUBAO_VIDEO_ENDPOINT: process.env.DOUBAO_VIDEO_ENDPOINT,
     DOUBAO_VIDEO_API_KEY: process.env.DOUBAO_VIDEO_API_KEY,
+    TIKHUB_TRANSCRIPT_PROVIDER_ENABLED: process.env.TIKHUB_TRANSCRIPT_PROVIDER_ENABLED,
+    FFMPEG_FAST_PROBE_SIZE: process.env.FFMPEG_FAST_PROBE_SIZE,
+    FFMPEG_FAST_ANALYZE_DURATION: process.env.FFMPEG_FAST_ANALYZE_DURATION,
+    ASR_AUDIO_FORMAT: process.env.ASR_AUDIO_FORMAT,
+    ASR_WAV_MAX_BYTES: process.env.ASR_WAV_MAX_BYTES,
+    TIKHUB_MEDIA_URL_MAX_ATTEMPTS: process.env.TIKHUB_MEDIA_URL_MAX_ATTEMPTS,
+    TIKTOK_MEDIA_PROXY_URL: process.env.TIKTOK_MEDIA_PROXY_URL,
+    MEDIA_USE_ENV_PROXY: process.env.MEDIA_USE_ENV_PROXY,
   };
 
   try {
     process.env.TRANSCRIPT_PROVIDERS = "legacy-provider,ffmpeg,doubao-video";
+    delete process.env.TIKHUB_TRANSCRIPT_PROVIDER_ENABLED;
+    process.env.FFMPEG_FAST_PROBE_SIZE = "2M";
+    process.env.FFMPEG_FAST_ANALYZE_DURATION = "750k";
+    process.env.ASR_AUDIO_FORMAT = "auto";
+    process.env.ASR_WAV_MAX_BYTES = "12345678";
+    process.env.TIKHUB_MEDIA_URL_MAX_ATTEMPTS = "4";
+    process.env.TIKTOK_MEDIA_PROXY_URL = "http://127.0.0.1:7890";
+    process.env.MEDIA_USE_ENV_PROXY = "false";
     process.env.AGENT_CREATIVE_RETRY_ATTEMPTS = "3";
     process.env.AGENT_CREATIVE_RETRY_BASE_DELAY_MS = "1500";
     delete process.env.DOUBAO_RESOURCE_ID;
@@ -177,7 +269,14 @@ test("configures ffmpeg primary provider and Doubao video fallback", () => {
     process.env.DOUBAO_VIDEO_API_KEY = "test-key";
 
     const config = getContentAgentConfig();
-    assert.deepEqual(config.transcriptProviders, ["ffmpeg", "doubao-video"]);
+    assert.deepEqual(config.transcriptProviders, ["tikhub-ffmpeg", "ffmpeg", "doubao-video"]);
+    assert.equal(config.ffmpegFastProbeSize, "2M");
+    assert.equal(config.ffmpegFastAnalyzeDuration, "750k");
+    assert.equal(config.asrAudioFormat, "auto");
+    assert.equal(config.asrWavMaxBytes, 12345678);
+    assert.equal(config.tikhubMediaUrlMaxAttempts, 4);
+    assert.equal(config.mediaProxyUrl, "http://127.0.0.1:7890");
+    assert.equal(config.mediaUseEnvProxy, false);
     assert.equal(config.creativeAgentRetryAttempts, 3);
     assert.equal(config.creativeAgentRetryBaseDelayMs, 1500);
     assert.equal(config.doubaoResourceId, "volc.bigasr.auc_turbo");
@@ -280,6 +379,57 @@ test("classifies static mp4 URLs as direct video inputs", () => {
   assert.equal(info.kind, "direct-mp4");
   assert.equal(info.isDirectMp4, true);
   assert.equal(isDirectMp4Url("https://cdn.example.com/video/demo.mp4?sign=abc"), true);
+});
+
+test("streams TikTok CDN media into ffmpeg instead of handing ffmpeg the URL", () => {
+  const tiktokCdnUrl = "https://v16m.tiktokcdn-us.com/abc/video/tos/alisg/demo?mime_type=video_mp4";
+  const info = describeVideoUrlForDiagnostics(tiktokCdnUrl);
+
+  assert.equal(info.kind, "cdn-direct-video");
+  assert.equal(info.isDirectMp4, false);
+  assert.equal(shouldStreamVideoInputForFfmpeg(tiktokCdnUrl), true);
+  assert.equal(shouldStreamVideoInputForFfmpeg("https://cdn.example.com/video/demo.mp4?sign=abc"), false);
+});
+
+test("does not classify TikTok HEIC avatar images as streamable video", () => {
+  const avatarUrl = "https://p16-common-sign.tiktokcdn-us.com/tos-alisg-avt-0068/demo~tplv-tiktokx-cropcenter-q:720:720:q70.heic?x-expires=1&x-signature=demo";
+  const info = describeVideoUrlForDiagnostics(avatarUrl);
+
+  assert.equal(info.kind, "http-url");
+  assert.equal(info.isDirectMp4, false);
+  assert.equal(shouldStreamVideoInputForFfmpeg(avatarUrl), false);
+});
+
+test("builds fast and conservative ffmpeg audio extraction args", () => {
+  const fastArgs = buildFfmpegAudioExtractArgs({
+    input: "pipe:0",
+    fastProbe: true,
+    audioFormat: "mp3",
+    config: {
+      ffmpegFastProbeSize: "2M",
+      ffmpegFastAnalyzeDuration: "750k",
+    },
+  });
+  assert.deepEqual(fastArgs.slice(0, 8), [
+    "-nostdin",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-probesize",
+    "2M",
+    "-analyzeduration",
+    "750k",
+  ]);
+  assert.equal(fastArgs.includes("pipe:0"), true);
+  assert.equal(fastArgs.at(-1), "pipe:1");
+
+  const conservativeArgs = buildFfmpegAudioExtractArgs({ input: "pipe:0", fastProbe: false });
+  assert.equal(conservativeArgs.includes("-probesize"), false);
+  assert.equal(conservativeArgs.includes("-analyzeduration"), false);
+
+  const wavArgs = buildFfmpegAudioExtractArgs({ input: "pipe:0", fastProbe: true, audioFormat: "wav" });
+  assert.equal(wavArgs.includes("-b:a"), false);
+  assert.deepEqual(wavArgs.slice(-5), ["-c:a", "pcm_s16le", "-f", "wav", "pipe:1"]);
 });
 
 test("Doubao flash ASR rejects missing base64 audio before network calls", async () => {

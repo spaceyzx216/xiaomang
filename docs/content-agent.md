@@ -6,9 +6,10 @@ The frontend posts to `/api/agent/workflow/stream-run`, and the server returns a
 ## Runtime Flow
 
 1. Split `_input.share_links` or `parameters.share_links` by line.
-2. Resolve each Douyin share link with TikHub and obtain title, cover, and playable video URL.
+2. Resolve each Douyin or TikTok share link with TikHub and obtain title, cover, and playable video URL.
 3. Generate transcript with ordered providers:
-   - `ffmpeg`: use bundled `ffmpeg-static` to extract MP3 in the Vercel Node function, then call Doubao flash ASR with base64 audio.
+   - `tikhub-ffmpeg`: for TikHub-returned TikTok/ByteDance CDN URLs, keep multiple playable CDN candidates, fetch media with Node retry logic, and stream it into bundled `ffmpeg-static`, then call Doubao flash ASR with base64 audio. It starts with a fast ffmpeg probe and retries once with conservative probing only for ffmpeg probe/decode failures. If one CDN candidate fails to download, it quickly moves to the next candidate. With `ASR_AUDIO_FORMAT=auto`, it tries WAV first for short media and falls back to MP3 when WAV is too large or ASR rejects it.
+   - `ffmpeg`: generic fallback that lets `ffmpeg-static` read stable direct video URLs, then calls Doubao flash ASR.
    - `doubao-video`: fallback to `doubao-seed-2-0-mini-260428` directly against the video URL and ask it to reconstruct the spoken script.
 4. Run four DeepSeek creative agents in parallel:
    - opening hook extraction and recreation
@@ -66,7 +67,15 @@ AGENT_CREATIVE_RETRY_ATTEMPTS=2
 AGENT_CREATIVE_RETRY_BASE_DELAY_MS=1200
 TIKHUB_BASE_URL=https://api.tikhub.dev
 TIKHUB_API_TOKEN=...
-TRANSCRIPT_PROVIDERS=ffmpeg,doubao-video
+TRANSCRIPT_PROVIDERS=tikhub-ffmpeg,ffmpeg,doubao-video
+TIKHUB_TRANSCRIPT_PROVIDER_ENABLED=true
+FFMPEG_FAST_PROBE_SIZE=1048576
+FFMPEG_FAST_ANALYZE_DURATION=1000000
+ASR_AUDIO_FORMAT=auto
+ASR_WAV_MAX_BYTES=20971520
+TIKHUB_MEDIA_URL_MAX_ATTEMPTS=6
+TIKTOK_MEDIA_PROXY_URL=
+MEDIA_USE_ENV_PROXY=true
 DOUBAO_API_KEY=...
 DOUBAO_RESOURCE_ID=volc.bigasr.auc_turbo
 DOUBAO_ASR_ENDPOINT=https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash

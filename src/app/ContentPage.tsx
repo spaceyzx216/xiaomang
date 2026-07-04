@@ -17,7 +17,7 @@ import { clearCachedFinalDrafts, readCachedFinalDrafts } from "./finalDraftCache
 
 type TopicLike = {
   id?: string;
-  platform?: "douyin" | "wechat_channels";
+  platform?: "douyin" | "wechat_channels" | "tiktok";
   title?: string;
   authorName?: string;
   link?: string;
@@ -856,6 +856,12 @@ export default function ContentPage() {
       .map(link => String(link || "").trim())
       .filter(Boolean);
   }, [selectedTopics]);
+  // share_links 来源平台：从所选非视频号 topic 推断，含 tiktok 则标 tiktok，否则默认 douyin。
+  // 后端据此为 resolveTikHubVideo 选择正确的 TikHub 端点（/tiktok/ 或 /douyin/）。
+  const shareLinkPlatform = useMemo(() => {
+    const hasTiktok = selectedTopics.some(topic => !isWeChatChannelsTopic(topic) && topic?.platform === "tiktok");
+    return hasTiktok ? "tiktok" : "douyin";
+  }, [selectedTopics]);
 
   const wechatTopics = useMemo(() => selectedTopics.filter(isWeChatChannelsTopic), [selectedTopics]);
   const workflowInputs = useMemo(() => [
@@ -1563,6 +1569,7 @@ export default function ContentPage() {
           },
           body: JSON.stringify({
             workflow_id: "7618854964156563519",
+            source_platform: shareLinkPlatform,
             parameters: {
               share_links: batchLinksText,
               benchmark_topics: batchWechatTopics,

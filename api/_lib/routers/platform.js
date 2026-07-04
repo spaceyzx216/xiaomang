@@ -8,7 +8,7 @@
  *
  * 本地 Express（server/index.js）也调用同一份 handler，保证线上线下零分叉。
  */
-import { json, readBody } from "../common.js";
+import { json, readBody } from "./http-util.js";
 import { getContentAgentConfig } from "../contentAgent/config.js";
 import { createRequestLogger } from "../contentAgent/logger.js";
 import {
