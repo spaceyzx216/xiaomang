@@ -10,13 +10,14 @@ import { createRequestLogger, safeLink } from "../api/_lib/contentAgent/logger.j
 import { runRewriteAgent, runTranslationAgent } from "../api/_lib/contentAgent/providers.js";
 import { platformRouter } from "../api/_lib/routers/platform.js";
 import {
-  buildDraftListCsvRows,
-  buildFinalDraftCsvRows,
   buildFinalDraftMarkdown,
   normalizeBenchmarkVideos,
-  rowsToCsv,
 } from "../api/_lib/exportFormatters.js";
-import { writeFinalDraftToFeishu, writeFinalDraftToFeishuBitable } from "../api/_lib/feishuClient.js";
+import {
+  createFeishuBitableForTask,
+  writeFinalDraftToFeishu,
+  writeFinalDraftToFeishuBitable,
+} from "../api/_lib/feishuClient.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -400,83 +401,6 @@ app.delete("/api/final-drafts/:id", async (req, res) => {
   }
 });
 
-app.post("/api/export/word", async (req, res) => {
-  const docText = buildFinalDraftMarkdown(req.body || {});
-
-  res.setHeader("Content-Type", "application/msword; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="final-copy-${Date.now()}.doc"`);
-  return res.send(docText);
-});
-
-app.post("/api/export/excel", async (req, res) => {
-  const csv = rowsToCsv(buildFinalDraftCsvRows(req.body || {}));
-
-  res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="final-copy-${Date.now()}.csv"`);
-  return res.send(`\uFEFF${csv}`);
-});
-
-app.post("/api/export/final-drafts/word", async (_req, res) => {
-  try {
-    const db = await readFinalDrafts();
-    const list = Array.isArray(db?.items) ? db.items : [];
-
-    if (list.length === 0) {
-      return res.status(400).json({ success: false, error: "暂无可导出的已保存文案" });
-    }
-
-    const sections = list.map((item, idx) => {
-      const body = buildFinalDraftMarkdown(item).replace(/^# 最终文案\n\n/, "");
-      return [
-        `# 任务 ${idx + 1}`,
-        `保存时间：${String(item?.createdAt || "")}`,
-        "",
-        body,
-        "---",
-        "",
-      ].join("\n");
-    });
-
-    const docText = [
-      "# 全部任务最终文案汇总",
-      `共 ${list.length} 份`,
-      "",
-      ...sections,
-    ].join("\n");
-
-    res.setHeader("Content-Type", "application/msword; charset=utf-8");
-    res.setHeader("Content-Disposition", `attachment; filename="final-drafts-all-${Date.now()}.doc"`);
-    return res.send(docText);
-  } catch (error) {
-    return res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Export failed",
-    });
-  }
-});
-
-app.post("/api/export/final-drafts/excel", async (_req, res) => {
-  try {
-    const db = await readFinalDrafts();
-    const list = Array.isArray(db?.items) ? db.items : [];
-
-    if (list.length === 0) {
-      return res.status(400).json({ success: false, error: "暂无可导出的已保存文案" });
-    }
-
-    const csv = rowsToCsv(buildDraftListCsvRows(list));
-
-    res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", `attachment; filename="final-drafts-all-${Date.now()}.csv"`);
-    return res.send(`\uFEFF${csv}`);
-  } catch (error) {
-    return res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Export failed",
-    });
-  }
-});
-
 app.post("/api/export/feishu", async (req, res) => {
   const logger = createRequestLogger("api.export.feishu", req.headers["x-request-id"]);
   logger.info("route.request.start", {
@@ -540,6 +464,43 @@ app.post("/api/export/bitable", async (req, res) => {
     const message = error instanceof Error ? error.message : "Feishu bitable export failed";
     logger.error("route.request.error", {
       interface: "/api/export/bitable",
+      code: error?.code,
+      error: message,
+    });
+    return res.status(error?.status || 500).json({
+      success: false,
+      error: message,
+      code: error?.code,
+    });
+  }
+});
+
+app.post("/api/export/bitable/create", async (req, res) => {
+  const logger = createRequestLogger("api.export.bitable.create", req.headers["x-request-id"]);
+  logger.info("route.request.start", {
+    interface: "/api/export/bitable/create",
+    mode: "bitable.create",
+  });
+
+  try {
+    const result = await createFeishuBitableForTask(req.body || {}, { logger });
+    logger.info("route.request.done", {
+      interface: "/api/export/bitable/create",
+      appToken: result.appToken,
+      tableId: result.tableId,
+      appCreated: result.appCreated,
+      tableCreated: result.tableCreated,
+      fieldsCreated: result.fieldsCreated,
+    });
+    return res.json({
+      success: true,
+      message: "已创建飞书多维表格",
+      ...result,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Feishu bitable create failed";
+    logger.error("route.request.error", {
+      interface: "/api/export/bitable/create",
       code: error?.code,
       error: message,
     });

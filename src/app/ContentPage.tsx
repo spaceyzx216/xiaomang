@@ -12,7 +12,7 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "./components/ui/accordion";
-import { Loader2, FileText, Layers, CheckCircle2, Sparkles, ChevronLeft, ChevronRight, Download } from "lucide-react";
+import { Loader2, FileText, Layers, CheckCircle2, Sparkles, ChevronLeft, ChevronRight, Download, Link2, Plus, Unlink } from "lucide-react";
 import { clearCachedFinalDrafts, readCachedFinalDrafts } from "./finalDraftCache";
 
 type TopicLike = {
@@ -485,21 +485,6 @@ const formatMetric = (value: number) => {
   return String(value || 0);
 };
 
-const formatBenchmarkVideo = (item: BenchmarkVideo, index: number) => [
-  `对标视频 ${index + 1}`,
-  `标题：${item.title || "未命名选题"}`,
-  `链接：${item.link || "未提供"}`,
-  `作者：${item.authorName || "未知"}`,
-  item.publishDate ? `发布时间：${item.publishDate}` : "",
-  `数据：点赞 ${formatMetric(item.likes)} / 评论 ${formatMetric(item.comments)} / 转发 ${formatMetric(item.shares)} / 收藏 ${formatMetric(item.bookmarks)}`,
-  item.hotTopics.length > 0 ? `热词：${item.hotTopics.join("、")}` : "",
-].filter(Boolean).join("\n");
-
-const formatBenchmarkSummary = (items: BenchmarkVideo[]) => {
-  if (!Array.isArray(items) || items.length === 0) return "";
-  return items.map(formatBenchmarkVideo).join("\n\n");
-};
-
 type BitableBinding = {
   targetUrl?: string;
   appToken?: string;
@@ -816,6 +801,10 @@ export default function ContentPage() {
   const [batchExportLoading, setBatchExportLoading] = useState(false);
   const [batchExportMessage, setBatchExportMessage] = useState<string | null>(null);
   const [bitableTargetUrl, setBitableTargetUrl] = useState("");
+  const [bitableMode, setBitableMode] = useState<"new" | "existing">("new");
+  const [bitableNewName, setBitableNewName] = useState("");
+  const [bitableCreateLoading, setBitableCreateLoading] = useState(false);
+  const [bitableBindingError, setBitableBindingError] = useState<string | null>(null);
 
   const workflowInFlightRef = useRef(false);
   const workflowRunIdRef = useRef(0);
@@ -1195,38 +1184,6 @@ export default function ContentPage() {
     }
   };
 
-  const triggerDownload = (blob: Blob, filename: string) => {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const downloadBlobResponse = async (response: Response, fallbackName: string) => {
-    if (!response.ok) {
-      let message = `HTTP ${response.status}`;
-      const raw = await response.text();
-      const trimmed = raw.trim();
-      if (trimmed) {
-        try {
-          const parsed = JSON.parse(trimmed);
-          message = String(parsed?.error || parsed?.message || message);
-        } catch {
-          message = trimmed;
-        }
-      }
-      throw new Error(message);
-    }
-
-    const blob = await response.blob();
-    const disposition = response.headers.get("content-disposition") || "";
-    const matched = disposition.match(/filename="([^"]+)"/);
-    const filename = matched?.[1] || fallbackName;
-    triggerDownload(blob, filename);
-  };
-
   const clearAllPendingDrafts = async () => {
     try {
       const resp = await fetchWithRetry(apiUrl("/api/final-drafts"), { method: "DELETE" });
@@ -1267,65 +1224,91 @@ export default function ContentPage() {
     },
   });
 
-  const exportAllPendingDrafts = async (format: "word" | "excel" | "feishu" | "bitable") => {
+  // 解析飞书多维表格 URL：取出 appToken / tableId（与后端 parseFeishuBitableUrl 口径一致）
+  const parseBitableUrl = (value: string): { appToken?: string; tableId?: string } => {
+    const text = String(value || "").trim();
+    if (!text) return {};
+    try {
+      const parsed = new URL(text);
+      const parts = parsed.pathname.split("/").filter(Boolean);
+      const baseIndex = parts.findIndex(part => part === "base");
+      if (baseIndex >= 0 && parts[baseIndex + 1]) {
+        return {
+          appToken: parts[baseIndex + 1],
+          tableId: parsed.searchParams.get("table") || undefined,
+        };
+      }
+    } catch {
+      // fall through
+    }
+    const tokenMatch = text.match(/\b(app[a-zA-Z0-9]{8,})\b/);
+    return tokenMatch ? { appToken: tokenMatch[1] } : {};
+  };
+
+  // 创建新多维表格：立即调飞书 API 建表，拿到 URL 完成绑定
+  const bindNewBitable = async () => {
+    setBitableCreateLoading(true);
+    setBitableBindingError(null);
+    try {
+      const taskInfo = activeTask ? {
+        id: String(activeTask._id || ""),
+        customerName: String(activeTask.customerName || ""),
+        ownerName: String(activeTask.ownerName || ""),
+        platformName: String(activeTask.platformName || ""),
+        contentDirection: String(activeTask.contentDirection || ""),
+      } : null;
+      const name = bitableNewName.trim() || undefined;
+      const response = await fetchWithRetry(apiUrl("/api/export/bitable/create"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, taskInfo }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data?.success) {
+        throw new Error(data?.error || `创建多维表格失败（HTTP ${response.status}）`);
+      }
+      const binding: BitableBinding = {
+        targetUrl: "",
+        appToken: String(data?.appToken || ""),
+        tableId: String(data?.tableId || ""),
+        tableName: String(data?.tableName || taskTableName),
+        bitableUrl: String(data?.bitableUrl || ""),
+      };
+      writeBitableBinding(bitableBindingKey, binding);
+      setCachedBitableBinding(binding);
+      setBatchExportMessage(null);
+      if (binding.bitableUrl) window.open(binding.bitableUrl, "_blank", "noopener,noreferrer");
+    } catch (error) {
+      setBitableBindingError(error instanceof Error ? error.message : "创建多维表格失败");
+    } finally {
+      setBitableCreateLoading(false);
+    }
+  };
+
+  // 绑定已有多维表格：解析 URL 取 appToken/tableId，写回 binding（首次写入时后端会在该 app 下自动建表）
+  const bindExistingBitable = () => {
+    setBitableBindingError(null);
+    const raw = bitableTargetUrl.trim();
+    const parsed = parseBitableUrl(raw);
+    if (!parsed.appToken) {
+      setBitableBindingError("请粘贴合法的飞书多维表格 URL，需包含 /base/<token> 路径。");
+      return;
+    }
+    const binding: BitableBinding = {
+      targetUrl: raw,
+      appToken: parsed.appToken,
+      tableId: parsed.tableId || "",
+      tableName: cachedBitableBinding.tableName || taskTableName,
+      bitableUrl: raw,
+    };
+    writeBitableBinding(bitableBindingKey, binding);
+    setCachedBitableBinding(binding);
+    setBatchExportMessage(null);
+  };
+
+  const exportAllPendingDrafts = async (format: "feishu" | "bitable") => {
     setBatchExportLoading(true);
     setBatchExportMessage(null);
-
-    const exportItemsLocally = (items: any[]) => {
-      if (items.length === 0) throw new Error("暂无可导出的已保存文案");
-
-      if (format === "excel") {
-        const esc = (v: any) => `"${String(v || "").replace(/"/g, '""')}"`;
-        const rows = [
-          ["序号", "保存时间", "对标选题视频", "标题", "3秒留存", "二创文案", "风格转写结果", "中英翻译结果"],
-          ...items.map((item: any, idx: number) => [
-            String(idx + 1),
-            String(item?.createdAt || ""),
-            formatBenchmarkSummary(Array.isArray(item?.benchmarkVideos) ? item.benchmarkVideos : []),
-            String(item?.titleDraft || ""),
-            String(item?.hookDraft || ""),
-            String(item?.scriptDraft || ""),
-            String(item?.rewriteDraft || ""),
-            String(item?.translationDraft || ""),
-          ]),
-        ];
-        const csv = rows.map((row: string[]) => row.map(esc).join(",")).join("\n");
-        triggerDownload(new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" }), `final-drafts-all-${Date.now()}.csv`);
-        return;
-      }
-
-      const text = [
-        "# 全部任务最终文案汇总",
-        `共 ${items.length} 份`,
-        "",
-        ...items.map((item: any, idx: number) => [
-          `# 任务 ${idx + 1}`,
-          `保存时间：${String(item?.createdAt || "")}`,
-          "",
-          "## 对标选题视频",
-          formatBenchmarkSummary(Array.isArray(item?.benchmarkVideos) ? item.benchmarkVideos : []) || "未提供",
-          "",
-          "## 标题",
-          String(item?.titleDraft || ""),
-          "",
-          "## 3 秒留存",
-          String(item?.hookDraft || ""),
-          "",
-          "## 二创文案",
-          String(item?.scriptDraft || ""),
-          "",
-          "## 风格转写结果",
-          String(item?.rewriteDraft || ""),
-          "",
-          "## 中英翻译结果",
-          String(item?.translationDraft || ""),
-          "",
-          "---",
-          "",
-        ].join("\n")),
-      ].join("\n");
-      triggerDownload(new Blob([text], { type: "application/msword;charset=utf-8" }), `final-drafts-all-${Date.now()}.doc`);
-    };
 
     try {
       const items = await readPendingDraftItems();
@@ -1344,13 +1327,13 @@ export default function ContentPage() {
         const documentUrl = String(data?.documentUrl || "");
         if (documentUrl) window.open(documentUrl, "_blank", "noopener,noreferrer");
       } else if (format === "bitable") {
-        const targetUrl = bitableTargetUrl.trim() || cachedBitableBinding.targetUrl || cachedBitableBinding.bitableUrl || "";
-        if (!cachedBitableBinding.tableId && !targetUrl) {
-          throw new Error("请先粘贴一次飞书多维表格 URL，系统会自动创建并复用当前任务的数据表。");
+        // 必须先创建/绑定一份多维表格，任务内所有选题写入同一份表格
+        if (!cachedBitableBinding.appToken) {
+          throw new Error("请先创建一份新的多维表格，或绑定已有的多维表格 URL，再写入数据。");
         }
 
         let binding: BitableBinding = {
-          targetUrl,
+          targetUrl: cachedBitableBinding.targetUrl || cachedBitableBinding.bitableUrl || "",
           appToken: cachedBitableBinding.appToken || "",
           tableId: cachedBitableBinding.tableId || "",
           tableName: cachedBitableBinding.tableName || taskTableName,
@@ -1377,7 +1360,7 @@ export default function ContentPage() {
             throw new Error(data?.error || `写入飞书多维表格失败（HTTP ${response.status}）`);
           }
           binding = {
-            targetUrl: binding.targetUrl || targetUrl,
+            targetUrl: binding.targetUrl || "",
             appToken: String(data?.appToken || binding.appToken || ""),
             tableId: String(data?.tableId || binding.tableId || ""),
             tableName: String(data?.tableName || binding.tableName || taskTableName),
@@ -1387,23 +1370,6 @@ export default function ContentPage() {
           setCachedBitableBinding(binding);
         }
         if (binding.bitableUrl) window.open(binding.bitableUrl, "_blank", "noopener,noreferrer");
-      } else {
-        try {
-        const response = await fetchWithRetry(
-          apiUrl(format === "word" ? "/api/export/final-drafts/word" : "/api/export/final-drafts/excel"),
-          { method: "POST" },
-        );
-
-        if (response.status === 404 || response.status === 400) {
-          exportItemsLocally(items);
-        } else {
-          await downloadBlobResponse(response, format === "word" ? "final-drafts-all.doc" : "final-drafts-all.csv");
-        }
-      } catch (requestError) {
-        const cachedItems = readCachedFinalDrafts();
-        if (cachedItems.length === 0) throw requestError;
-        exportItemsLocally(cachedItems);
-      }
       }
 
       await clearAllPendingDrafts();
@@ -1449,7 +1415,25 @@ export default function ContentPage() {
     navigate("/final-editor");
   };
 
+  // 结束本次任务：解绑当前任务的多维表格（仅清前端 binding，飞书侧表格保留）
+  const unbindBitableBinding = () => {
+    try {
+      if (typeof localStorage !== "undefined") {
+        localStorage.removeItem(bitableBindingKey);
+      }
+    } catch {
+      // 忽略 localStorage 不可用
+    }
+    setCachedBitableBinding({});
+    setBitableTargetUrl("");
+  };
+
   const handleConfirmComplete = () => {
+    try {
+      unbindBitableBinding();
+    } catch {
+      // 即便解绑异常，也不阻断结束任务
+    }
     setTaskCompleteVisible(true);
     setTimeout(() => {
       setTaskCompleteVisible(false);
@@ -2264,26 +2248,6 @@ export default function ContentPage() {
                   <Button
                     type="button"
                     variant="outline"
-                    className="border-emerald-200 text-emerald-700"
-                    onClick={() => exportAllPendingDrafts("word")}
-                    disabled={batchExportLoading || pendingDraftCount === 0}
-                  >
-                    <Download className="h-4 w-4 mr-1" />
-                    一键导出全部文档
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="border-emerald-200 text-emerald-700"
-                    onClick={() => exportAllPendingDrafts("excel")}
-                    disabled={batchExportLoading || pendingDraftCount === 0}
-                  >
-                    <Download className="h-4 w-4 mr-1" />
-                    一键导出全部表格
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
                     className="border-blue-200 text-blue-700"
                     onClick={() => exportAllPendingDrafts("feishu")}
                     disabled={batchExportLoading || pendingDraftCount === 0}
@@ -2302,23 +2266,110 @@ export default function ContentPage() {
                     写入多维表格
                   </Button>
                 </div>
-                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3 space-y-2">
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3 space-y-3">
                   <div className="flex items-center justify-between gap-3">
                     <div className="text-xs font-medium text-slate-700">飞书多维表格归档</div>
-                    <Badge className={cachedBitableBinding.tableId ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-700"}>
-                      {cachedBitableBinding.tableId ? "当前任务已绑定" : "粘贴一次即可"}
+                    <Badge className={cachedBitableBinding.appToken ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-700"}>
+                      {cachedBitableBinding.appToken ? "当前任务已绑定" : "未绑定"}
                     </Badge>
                   </div>
-                  <input
-                    value={bitableTargetUrl}
-                    onChange={(event) => setBitableTargetUrl(event.target.value)}
-                    placeholder="粘贴飞书多维表格 URL，首次写入会自动创建当前任务的数据表"
-                    className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-xs outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
-                  />
-                  <div className="text-[11px] text-slate-500">
-                    数据表：{cachedBitableBinding.tableName || taskTableName}
-                    {cachedBitableBinding.tableId ? ` · ${cachedBitableBinding.tableId}` : ""}
-                  </div>
+
+                  {cachedBitableBinding.appToken ? (
+                    <div className="space-y-2">
+                      <div className="text-[11px] text-slate-500 break-all">
+                        数据表：{cachedBitableBinding.tableName || taskTableName}
+                        {cachedBitableBinding.tableId ? ` · ${cachedBitableBinding.tableId}` : ""}
+                        {cachedBitableBinding.bitableUrl ? (
+                          <>
+                            {" · "}
+                            <a href={cachedBitableBinding.bitableUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
+                              打开多维表格
+                            </a>
+                          </>
+                        ) : null}
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          className="border-slate-300 text-slate-600 h-7 text-xs"
+                          onClick={() => {
+                            try { localStorage.removeItem(bitableBindingKey); } catch { /* ignore */ }
+                            setCachedBitableBinding({});
+                            setBitableTargetUrl("");
+                            setBitableBindingError(null);
+                          }}
+                        >
+                          <Unlink className="h-3.5 w-3.5 mr-1" />
+                          解绑多维表格
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setBitableMode("new")}
+                          className={`text-xs px-3 py-1 rounded-md border ${bitableMode === "new" ? "border-emerald-500 bg-white text-emerald-700 font-medium" : "border-slate-300 bg-white text-slate-600"}`}
+                        >
+                          <Plus className="h-3.5 w-3.5 inline mr-1" />
+                          创建新多维表格
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setBitableMode("existing")}
+                          className={`text-xs px-3 py-1 rounded-md border ${bitableMode === "existing" ? "border-emerald-500 bg-white text-emerald-700 font-medium" : "border-slate-300 bg-white text-slate-600"}`}
+                        >
+                          <Link2 className="h-3.5 w-3.5 inline mr-1" />
+                          绑定已有表格
+                        </button>
+                      </div>
+
+                      {bitableMode === "new" ? (
+                        <div className="flex flex-col sm:flex-row gap-2">
+                          <input
+                            value={bitableNewName}
+                            onChange={(event) => setBitableNewName(event.target.value)}
+                            placeholder="表格名称（可选，默认：客户 - 平台 - 选题复盘）"
+                            className="flex-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-xs outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
+                          />
+                          <Button
+                            type="button"
+                            className="bg-emerald-600 hover:bg-emerald-700 text-white h-9 text-xs"
+                            onClick={bindNewBitable}
+                            disabled={bitableCreateLoading}
+                          >
+                            {bitableCreateLoading ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : null}
+                            创建并绑定
+                          </Button>
+                        </div>
+                      ) : (
+                        <div className="flex flex-col sm:flex-row gap-2">
+                          <input
+                            value={bitableTargetUrl}
+                            onChange={(event) => setBitableTargetUrl(event.target.value)}
+                            placeholder="粘贴飞书多维表格 URL（https://xxx.feishu.cn/base/<token>）"
+                            className="flex-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-xs outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
+                          />
+                          <Button
+                            type="button"
+                            variant="outline"
+                            className="border-emerald-400 text-emerald-700 h-9 text-xs"
+                            onClick={bindExistingBitable}
+                          >
+                            <Link2 className="h-3.5 w-3.5 mr-1" />
+                            绑定
+                          </Button>
+                        </div>
+                      )}
+                      <div className="text-[11px] text-slate-500">
+                        绑定后，本次任务中处理好的所有选题都会导入到这份多维表格；点击「确认无误」结束任务后会自动解绑。
+                      </div>
+                    </div>
+                  )}
+
+                  {bitableBindingError && <div className="text-xs text-rose-600">{bitableBindingError}</div>}
                 </div>
                 {batchExportMessage && <div className="text-xs text-slate-500">{batchExportMessage}</div>}
               </CardContent>

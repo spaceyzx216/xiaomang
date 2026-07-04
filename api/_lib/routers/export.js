@@ -1,26 +1,22 @@
 /**
  * 导出路由的共享 handler。
  *
- * 合并 api/export/* 6 个路由为单函数 api/export.ts，通过 vercel.json rewrite
+ * 合并 api/export/* 路由为单函数 api/export.ts，通过 vercel.json rewrite
  * 把 /api/export/* 都路由过来，按 req.url 末尾路径分发。
  * 本地 Express 也调用同一份 handler。
  *
  * 子动作：
- *   feishu / bitable            —— 调飞书 API（需较长 maxDuration）
- *   word / excel                —— 单条文案纯本地格式化
- *   final-drafts/word           —— 全部已存文案汇总为 doc
- *   final-drafts/excel          —— 全部已存文案汇总为 csv
+ *   feishu                —— 把全部选题合并写入一篇飞书文档（需较长 maxDuration）
+ *   bitable               —— 把选题记录写入已绑定的飞书多维表格（需较长 maxDuration）
+ *   bitable/create        —— 为当前任务创建一份全新的多维表格并完成绑定（需较长 maxDuration）
+ *
+ * 注：原 word / excel / final-drafts/word / final-drafts/excel 已按要求移除。
  */
 import { json, readBody } from "./http-util.js";
 import { createRequestLogger } from "../contentAgent/logger.js";
+import { buildFinalDraftMarkdown } from "../exportFormatters.js";
 import {
-  buildDraftListCsvRows,
-  buildFinalDraftCsvRows,
-  buildFinalDraftMarkdown,
-  rowsToCsv,
-} from "../exportFormatters.js";
-import { listDrafts } from "../draftStore.js";
-import {
+  createFeishuBitableForTask,
   writeFinalDraftToFeishu,
   writeFinalDraftToFeishuBitable,
 } from "../feishuClient.js";
@@ -91,74 +87,47 @@ const handleBitable = async (req, res) => {
   }
 };
 
-const handleExcel = (req, res) => {
+const handleBitableCreate = async (req, res) => {
   const body = readBody(req);
-  const csv = rowsToCsv(buildFinalDraftCsvRows(body));
-  res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="final-copy-${Date.now()}.csv"`);
-  return res.status(200).send(`\uFEFF${csv}`);
-};
-
-const handleWord = (req, res) => {
-  const body = readBody(req);
-  const docText = buildFinalDraftMarkdown(body);
-  res.setHeader("Content-Type", "application/msword; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="final-copy-${Date.now()}.doc"`);
-  return res.status(200).send(docText);
-};
-
-const handleFinalDraftsExcel = (req, res) => {
-  const items = listDrafts();
-  if (items.length === 0) {
-    return json(res, 400, { success: false, error: "暂无可导出的已保存文案" });
-  }
-  const csv = rowsToCsv(buildDraftListCsvRows(items));
-  res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="final-drafts-all-${Date.now()}.csv"`);
-  return res.status(200).send(`\uFEFF${csv}`);
-};
-
-const handleFinalDraftsWord = (req, res) => {
-  const items = listDrafts();
-  if (items.length === 0) {
-    return json(res, 400, { success: false, error: "暂无可导出的已保存文案" });
-  }
-  const sections = items.map((item, index) => {
-    const body = buildFinalDraftMarkdown(item).replace(/^# 最终文案\n\n/, "");
-    return [
-      `# 任务 ${index + 1}`,
-      `保存时间：${String(item?.createdAt || "")}`,
-      "",
-      body,
-      "---",
-      "",
-    ].join("\n");
+  const logger = createRequestLogger("api.export.bitable.create", req.headers?.["x-request-id"]);
+  logger.info("route.request.start", {
+    interface: "/api/export/bitable/create",
+    mode: "bitable.create",
   });
-  const docText = ["# 全部任务最终文案汇总", `共 ${items.length} 份`, "", ...sections].join("\n");
-  res.setHeader("Content-Type", "application/msword; charset=utf-8");
-  res.setHeader("Content-Disposition", `attachment; filename="final-drafts-all-${Date.now()}.doc"`);
-  return res.status(200).send(docText);
+  try {
+    const result = await createFeishuBitableForTask(body, { logger });
+    logger.info("route.request.done", {
+      interface: "/api/export/bitable/create",
+      appToken: result.appToken,
+      tableId: result.tableId,
+      appCreated: result.appCreated,
+      tableCreated: result.tableCreated,
+      fieldsCreated: result.fieldsCreated,
+    });
+    return json(res, 200, { success: true, message: "已创建飞书多维表格", ...result });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Feishu bitable create failed";
+    logger.error("route.request.error", {
+      interface: "/api/export/bitable/create",
+      code: error?.code,
+      error: message,
+    });
+    return json(res, error?.status || 500, { success: false, error: message, code: error?.code });
+  }
 };
 
 export const exportRouter = async (req, res) => {
   if (req.method !== "POST") {
-    // excel/word 类返回纯文本错误更友好，但为统一仍用 json
     return json(res, 405, { success: false, error: "Method not allowed" });
   }
   const action = resolveExportAction(req);
   switch (action) {
     case "feishu":
       return handleFeishu(req, res);
+    case "bitable/create":
+      return handleBitableCreate(req, res);
     case "bitable":
       return handleBitable(req, res);
-    case "excel":
-      return handleExcel(req, res);
-    case "word":
-      return handleWord(req, res);
-    case "final-drafts/excel":
-      return handleFinalDraftsExcel(req, res);
-    case "final-drafts/word":
-      return handleFinalDraftsWord(req, res);
     default:
       return json(res, 404, { success: false, error: `Unknown export action: ${action || "(empty)"}` });
   }

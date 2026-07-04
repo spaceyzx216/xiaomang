@@ -290,6 +290,10 @@ export const writeFinalDraftToFeishu = async (draft = {}, options = {}) => {
 const BITABLE_TABLE_NAME = "选题复盘";
 const BITABLE_VIEW_NAME = "运营复盘视图";
 const BITABLE_TEXT_LIMIT = 50000;
+const FEISHU_DUPLICATE_TABLE_CODES = new Set([
+  "TableNameDuplicated",
+  "DuplicateTableName",
+]);
 
 export const BITABLE_FIELDS = [
   { field_name: "选题标题", type: 1 },
@@ -440,37 +444,76 @@ export const createFeishuBitableApp = async ({ name }, tenantAccessToken, config
   return app;
 };
 
-export const createFeishuBitableTable = async (appToken, tenantAccessToken, config = getFeishuConfig(), options = {}) => {
-  const tableName = trimBitableName(options.tableName || BITABLE_TABLE_NAME);
+const findFeishuBitableTableByName = async (appToken, tableName, tenantAccessToken, config, options) => {
   const data = await feishuRequest(
     `/open-apis/bitable/v1/apps/${encodeURIComponent(appToken)}/tables`,
-    {
-      table: {
-        name: tableName,
-        default_view_name: BITABLE_VIEW_NAME,
-        fields: BITABLE_FIELDS,
-      },
-    },
+    null,
     config,
     {
       ...options,
+      method: "GET",
       tenantAccessToken,
-      interfaceName: "feishu:bitable.table.create",
+      interfaceName: "feishu:bitable.tables.list",
     },
   );
-  const tableId = String(data?.data?.table_id || "");
-  if (!tableId) {
-    throw new AgentError("Feishu bitable table_id is empty", {
-      code: "FEISHU_BITABLE_TABLE_EMPTY",
-      status: 500,
-      details: data,
-    });
+
+  const items = Array.isArray(data?.data?.items) ? data.data.items : [];
+  return items.find((item) => String(item?.name || "").trim() === tableName) || null;
+};
+
+export const createFeishuBitableTable = async (appToken, tenantAccessToken, config = getFeishuConfig(), options = {}) => {
+  const tableName = trimBitableName(options.tableName || BITABLE_TABLE_NAME);
+  try {
+    const data = await feishuRequest(
+      `/open-apis/bitable/v1/apps/${encodeURIComponent(appToken)}/tables`,
+      {
+        table: {
+          name: tableName,
+          default_view_name: BITABLE_VIEW_NAME,
+          fields: BITABLE_FIELDS,
+        },
+      },
+      config,
+      {
+        ...options,
+        tenantAccessToken,
+        interfaceName: "feishu:bitable.table.create",
+      },
+    );
+    const tableId = String(data?.data?.table_id || "");
+    if (!tableId) {
+      throw new AgentError("Feishu bitable table_id is empty", {
+        code: "FEISHU_BITABLE_TABLE_EMPTY",
+        status: 500,
+        details: data,
+      });
+    }
+    return {
+      tableId,
+      defaultViewId: data?.data?.default_view_id || "",
+      fieldIdList: Array.isArray(data?.data?.field_id_list) ? data.data.field_id_list : [],
+      tableName,
+      reused: false,
+    };
+  } catch (error) {
+    const feishuCode = String(error?.details?.feishuCode || error?.details?.code || error?.code || "");
+    if (!FEISHU_DUPLICATE_TABLE_CODES.has(feishuCode)) {
+      throw error;
+    }
+
+    const existingTable = await findFeishuBitableTableByName(appToken, tableName, tenantAccessToken, config, options);
+    if (!existingTable?.table_id) {
+      throw error;
+    }
+
+    return {
+      tableId: String(existingTable.table_id),
+      defaultViewId: String(existingTable.default_view_id || ""),
+      fieldIdList: Array.isArray(existingTable.field_id_list) ? existingTable.field_id_list : [],
+      tableName,
+      reused: true,
+    };
   }
-  return {
-    tableId,
-    defaultViewId: data?.data?.default_view_id || "",
-    fieldIdList: Array.isArray(data?.data?.field_id_list) ? data.data.field_id_list : [],
-  };
 };
 
 export const listFeishuBitableFields = async (appToken, tableId, tenantAccessToken, config = getFeishuConfig(), options = {}) => {
@@ -537,6 +580,50 @@ export const ensureFeishuBitableFields = async (appToken, tableId, tenantAccessT
     existingCount: existingFields.length,
     missingCount: missingFields.length,
     createdCount: createdFields.length,
+  };
+};
+
+/**
+ * 为任务绑定流程创建一份全新的飞书多维表格应用，并自动建好「选题复盘」数据表与字段。
+ * 与 writeFinalDraftToFeishuBitable 不同：本函数不写入任何选题记录，仅完成建表与字段，
+ * 供前端「创建新多维表格」按钮立即拿到 appToken/tableId/bitableUrl 完成绑定。
+ */
+export const createFeishuBitableForTask = async (payload = {}, options = {}) => {
+  const config = options.config || getFeishuConfig();
+  ensureFeishuConfigured(config);
+
+  const tenantAccessToken = await getTenantAccessToken(config, options);
+  const taskInfo = payload?.taskInfo || payload?.task || {};
+  const requestedTableName = trimBitableName(
+    payload?.tableName ||
+      [taskInfo?.customerName, taskInfo?.platformName, "选题复盘"].filter(Boolean).join(" - ") ||
+      BITABLE_TABLE_NAME,
+  );
+  const appName = trimTitle(
+    payload?.name ||
+      `小芒选题复盘 ${new Date().toISOString().slice(0, 10)}`,
+  );
+
+  const app = await createFeishuBitableApp({ name: appName }, tenantAccessToken, config, options);
+  const appToken = app.app_token;
+  const appUrl = app.url || "";
+
+  const table = await createFeishuBitableTable(appToken, tenantAccessToken, config, {
+    ...options,
+    tableName: requestedTableName,
+  });
+  const tableId = table.tableId;
+
+  const fieldResult = await ensureFeishuBitableFields(appToken, tableId, tenantAccessToken, config, options);
+
+  return {
+    appToken,
+    tableId,
+    tableName: requestedTableName,
+    bitableUrl: buildBitableUrl(appToken, tableId, appUrl, config),
+    appCreated: true,
+    tableCreated: !table.reused,
+    fieldsCreated: fieldResult.createdCount,
   };
 };
 
@@ -611,13 +698,11 @@ export const writeFinalDraftToFeishuBitable = async (draft = {}, options = {}) =
       tableName: requestedTableName,
     });
     tableId = table.tableId;
-    tableCreated = true;
+    tableCreated = !table.reused;
   }
 
-  if (!tableCreated) {
-    const fieldResult = await ensureFeishuBitableFields(appToken, tableId, tenantAccessToken, config, options);
-    fieldsCreated = fieldResult.createdCount;
-  }
+  const fieldResult = await ensureFeishuBitableFields(appToken, tableId, tenantAccessToken, config, options);
+  fieldsCreated = fieldResult.createdCount;
 
   const createdRecords = await batchCreateFeishuBitableRecords(
     appToken,
