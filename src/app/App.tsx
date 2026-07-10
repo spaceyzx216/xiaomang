@@ -1,10 +1,20 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Checkbox } from "./components/ui/checkbox";
 import { Button } from "./components/ui/button";
 import { Badge } from "./components/ui/badge";
 import { apiUrl, fetchWithRetry, parseApiJson } from "./api";
+import {
+  DEFAULT_TOPIC_DAYS,
+  MAX_TOPIC_DAYS,
+  groupTopicsByWeek,
+  isTopicWithinDays,
+  mergeTopicBatchResults,
+  parseTopicDays,
+  topicRequestLimits,
+  topicTimestampMs,
+} from "./topicTimeWindow";
 import {
   type CarouselApi,
   Carousel,
@@ -13,7 +23,7 @@ import {
   CarouselNext,
   CarouselPrevious,
 } from "./components/ui/carousel";
-import { Target, TrendingUp, MessageCircle, ThumbsUp, Share2, Bookmark, ExternalLink, User, CalendarDays, Phone, Layers, Sparkles, CheckCircle2, RefreshCw } from "lucide-react";
+import { Target, TrendingUp, MessageCircle, ThumbsUp, Share2, Bookmark, ExternalLink, User, CalendarDays, Phone, Layers, Sparkles, CheckCircle2, RefreshCw, ChevronDown, ChevronRight, LoaderCircle } from "lucide-react";
 
 interface Topic {
   id: string;
@@ -61,7 +71,10 @@ type TikhubBatchResult = {
   recentDays?: number;
   hasMore?: boolean;
   stopReason?: string;
+  isComplete?: boolean;
+  incompleteReason?: string | null;
   error?: string | null;
+  backgroundError?: string | null;
 };
 
 type WeChatAccountCandidate = {
@@ -222,6 +235,36 @@ const writeWeChatAccountCache = (cache: Record<string, WeChatAccountCandidate>) 
   localStorage.setItem(WECHAT_CHANNELS_ACCOUNT_CACHE_KEY, JSON.stringify(cache));
 };
 
+const persistTikhubResults = (results: TikhubBatchResult[]) => {
+  try {
+    sessionStorage.setItem("tikhubResults", JSON.stringify(results));
+  } catch {
+    // Three-month windows can exceed the browser storage quota; keep live state usable.
+    try {
+      sessionStorage.removeItem("tikhubResults");
+    } catch {
+      // Storage can be fully unavailable in privacy-restricted contexts.
+    }
+  }
+};
+
+const summarizeVideosResponse = (response: unknown) => {
+  const payload = response as Record<string, any> | undefined;
+  if (!payload) return response;
+  const data = payload.data;
+  if (Array.isArray(data)) {
+    return { ...payload, data: data.slice(0, 3), previewOnly: data.length > 3 };
+  }
+  if (data && typeof data === "object" && Array.isArray(data.aweme_list)) {
+    return {
+      ...payload,
+      data: { ...data, aweme_list: data.aweme_list.slice(0, 3) },
+      previewOnly: data.aweme_list.length > 3,
+    };
+  }
+  return payload;
+};
+
 const inferDefaultPlatform = (tasks: TaskItem[]): SourcePlatform => {
   const text = tasks
     .map(task => [task.platformName, task.benchmarkAccounts].filter(Boolean).join(" "))
@@ -261,7 +304,7 @@ export default function App() {
   const [taskCarouselApi, setTaskCarouselApi] = useState<CarouselApi | null>(null);
   const [sourcePlatform, setSourcePlatform] = useState<SourcePlatform>(() => {
     const stored = sessionStorage.getItem("sourcePlatform");
-    return stored === "wechat_channels" || stored === "douyin" ? stored : inferDefaultPlatform(tasks);
+    return stored === "wechat_channels" || stored === "douyin" || stored === "tiktok" ? stored : inferDefaultPlatform(tasks);
   });
   const [tikhubInput, setTikhubInput] = useState(() => sessionStorage.getItem("tikhubInput") || "");
   const [tikhubLoading, setTikhubLoading] = useState(false);
@@ -274,6 +317,23 @@ export default function App() {
       return [];
     }
   });
+  const [topicDays, setTopicDays] = useState(() => {
+    try {
+      return parseTopicDays(sessionStorage.getItem("topicWindowDays") || DEFAULT_TOPIC_DAYS);
+    } catch {
+      return DEFAULT_TOPIC_DAYS;
+    }
+  });
+  const [topicDaysInput, setTopicDaysInput] = useState(() => String(topicDays));
+  const [topicDaysError, setTopicDaysError] = useState<string | null>(null);
+  const [olderTopicsLoading, setOlderTopicsLoading] = useState(false);
+  const [olderTopicsError, setOlderTopicsError] = useState<string | null>(null);
+  const [expandedTopicGroups, setExpandedTopicGroups] = useState<number[]>([0]);
+  const topicFetchGeneration = useRef(0);
+  const lastTopicFetchRef = useRef<{
+    requestedDays: number;
+    fetchRange: (days: number) => Promise<TikhubBatchResult[]>;
+  } | null>(null);
   const [wechatSearchResults, setWechatSearchResults] = useState<WeChatAccountSearchResult[]>(() => {
     try {
       const raw = sessionStorage.getItem("wechatAccountSearchResults");
@@ -299,7 +359,6 @@ export default function App() {
 
   const tikhubTopics = useMemo(() => {
     const now = Date.now();
-    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
     // result.platform 由后端 batch 返回标记；抖音/C TikTok 走同一套 aweme 字段映射，
     // 仅 platform 标记与 link 兜底域名不同。
     const resolveTopicPlatform = (result: TikhubBatchResult): Topic["platform"] =>
@@ -312,7 +371,7 @@ export default function App() {
       return `https://www.douyin.com/video/${id}`;
     };
 
-    return tikhubResults.flatMap(result => {
+    const topics = tikhubResults.flatMap(result => {
       if (Array.isArray(result.topics)) {
         return result.topics;
       }
@@ -327,15 +386,13 @@ export default function App() {
 
       return videosList
         .map((video: any) => {
-          const createdAt = typeof video?.create_time === "number" ? video.create_time * 1000 : null;
-          if (!createdAt || now - createdAt > sevenDaysMs) {
-            return null;
-          }
+          const createdAt = topicTimestampMs({ id: "", rawData: video }) || null;
+          if (!createdAt) return null;
 
           const stats = video?.statistics || {};
-          const id = String(video?.aweme_id || video?.awemeId || Math.random());
           const title = video?.desc || "未命名视频";
           const authorName = video?.author?.nickname || result.authorName || "未知";
+          const id = String(video?.aweme_id || video?.awemeId || `${result.url || result.inputName || authorName}:${createdAt}:${title}`);
           const publishDate = createdAt ? new Date(createdAt).toISOString().slice(0, 10) : undefined;
           const link = video?.share_url || fallbackLink(id, topicPlatform, authorName);
           const hotTopics = Array.isArray(video?.suggest_words)
@@ -370,7 +427,18 @@ export default function App() {
         })
         .filter(Boolean) as Topic[];
     });
-  }, [tikhubResults]);
+    const unique = new Map<string, Topic>();
+    topics.forEach((topic) => {
+      if (!isTopicWithinDays(topic, topicDays, now)) return;
+      unique.set(topic.id, { ...unique.get(topic.id), ...topic });
+    });
+    return Array.from(unique.values()).sort((left, right) => topicTimestampMs(right) - topicTimestampMs(left));
+  }, [tikhubResults, topicDays]);
+
+  const topicGroups = useMemo(
+    () => groupTopicsByWeek(tikhubTopics, topicDays),
+    [tikhubTopics, topicDays],
+  );
 
   useEffect(() => {
     if (tasks.length > 0) return;
@@ -427,8 +495,121 @@ export default function App() {
 
   useEffect(() => {
     sessionStorage.setItem("sourcePlatform", sourcePlatform);
+    topicFetchGeneration.current += 1;
+    lastTopicFetchRef.current = null;
+    setOlderTopicsLoading(false);
+    setOlderTopicsError(null);
     setTikhubError(null);
   }, [sourcePlatform]);
+
+  const storeTikhubResults = (results: TikhubBatchResult[]) => {
+    setTikhubResults(results);
+    persistTikhubResults(results);
+  };
+
+  const requestTikhubRange = async (urls: string[], days: number, platform: SourcePlatform) => {
+    const limits = topicRequestLimits(days);
+    const response = await fetchWithRetry(apiUrl("/api/tikhub/batch"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ urls, platform, days, ...limits }),
+    });
+    const data = await parseApiJson(response);
+    if (!response.ok) throw new Error(data?.error || "请求失败");
+    const results = Array.isArray(data?.results) ? data.results as TikhubBatchResult[] : [];
+    if (results.length !== urls.length) throw new Error("接口返回的账号结果不完整，请重试");
+    return results;
+  };
+
+  const requestWechatRange = async (accounts: Array<Record<string, string>>, days: number) => {
+    const limits = topicRequestLimits(days);
+    const response = await fetchWithRetry(apiUrl("/api/platform/topics/batch"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        platform: "wechat_channels",
+        accounts,
+        days,
+        ...limits,
+      }),
+    });
+    const data = await parseApiJson(response);
+    if (!response.ok) throw new Error(data?.error || "获取视频号作品失败");
+    const results = Array.isArray(data?.results) ? data.results as TikhubBatchResult[] : [];
+    if (results.length !== accounts.length) throw new Error("视频号接口返回的账号结果不完整，请重试");
+    return results;
+  };
+
+  const startProgressiveTopicFetch = async (
+    requestedDays: number,
+    fetchRange: (days: number) => Promise<TikhubBatchResult[]>,
+  ) => {
+    const generation = ++topicFetchGeneration.current;
+    lastTopicFetchRef.current = { requestedDays, fetchRange };
+    setExpandedTopicGroups([0]);
+    setOlderTopicsLoading(false);
+    setOlderTopicsError(null);
+
+    const firstResults = await fetchRange(Math.min(DEFAULT_TOPIC_DAYS, requestedDays));
+    if (generation !== topicFetchGeneration.current) return;
+    setTopicDays(requestedDays);
+    setTopicDaysInput(String(requestedDays));
+    setTopicDaysError(null);
+    sessionStorage.setItem("topicWindowDays", String(requestedDays));
+    storeTikhubResults(firstResults);
+    setSelectedTopics([]);
+    sessionStorage.removeItem("selectedTopicIds");
+
+    if (requestedDays <= DEFAULT_TOPIC_DAYS) return;
+    setOlderTopicsLoading(true);
+    void fetchRange(requestedDays)
+      .then((fullResults) => {
+        if (generation !== topicFetchGeneration.current) return;
+        setTikhubResults((previous) => {
+          const next = mergeTopicBatchResults<Topic>(previous, fullResults) as TikhubBatchResult[];
+          persistTikhubResults(next);
+          return next;
+        });
+        const failures = fullResults.filter(item => item.error || item.isComplete === false);
+        setOlderTopicsError(failures.length > 0 ? `${failures.length} 个账号的旧作品获取失败，可重试` : null);
+      })
+      .catch((error) => {
+        if (generation !== topicFetchGeneration.current) return;
+        setOlderTopicsError(error instanceof Error ? error.message : "旧作品获取失败");
+      })
+      .finally(() => {
+        if (generation === topicFetchGeneration.current) setOlderTopicsLoading(false);
+      });
+  };
+
+  const retryOlderTopics = async () => {
+    if (topicDays <= DEFAULT_TOPIC_DAYS || olderTopicsLoading) return;
+    const context = lastTopicFetchRef.current;
+    if (!context) {
+      setOlderTopicsError("缺少上一次获取上下文，请重新开始获取");
+      return;
+    }
+    const generation = topicFetchGeneration.current;
+    setOlderTopicsLoading(true);
+    setOlderTopicsError(null);
+    try {
+      const results = await context.fetchRange(context.requestedDays);
+      if (generation !== topicFetchGeneration.current) return;
+      setTikhubResults((previous) => {
+        const next = mergeTopicBatchResults<Topic>(previous, results) as TikhubBatchResult[];
+        persistTikhubResults(next);
+        return next;
+      });
+      const failures = results.filter(item => item.error || item.isComplete === false);
+      setOlderTopicsError(failures.length > 0 ? `${failures.length} 个账号的旧作品获取失败，可重试` : null);
+    } catch (error) {
+      if (generation === topicFetchGeneration.current) {
+        setOlderTopicsError(error instanceof Error ? error.message : "旧作品获取失败");
+      }
+    } finally {
+      if (generation === topicFetchGeneration.current) setOlderTopicsLoading(false);
+    }
+  };
 
   const runTikhubFetch = async () => {
     const rawItems = parseLines(tikhubInput);
@@ -441,6 +622,15 @@ export default function App() {
             ? "请输入 TikTok 博主主页链接（每行一个，如 https://www.tiktok.com/@username）"
             : "请输入抖音博主主页分享链接（每行一个）",
       );
+      return;
+    }
+
+    let requestedDays: number;
+    try {
+      requestedDays = parseTopicDays(topicDaysInput);
+      setTopicDaysError(null);
+    } catch (error) {
+      setTopicDaysError(error instanceof Error ? error.message : "时间范围无效");
       return;
     }
 
@@ -477,26 +667,14 @@ export default function App() {
           return;
         }
 
-        await fetchConfirmedWechatTopics(rawItems);
+        await fetchConfirmedWechatTopics(rawItems, requestedDays);
         return;
       }
 
-      const response = await fetchWithRetry(apiUrl("/api/tikhub/batch"), {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ urls: rawItems, platform: sourcePlatform }),
-      });
-
-      const data = await parseApiJson(response);
-      if (!response.ok) {
-        throw new Error(data?.error || "请求失败");
-      }
-
-      const results = Array.isArray(data?.results) ? data.results : [];
-      setTikhubResults(results);
-      sessionStorage.setItem("tikhubResults", JSON.stringify(results));
+      await startProgressiveTopicFetch(
+        requestedDays,
+        days => requestTikhubRange(rawItems, days, sourcePlatform),
+      );
       sessionStorage.setItem("tikhubInput", tikhubInput);
     } catch (error) {
       const message = error instanceof Error ? error.message : "请求失败";
@@ -523,7 +701,22 @@ export default function App() {
     writeWeChatAccountCache(next);
   };
 
-  const fetchConfirmedWechatTopics = async (names = parseLines(tikhubInput)) => {
+  const fetchConfirmedWechatTopics = async (
+    names = parseLines(tikhubInput),
+    requestedDaysValue?: number,
+  ) => {
+    if (names.length === 0) {
+      setTikhubError("请输入视频号对标账号名称（每行一个）");
+      return;
+    }
+    let requestedDays: number;
+    try {
+      requestedDays = parseTopicDays(requestedDaysValue ?? topicDaysInput);
+      setTopicDaysError(null);
+    } catch (error) {
+      setTopicDaysError(error instanceof Error ? error.message : "时间范围无效");
+      return;
+    }
     const accounts = names
       .map(name => confirmedWechatAccounts[name])
       .filter(Boolean)
@@ -546,26 +739,10 @@ export default function App() {
     setTikhubLoading(true);
     setTikhubError(null);
     try {
-      const response = await fetchWithRetry(apiUrl("/api/platform/topics/batch"), {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          platform: "wechat_channels",
-          accounts,
-          count: 200,
-          days: 7,
-          maxPages: 10,
-        }),
-      });
-      const data = await parseApiJson(response);
-      if (!response.ok) {
-        throw new Error(data?.error || "获取视频号作品失败");
-      }
-      const results = Array.isArray(data?.results) ? data.results : [];
-      setTikhubResults(results);
-      sessionStorage.setItem("tikhubResults", JSON.stringify(results));
+      await startProgressiveTopicFetch(
+        requestedDays,
+        days => requestWechatRange(accounts, days),
+      );
       sessionStorage.setItem("tikhubInput", tikhubInput);
       sessionStorage.setItem("sourcePlatform", "wechat_channels");
     } catch (error) {
@@ -584,7 +761,7 @@ export default function App() {
           ? result.topics.map(topic => topic.id === topicId ? { ...topic, link } : topic)
           : result.topics,
       }));
-      sessionStorage.setItem("tikhubResults", JSON.stringify(next));
+      persistTikhubResults(next);
       return next;
     });
   };
@@ -911,6 +1088,46 @@ export default function App() {
                     </button>
                   ))}
                 </div>
+                <div className="flex flex-wrap items-end gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3">
+                  <div>
+                    <div className="text-xs font-semibold text-slate-600">发布时间范围</div>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {[7, 15, 30, 90].map(days => (
+                        <button
+                          key={days}
+                          type="button"
+                          onClick={() => {
+                            setTopicDaysInput(String(days));
+                            setTopicDaysError(null);
+                          }}
+                          className={`rounded-full border px-3 py-1 text-xs transition ${
+                            topicDaysInput === String(days)
+                              ? "border-indigo-500 bg-indigo-50 text-indigo-700"
+                              : "border-slate-200 text-slate-600 hover:border-slate-300"
+                          }`}
+                        >
+                          近 {days} 天
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <label className="ml-auto text-xs text-slate-600">
+                    自定义 1–{MAX_TOPIC_DAYS} 天
+                    <input
+                      type="number"
+                      min={1}
+                      max={MAX_TOPIC_DAYS}
+                      step={1}
+                      value={topicDaysInput}
+                      onChange={event => {
+                        setTopicDaysInput(event.target.value);
+                        setTopicDaysError(null);
+                      }}
+                      className="ml-2 h-8 w-20 rounded-md border border-slate-200 bg-white px-2 text-sm outline-none focus:border-indigo-300 focus:ring-2 focus:ring-indigo-100"
+                    />
+                  </label>
+                  {topicDaysError && <div className="w-full text-xs text-red-500">{topicDaysError}</div>}
+                </div>
                 <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-4">
                   <div className="text-xs font-semibold text-slate-600">
                     {sourcePlatform === "wechat_channels" ? "视频号对标账号名称（多行）" : sourcePlatform === "tiktok" ? "TikTok 博主主页链接（多行）" : "抖音博主主页分享链接（多行）"}
@@ -1046,7 +1263,7 @@ export default function App() {
                                 <div>sec_user_id：{item.secUserId || "未获取"}</div>
                               )}
                               <div>作品数量：{item.videosCount ?? 0}</div>
-                              {sourcePlatform === "wechat_channels" && (
+                              {item.recentDays && (
                                 <div className="text-xs text-slate-500">
                                   已拉取 {item.rawVideosCount ?? item.videosCount ?? 0} 条原始作品，
                                   近 {item.recentDays ?? 7} 天命中 {item.videosCount ?? 0} 条，
@@ -1054,6 +1271,12 @@ export default function App() {
                                   {item.hasMore ? "，可能仍有下一页" : "，已停止翻页"}
                                   {item.stopReason ? `（${item.stopReason}）` : ""}
                                 </div>
+                              )}
+                              {item.incompleteReason && (
+                                <div className="text-xs text-amber-600">{item.incompleteReason}</div>
+                              )}
+                              {item.backgroundError && (
+                                <div className="text-xs text-amber-600">旧作品：{item.backgroundError}</div>
                               )}
                             </div>
                             {item.secUserResponse && (
@@ -1066,9 +1289,9 @@ export default function App() {
                             )}
                             {item.videosResponse && (
                               <details className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-                                <summary className="cursor-pointer text-xs font-semibold text-slate-600">主页作品接口返回</summary>
+                                <summary className="cursor-pointer text-xs font-semibold text-slate-600">主页作品接口摘要（最多 3 条）</summary>
                                 <pre className="mt-2 whitespace-pre-wrap break-all text-xs text-slate-600">
-                                  {JSON.stringify(item.videosResponse, null, 2)}
+                                  {JSON.stringify(summarizeVideosResponse(item.videosResponse), null, 2)}
                                 </pre>
                               </details>
                             )}
@@ -1122,11 +1345,53 @@ export default function App() {
                 </div>
               </CardHeader>
               <CardContent className="space-y-3">
-                {tikhubTopics
-                  .sort((a, b) => b.stats[sortKey] - a.stats[sortKey])
-                  .map(topic => (
+                {topicGroups.map(group => {
+                  const expanded = group.index === 0 || expandedTopicGroups.includes(group.index);
+                  const isOlderGroup = group.index > 0;
+                  return (
+                  <section key={group.index} className="rounded-xl border border-slate-200 bg-white">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!isOlderGroup) return;
+                        setExpandedTopicGroups(previous => previous.includes(group.index)
+                          ? previous.filter(index => index !== group.index)
+                          : [...previous, group.index]);
+                      }}
+                      className={`flex w-full items-center justify-between gap-3 px-4 py-3 text-left ${isOlderGroup ? "cursor-pointer" : "cursor-default"}`}
+                    >
+                      <span className="flex items-center gap-2 text-sm font-semibold text-slate-800">
+                        {isOlderGroup && (expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />)}
+                        {group.label}
+                      </span>
+                      <span className="flex items-center gap-2 text-xs text-slate-500">
+                        {isOlderGroup && olderTopicsLoading && <LoaderCircle className="h-4 w-4 animate-spin text-indigo-500" />}
+                        {group.topics.length} 条
+                      </span>
+                    </button>
+                    {expanded && (
+                    <div className="space-y-3 border-t border-slate-100 p-3">
+                      {isOlderGroup && olderTopicsLoading && group.topics.length === 0 && (
+                        <div className="flex items-center justify-center gap-2 py-6 text-sm text-slate-500">
+                          <LoaderCircle className="h-5 w-5 animate-spin text-indigo-500" />
+                          正在获取这一时间段的作品…
+                        </div>
+                      )}
+                      {isOlderGroup && olderTopicsError && (
+                        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                          <span>{olderTopicsError}</span>
+                          <Button type="button" size="sm" variant="outline" onClick={retryOlderTopics} disabled={olderTopicsLoading}>
+                            重试
+                          </Button>
+                        </div>
+                      )}
+                      {group.topics
+                        .slice()
+                        .sort((a, b) => b.stats[sortKey] - a.stats[sortKey])
+                        .map(topic => (
                   <div
                     key={topic.id}
+                    style={{ contentVisibility: "auto", containIntrinsicSize: "0 180px" }}
                     className={`rounded-lg border transition-all ${
                       selectedTopics.includes(topic.id)
                         ? "bg-indigo-50 border-indigo-300"
@@ -1216,7 +1481,15 @@ export default function App() {
                       </div>
                     </div>
                   </div>
-                ))}
+                      ))}
+                      {group.topics.length === 0 && !olderTopicsLoading && !olderTopicsError && (
+                        <div className="py-5 text-center text-sm text-slate-400">这一时间段暂无作品</div>
+                      )}
+                    </div>
+                    )}
+                  </section>
+                  );
+                })}
               </CardContent>
             </Card>
           </div>

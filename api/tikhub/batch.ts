@@ -2,6 +2,11 @@ import { TIKHUB_API_TOKEN, TIKHUB_BASE_URL, json, readBody, sanitizeUrl } from "
 import { getContentAgentConfig } from "../_lib/contentAgent/config.js";
 import { appendQuery, fetchJson } from "../_lib/contentAgent/http.js";
 import { createRequestLogger, safeLink } from "../_lib/contentAgent/logger.js";
+import {
+  buildCombinedVideosResponse,
+  collectRecentAwemePages,
+  parseRecentDays,
+} from "../_lib/topicPagination.js";
 
 export default async function handler(req: any, res: any) {
   if (req.method !== "POST") {
@@ -11,12 +16,14 @@ export default async function handler(req: any, res: any) {
   const logger = createRequestLogger("api.tikhub.batch", req.headers?.["x-request-id"]);
   const agentConfig = getContentAgentConfig();
 
-  if (!TIKHUB_API_TOKEN) {
-    return json(res, 500, { error: "Missing TIKHUB_API_TOKEN" });
-  }
-
-  const { urls, platform } = readBody(req);
+  const { urls, platform, days = 7, maxPages = 20, count = 400 } = readBody(req);
   const normalizedPlatform = String(platform || "douyin").toLowerCase() === "tiktok" ? "tiktok" : "douyin";
+  let recentDays;
+  try {
+    recentDays = parseRecentDays(days);
+  } catch {
+    return json(res, 400, { error: "days must be an integer between 1 and 90", code: "TOPIC_DAYS_INVALID" });
+  }
   logger.info("route.request.start", {
     interface: "/api/tikhub/batch",
     platform: normalizedPlatform,
@@ -26,6 +33,10 @@ export default async function handler(req: any, res: any) {
   if (!Array.isArray(urls) || urls.length === 0) {
     logger.warn("route.validation.error", { error: "urls must be a non-empty array" });
     return json(res, 400, { error: "urls must be a non-empty array" });
+  }
+
+  if (!TIKHUB_API_TOKEN) {
+    return json(res, 500, { error: "Missing TIKHUB_API_TOKEN" });
   }
 
   const results: Array<Record<string, unknown>> = [];
@@ -84,7 +95,7 @@ export default async function handler(req: any, res: any) {
           }
         }
         const videosEndpoint = `${TIKHUB_BASE_URL}/api/v1/tiktok/app/v3/fetch_user_post_videos`;
-        const videosParams: Record<string, unknown> = { count: 20, cursor: 0 };
+        const videosParams: Record<string, unknown> = { count: 20 };
         if (secUserId) {
           videosParams.sec_user_id = secUserId;
         } else if (username) {
@@ -92,24 +103,26 @@ export default async function handler(req: any, res: any) {
         } else {
           videosParams.url = sanitizedUrl;
         }
-        const { response: videosResp, data: videosResponse } = await fetchJson(
-          appendQuery(videosEndpoint, videosParams),
-          {
-            timeoutMs: agentConfig.requestTimeoutMs,
-            retries: agentConfig.apiRetryAttempts,
-            retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
-            logger,
-            interfaceName: "tikhub:tiktok:fetch_user_post_videos",
-            headers: { Authorization: `Bearer ${TIKHUB_API_TOKEN}` },
-          },
-        );
-
-        const dataBlock = videosResponse?.data;
-        const videosList = Array.isArray(dataBlock)
-          ? dataBlock
-          : Array.isArray(dataBlock?.aweme_list)
-            ? dataBlock.aweme_list
-            : [];
+        const collection = await collectRecentAwemePages({
+          platform: normalizedPlatform,
+          days: recentDays,
+          maxPages,
+          maxVideos: count,
+          fetchPage: (cursor: unknown, page: number) => fetchJson(
+            appendQuery(videosEndpoint, { ...videosParams, cursor }),
+            {
+              timeoutMs: agentConfig.requestTimeoutMs,
+              retries: agentConfig.apiRetryAttempts,
+              retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
+              logger,
+              interfaceName: "tikhub:tiktok:fetch_user_post_videos",
+              logFields: { page },
+              headers: { Authorization: `Bearer ${TIKHUB_API_TOKEN}` },
+            },
+          ),
+        });
+        const videosList = collection.videos;
+        const videosResponse = buildCombinedVideosResponse(collection.pages, videosList, collection);
         const authorName = videosList?.[0]?.author?.nickname;
 
         results.push({
@@ -120,13 +133,21 @@ export default async function handler(req: any, res: any) {
           videosCount: videosList.length,
           secUserResponse,
           videosResponse,
-          error: videosResp.ok ? null : videosResponse?.message || "Failed to fetch videos",
+          pageCount: collection.pageCount,
+          rawVideosCount: collection.rawVideosCount,
+          recentDays: collection.recentDays,
+          hasMore: collection.hasMore,
+          stopReason: collection.stopReason,
+          isComplete: collection.isComplete,
+          incompleteReason: collection.incompleteReason,
+          backgroundError: collection.partialError,
+          error: null,
         });
         logger.info("tikhub.item.end", {
           url: safeLink(sanitizedUrl),
           secUserId,
           videosCount: videosList.length,
-          error: videosResp.ok ? "" : videosResponse?.message || "Failed to fetch videos",
+          error: "",
         });
       } else {
         // 抖音：主页链接 → sec_user_id → fetch_user_post_videos
@@ -156,29 +177,31 @@ export default async function handler(req: any, res: any) {
         }
 
         const videosEndpoint = `${TIKHUB_BASE_URL}/api/v1/douyin/app/v3/fetch_user_post_videos`;
-        const { response: videosResp, data: videosResponse } = await fetchJson(
-          appendQuery(videosEndpoint, {
-            sec_user_id: secUserId,
-            count: 20,
-            max_cursor: 0,
-            sort_type: 0,
-          }),
-          {
-            timeoutMs: agentConfig.requestTimeoutMs,
-            retries: agentConfig.apiRetryAttempts,
-            retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
-            logger,
-            interfaceName: "tikhub:fetch_user_post_videos",
-            headers: { Authorization: `Bearer ${TIKHUB_API_TOKEN}` },
-          },
-        );
-
-        const dataBlock = videosResponse?.data;
-        const videosList = Array.isArray(dataBlock)
-          ? dataBlock
-          : Array.isArray(dataBlock?.aweme_list)
-            ? dataBlock.aweme_list
-            : [];
+        const collection = await collectRecentAwemePages({
+          platform: normalizedPlatform,
+          days: recentDays,
+          maxPages,
+          maxVideos: count,
+          fetchPage: (cursor: unknown, page: number) => fetchJson(
+            appendQuery(videosEndpoint, {
+              sec_user_id: secUserId,
+              count: 20,
+              max_cursor: cursor,
+              sort_type: 0,
+            }),
+            {
+              timeoutMs: agentConfig.requestTimeoutMs,
+              retries: agentConfig.apiRetryAttempts,
+              retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
+              logger,
+              interfaceName: "tikhub:fetch_user_post_videos",
+              logFields: { page },
+              headers: { Authorization: `Bearer ${TIKHUB_API_TOKEN}` },
+            },
+          ),
+        });
+        const videosList = collection.videos;
+        const videosResponse = buildCombinedVideosResponse(collection.pages, videosList, collection);
         const authorName = videosList?.[0]?.author?.nickname;
 
         results.push({
@@ -189,13 +212,21 @@ export default async function handler(req: any, res: any) {
           videosCount: videosList.length,
           secUserResponse,
           videosResponse,
-          error: videosResp.ok ? null : videosResponse?.message || "Failed to fetch videos",
+          pageCount: collection.pageCount,
+          rawVideosCount: collection.rawVideosCount,
+          recentDays: collection.recentDays,
+          hasMore: collection.hasMore,
+          stopReason: collection.stopReason,
+          isComplete: collection.isComplete,
+          incompleteReason: collection.incompleteReason,
+          backgroundError: collection.partialError,
+          error: null,
         });
         logger.info("tikhub.item.end", {
           url: safeLink(sanitizedUrl),
           secUserId,
           videosCount: videosList.length,
-          error: videosResp.ok ? "" : videosResponse?.message || "Failed to fetch videos",
+          error: "",
         });
       }
     } catch (error) {

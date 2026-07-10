@@ -10,6 +10,11 @@ import { createRequestLogger, safeLink } from "../api/_lib/contentAgent/logger.j
 import { runRewriteAgent, runTranslationAgent } from "../api/_lib/contentAgent/providers.js";
 import { platformRouter } from "../api/_lib/routers/platform.js";
 import {
+  buildCombinedVideosResponse,
+  collectRecentAwemePages,
+  parseRecentDays,
+} from "../api/_lib/topicPagination.js";
+import {
   buildFinalDraftMarkdown,
   normalizeBenchmarkVideos,
 } from "../api/_lib/exportFormatters.js";
@@ -97,24 +102,33 @@ const writeFinalDrafts = async (payload) => {
 
 app.post("/api/tikhub/batch", async (req, res) => {
   const logger = createRequestLogger("api.tikhub.batch", req.headers["x-request-id"]);
-  const { urls, platform } = req.body || {};
+  const { urls, platform, days = 7, maxPages = 20, count = 400 } = req.body || {};
   const normalizedPlatform = String(platform || "douyin").toLowerCase() === "tiktok" ? "tiktok" : "douyin";
+  let recentDays;
+  try {
+    recentDays = parseRecentDays(days);
+  } catch {
+    return res.status(400).json({
+      error: "days must be an integer between 1 and 90",
+      code: "TOPIC_DAYS_INVALID",
+    });
+  }
   logger.info("route.request.start", {
     interface: "/api/tikhub/batch",
     platform: normalizedPlatform,
     urlCount: Array.isArray(urls) ? urls.length : 0,
   });
 
+  if (!Array.isArray(urls) || urls.length === 0) {
+    logger.warn("route.validation.error", { error: "urls must be a non-empty array" });
+    return res.status(400).json({ error: "urls must be a non-empty array" });
+  }
+
   if (!apiToken) {
     logger.error("route.config.error", { error: "Missing TIKHUB_API_TOKEN" });
     return res.status(500).json({
       error: "Missing TIKHUB_API_TOKEN",
     });
-  }
-
-  if (!Array.isArray(urls) || urls.length === 0) {
-    logger.warn("route.validation.error", { error: "urls must be a non-empty array" });
-    return res.status(400).json({ error: "urls must be a non-empty array" });
   }
 
   const fetchOpts = {
@@ -173,7 +187,7 @@ app.post("/api/tikhub/batch", async (req, res) => {
           }
         }
         const videosEndpoint = `${baseUrl}/api/v1/tiktok/app/v3/fetch_user_post_videos`;
-        const videosParams = { count: 20, cursor: 0 };
+        const videosParams = { count: 20 };
         if (secUserId) {
           videosParams.sec_user_id = secUserId;
         } else if (username) {
@@ -181,17 +195,22 @@ app.post("/api/tikhub/batch", async (req, res) => {
         } else {
           videosParams.url = sanitizedUrl;
         }
-        const { response: videosResp, data: videosResponse } = await fetchJson(
-          appendQuery(videosEndpoint, videosParams),
-          { ...fetchOpts, interfaceName: "tikhub:tiktok:fetch_user_post_videos" },
-        );
-
-        const dataBlock = videosResponse?.data;
-        const videosList = Array.isArray(dataBlock)
-          ? dataBlock
-          : Array.isArray(dataBlock?.aweme_list)
-            ? dataBlock.aweme_list
-            : [];
+        const collection = await collectRecentAwemePages({
+          platform: normalizedPlatform,
+          days: recentDays,
+          maxPages,
+          maxVideos: count,
+          fetchPage: (cursor, page) => fetchJson(
+            appendQuery(videosEndpoint, { ...videosParams, cursor }),
+            {
+              ...fetchOpts,
+              interfaceName: "tikhub:tiktok:fetch_user_post_videos",
+              logFields: { page },
+            },
+          ),
+        });
+        const videosList = collection.videos;
+        const videosResponse = buildCombinedVideosResponse(collection.pages, videosList, collection);
         const authorName = videosList?.[0]?.author?.nickname;
 
         results.push({
@@ -202,13 +221,21 @@ app.post("/api/tikhub/batch", async (req, res) => {
           videosCount: videosList.length,
           secUserResponse,
           videosResponse,
-          error: videosResp.ok ? null : videosResponse?.message || "Failed to fetch videos",
+          pageCount: collection.pageCount,
+          rawVideosCount: collection.rawVideosCount,
+          recentDays: collection.recentDays,
+          hasMore: collection.hasMore,
+          stopReason: collection.stopReason,
+          isComplete: collection.isComplete,
+          incompleteReason: collection.incompleteReason,
+          backgroundError: collection.partialError,
+          error: null,
         });
         logger.info("tikhub.item.end", {
           url: safeLink(sanitizedUrl),
           secUserId,
           videosCount: videosList.length,
-          error: videosResp.ok ? "" : videosResponse?.message || "Failed to fetch videos",
+          error: "",
         });
       } else {
         // 抖音：主页链接 → sec_user_id → fetch_user_post_videos
@@ -236,22 +263,27 @@ app.post("/api/tikhub/batch", async (req, res) => {
         }
 
         const videosEndpoint = `${baseUrl}/api/v1/douyin/app/v3/fetch_user_post_videos`;
-        const { response: videosResp, data: videosResponse } = await fetchJson(
-          appendQuery(videosEndpoint, {
-            sec_user_id: secUserId,
-            count: 20,
-            max_cursor: 0,
-            sort_type: 0,
-          }),
-          { ...fetchOpts, interfaceName: "tikhub:fetch_user_post_videos" },
-        );
-
-        const dataBlock = videosResponse?.data;
-        const videosList = Array.isArray(dataBlock)
-          ? dataBlock
-          : Array.isArray(dataBlock?.aweme_list)
-            ? dataBlock.aweme_list
-            : [];
+        const collection = await collectRecentAwemePages({
+          platform: normalizedPlatform,
+          days: recentDays,
+          maxPages,
+          maxVideos: count,
+          fetchPage: (cursor, page) => fetchJson(
+            appendQuery(videosEndpoint, {
+              sec_user_id: secUserId,
+              count: 20,
+              max_cursor: cursor,
+              sort_type: 0,
+            }),
+            {
+              ...fetchOpts,
+              interfaceName: "tikhub:fetch_user_post_videos",
+              logFields: { page },
+            },
+          ),
+        });
+        const videosList = collection.videos;
+        const videosResponse = buildCombinedVideosResponse(collection.pages, videosList, collection);
         const authorName = videosList?.[0]?.author?.nickname;
 
         results.push({
@@ -262,13 +294,21 @@ app.post("/api/tikhub/batch", async (req, res) => {
           videosCount: videosList.length,
           secUserResponse,
           videosResponse,
-          error: videosResp.ok ? null : videosResponse?.message || "Failed to fetch videos",
+          pageCount: collection.pageCount,
+          rawVideosCount: collection.rawVideosCount,
+          recentDays: collection.recentDays,
+          hasMore: collection.hasMore,
+          stopReason: collection.stopReason,
+          isComplete: collection.isComplete,
+          incompleteReason: collection.incompleteReason,
+          backgroundError: collection.partialError,
+          error: null,
         });
         logger.info("tikhub.item.end", {
           url: safeLink(sanitizedUrl),
           secUserId,
           videosCount: videosList.length,
-          error: videosResp.ok ? "" : videosResponse?.message || "Failed to fetch videos",
+          error: "",
         });
       }
     } catch (error) {

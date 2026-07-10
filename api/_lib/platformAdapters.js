@@ -1,4 +1,11 @@
 import { AgentError, fetchJson } from "./contentAgent/http.js";
+import {
+  MAX_TOPIC_PAGES,
+  MAX_TOPIC_VIDEOS,
+  parseRecentDays,
+  reachedRecentTimeBoundary,
+  stableVideoFingerprint,
+} from "./topicPagination.js";
 
 export const normalizePlatform = (value) => {
   const text = String(value || "").trim().toLowerCase();
@@ -373,9 +380,14 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
     throw new AgentError("accounts must include finderUsername", { code: "ACCOUNTS_EMPTY", status: 400 });
   }
 
-  const limit = Math.max(1, Math.min(Number(count) || 200, 500));
-  const recentDays = Math.max(1, Math.min(Number(days) || 7, 30));
-  const pageLimit = Math.max(1, Math.min(Number(maxPages) || 10, 20));
+  const limit = Math.max(1, Math.min(Number(count) || 200, MAX_TOPIC_VIDEOS));
+  let recentDays;
+  try {
+    recentDays = parseRecentDays(days);
+  } catch {
+    throw new AgentError("days must be an integer between 1 and 90", { code: "TOPIC_DAYS_INVALID", status: 400 });
+  }
+  const pageLimit = Math.max(1, Math.min(Number(maxPages) || 10, MAX_TOPIC_PAGES));
   const nowMs = Date.now();
   const results = [];
   for (const account of selectedAccounts) {
@@ -387,58 +399,91 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
       let lastBuffer = "";
       let hasMore = false;
       let stopReason = "page_limit";
+      let partialError = null;
+      let hitVideoLimit = false;
 
       for (let page = 1; page <= pageLimit && allVideos.length < limit; page += 1) {
-        const videosResponse = await postTikHub(
-          "/api/v1/wechat_channels/v2/fetch_user_videos",
-          {
-            username: account.finderUsername,
-            last_buffer: lastBuffer,
-            raw: false,
-          },
-          config,
-          {
-            logger: options.logger,
-            logFields: {
-              inputName: account.inputName,
-              finderUsername: account.finderUsername,
-              page,
+        let videosResponse;
+        try {
+          videosResponse = await postTikHub(
+            "/api/v1/wechat_channels/v2/fetch_user_videos",
+            {
+              username: account.finderUsername,
+              last_buffer: lastBuffer,
+              raw: false,
             },
-          },
-        );
+            config,
+            {
+              logger: options.logger,
+              logFields: {
+                inputName: account.inputName,
+                finderUsername: account.finderUsername,
+                page,
+              },
+            },
+          );
+        } catch (error) {
+          if (pageResponses.length === 0) throw error;
+          partialError = error instanceof Error ? error.message : "Page fetch failed";
+          hasMore = true;
+          stopReason = "page_error";
+          break;
+        }
         pageResponses.push(videosResponse);
         const data = videosResponse?.data || {};
         const videos = Array.isArray(data?.videos) ? data.videos : [];
         let addedCount = 0;
+        const newPageVideos = [];
         for (const video of videos) {
-          const identity = videoIdentity(video) || JSON.stringify(video).slice(0, 500);
+          if (allVideos.length >= limit) {
+            hitVideoLimit = true;
+            break;
+          }
+          const identity = videoIdentity(video) || stableVideoFingerprint(video);
           if (seenVideoKeys.has(identity)) continue;
           seenVideoKeys.add(identity);
           allVideos.push(video);
+          newPageVideos.push(video);
           addedCount += 1;
+        }
+
+        if (page > 1 && reachedRecentTimeBoundary(newPageVideos, recentDays, nowMs)) {
+          stopReason = "time_boundary";
+          hasMore = false;
+          break;
         }
 
         const nextBuffer = String(data?.last_buffer || data?.lastBuffer || "").trim();
         const apiHasNext = hasNextPage(data?.up_continue) || hasNextPage(data?.upContinueFlag);
-        hasMore = Boolean(nextBuffer) && nextBuffer !== lastBuffer && !seenBuffers.has(nextBuffer);
+        const canAdvance = Boolean(nextBuffer) && nextBuffer !== lastBuffer && !seenBuffers.has(nextBuffer);
+        hasMore = Boolean(nextBuffer);
         if (!nextBuffer) {
           stopReason = "no_next_buffer";
           hasMore = false;
           break;
         }
-        if (nextBuffer === lastBuffer || seenBuffers.has(nextBuffer)) {
+        if (videos.length === 0 || addedCount === 0) {
+          if (canAdvance) {
+            stopReason = "duplicate_page_advanced";
+            lastBuffer = nextBuffer;
+            seenBuffers.add(lastBuffer);
+            continue;
+          }
           stopReason = "repeated_buffer";
-          hasMore = false;
           break;
         }
-        if (videos.length === 0 || addedCount === 0) {
-          stopReason = "no_new_videos";
-          hasMore = false;
+        if (!canAdvance) {
+          stopReason = "repeated_buffer";
           break;
         }
         stopReason = apiHasNext ? "api_has_next" : "buffer_probe";
         lastBuffer = nextBuffer;
         seenBuffers.add(lastBuffer);
+      }
+
+      if (hitVideoLimit || (hasMore && (pageResponses.length >= pageLimit || allVideos.length >= limit))) {
+        hasMore = true;
+        stopReason = "safety_limit";
       }
 
       const topics = allVideos
@@ -458,6 +503,11 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
         recentDays,
         hasMore,
         stopReason,
+        isComplete: !["safety_limit", "page_error", "repeated_buffer"].includes(stopReason),
+        incompleteReason: partialError || (stopReason === "safety_limit"
+          ? "已达到安全翻页上限，结果可能不完整"
+          : stopReason === "repeated_buffer" ? "上游翻页游标重复，结果可能不完整" : null),
+        backgroundError: partialError,
         error: null,
       });
     } catch (error) {
@@ -466,6 +516,7 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
         finderUsername: account.finderUsername,
         videosCount: 0,
         topics: [],
+        recentDays,
         error: error instanceof Error ? error.message : "Failed to fetch videos",
       });
     }
