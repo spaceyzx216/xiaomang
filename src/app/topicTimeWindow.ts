@@ -194,10 +194,17 @@ export const mergeTopicBatchResults = <T extends TopicTimeItem>(
   const merged = incomingItems.map((next, index) => {
     const old = previousByKey.get(resultIdentity(next, index));
     if (!old) return next;
+    // 仅当任一方已通过 topics 字段传递作品时才合并 topics；否则保留
+    // undefined，让下游（App.tsx 的 tikhubTopics memo）继续走 videosResponse
+    // 解析路径（抖音/TikTok）。若无条件合并，uniqueTopics(undefined, undefined)
+    // 会得到 []，而 Array.isArray([]) 为真，反而短路掉 videosResponse 的解析，
+    // 导致渐进分页第二次请求合并后内容被清空。
+    const hadTopics = Array.isArray(old.topics) || Array.isArray(next.topics);
+    const mergedTopics = hadTopics ? { topics: uniqueTopics(old.topics, next.topics) } : {};
     if (next.error) {
       return {
         ...old,
-        topics: uniqueTopics(old.topics, next.topics),
+        ...mergedTopics,
         videosResponse: mergeVideosResponse(old.videosResponse, next.videosResponse),
         backgroundError: next.error,
         error: old.error || null,
@@ -206,7 +213,7 @@ export const mergeTopicBatchResults = <T extends TopicTimeItem>(
     return {
       ...old,
       ...next,
-      topics: uniqueTopics(old.topics, next.topics),
+      ...mergedTopics,
       videosResponse: mergeVideosResponse(old.videosResponse, next.videosResponse),
       error: null,
       backgroundError: next.backgroundError || null,

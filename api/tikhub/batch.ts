@@ -108,6 +108,7 @@ export default async function handler(req: any, res: any) {
           days: recentDays,
           maxPages,
           maxVideos: count,
+          expectedPageSize: 20,
           fetchPage: (cursor: unknown, page: number) => fetchJson(
             appendQuery(videosEndpoint, { ...videosParams, cursor }),
             {
@@ -182,6 +183,7 @@ export default async function handler(req: any, res: any) {
           days: recentDays,
           maxPages,
           maxVideos: count,
+          expectedPageSize: 20,
           fetchPage: (cursor: unknown, page: number) => fetchJson(
             appendQuery(videosEndpoint, {
               sec_user_id: secUserId,

@@ -131,11 +131,13 @@ export const collectRecentAwemePages = async ({
   fetchPage,
   maxPages = 20,
   maxVideos = 400,
+  expectedPageSize = 20,
   nowMs = Date.now(),
 }) => {
   const recentDays = parseRecentDays(days);
   const pageLimit = Math.max(1, Math.min(Number(maxPages) || 20, MAX_TOPIC_PAGES));
   const videoLimit = Math.max(20, Math.min(Number(maxVideos) || 400, MAX_TOPIC_VIDEOS));
+  const pageSize = Math.max(1, Number(expectedPageSize) || 20);
   const pages = [];
   const allVideos = [];
   const seenVideos = new Set();
@@ -180,6 +182,15 @@ export const collectRecentAwemePages = async ({
       break;
     }
 
+    // 方案 2：当本页返回的视频数严格小于每页请求量时，说明上游已经没有更多内容，
+    // 无需继续翻页。这避免了对作品少的账号发起无意义的第 2 页请求，
+    // 也从源头减少了上游游标不前进导致的 repeated_cursor。
+    if (pageVideos.length > 0 && pageVideos.length < pageSize) {
+      hasMore = false;
+      stopReason = "upstream_exhausted";
+      break;
+    }
+
     const nextCursor = extractNextCursor(pageResult?.data, platform);
     const upstreamHasMore = extractHasMore(pageResult?.data);
     hasMore = upstreamHasMore === undefined
@@ -193,19 +204,21 @@ export const collectRecentAwemePages = async ({
         stopReason = "duplicate_page_advanced";
         continue;
       }
-      if (hasMore) {
-        stopReason = "repeated_cursor";
-        break;
-      }
+      // 游标重复但数据已收到：上游虽暗示有更多，但无法前进，视为已取尽。
       stopReason = "upstream_exhausted";
+      hasMore = false;
       break;
     }
     if (!hasMore) {
       stopReason = "upstream_exhausted";
       break;
     }
+    // 方案 1：游标重复时不再判定为"失败"。上游已无新游标可前进，
+    // 说明该账号的可见作品已经取尽（常见于作品少的博主），数据是完整的。
+    // 旧逻辑会标记 repeated_cursor + isComplete=false，触发前端误报警告。
     if (!canAdvance) {
-      stopReason = "repeated_cursor";
+      stopReason = "upstream_exhausted";
+      hasMore = false;
       break;
     }
     cursor = nextCursor;
@@ -220,7 +233,7 @@ export const collectRecentAwemePages = async ({
   }
 
   const videos = filterRecentAwemes(allVideos, recentDays, nowMs);
-  const isComplete = !["safety_limit", "page_error", "repeated_cursor"].includes(stopReason);
+  const isComplete = !["safety_limit", "page_error"].includes(stopReason);
   return {
     videos,
     pages,
@@ -232,7 +245,7 @@ export const collectRecentAwemePages = async ({
     isComplete,
     incompleteReason: isComplete
       ? null
-      : partialError || (stopReason === "repeated_cursor" ? "上游游标重复，结果可能不完整" : "已达到安全翻页上限，结果可能不完整"),
+      : partialError || "已达到安全翻页上限，结果可能不完整",
     partialError,
   };
 };

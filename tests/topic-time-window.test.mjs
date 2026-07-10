@@ -84,6 +84,25 @@ test("merges background results without deleting first-week data on partial fail
   assert.equal(recovered[0].backgroundError, null);
 });
 
+test("keeps topics undefined for douyin/tiktok results so videosResponse stays the source of truth", () => {
+  // 抖音/TikTok 后端不返回 topics，前端依赖 videosResponse.data.aweme_list 解析。
+  // 合并时若把 topics 设成 []，下游 Array.isArray([]) 会短路掉 videosResponse 解析，
+  // 导致渐进分页第二次请求合并后内容被清空。
+  const initial = [{
+    url: "https://www.douyin.com/user/sec-a",
+    videosResponse: { data: { aweme_list: [videoAtAge("a", 1)] } },
+    error: null,
+  }];
+  const full = [{
+    url: "https://www.douyin.com/user/sec-a",
+    videosResponse: { data: { aweme_list: [videoAtAge("a", 1), videoAtAge("b", 20)] } },
+    error: null,
+  }];
+  const merged = mergeTopicBatchResults(initial, full);
+  assert.equal("topics" in merged[0], false);
+  assert.deepEqual(merged[0].videosResponse.data.aweme_list.map(v => v.aweme_id), ["a", "b"]);
+});
+
 test("stops paginated collection at the requested time boundary", async () => {
   let calls = 0;
   const pages = [
@@ -94,6 +113,7 @@ test("stops paginated collection at the requested time boundary", async () => {
   const result = await collectRecentAwemePages({
     platform: "douyin",
     days: 7,
+    expectedPageSize: 2,
     nowMs: NOW,
     fetchPage: async (_cursor, page) => {
       calls += 1;
@@ -119,12 +139,13 @@ test("ignores an old pinned video on the first page before confirming the bounda
   let calls = 0;
   const pages = [
     [videoAtAge("pinned-old", 40), videoAtAge("recent-a", 1)],
-    [videoAtAge("recent-b", 12)],
-    [videoAtAge("boundary-old", 31)],
+    [videoAtAge("recent-b", 12), videoAtAge("filler", 20)],
+    [videoAtAge("boundary-old", 31), videoAtAge("should-not-load", 35)],
   ];
   const result = await collectRecentAwemePages({
     platform: "douyin",
     days: 30,
+    expectedPageSize: 2,
     nowMs: NOW,
     fetchPage: async (_cursor, page) => {
       calls += 1;
@@ -142,7 +163,7 @@ test("ignores an old pinned video on the first page before confirming the bounda
 
   assert.equal(calls, 3);
   assert.equal(result.stopReason, "time_boundary");
-  assert.deepEqual(result.videos.map(video => video.aweme_id), ["recent-a", "recent-b"]);
+  assert.deepEqual(result.videos.map(video => video.aweme_id), ["recent-a", "recent-b", "filler"]);
 });
 
 test("continues past a duplicate-only page when the cursor advances", async () => {
@@ -150,6 +171,7 @@ test("continues past a duplicate-only page when the cursor advances", async () =
   const result = await collectRecentAwemePages({
     platform: "tiktok",
     days: 30,
+    expectedPageSize: 1,
     nowMs: NOW,
     fetchPage: async (_cursor, page) => {
       calls += 1;
@@ -168,6 +190,7 @@ test("keeps successful pages when a later page fails", async () => {
   const result = await collectRecentAwemePages({
     platform: "douyin",
     days: 30,
+    expectedPageSize: 1,
     nowMs: NOW,
     fetchPage: async (_cursor, page) => {
       if (page === 2) throw new Error("upstream timeout");
@@ -320,6 +343,7 @@ test("reports incomplete data when pagination reaches a safety cap", async () =>
     days: 90,
     maxPages: 2,
     maxVideos: 1200,
+    expectedPageSize: 1,
     nowMs: NOW,
     fetchPage: async (_cursor, page) => ({
       data: {
@@ -336,6 +360,68 @@ test("reports incomplete data when pagination reaches a safety cap", async () =>
   assert.equal(result.stopReason, "safety_limit");
   assert.equal(result.isComplete, false);
   assert.match(result.incompleteReason, /可能不完整/);
+});
+
+test("treats a repeated cursor as complete instead of a partial failure", async () => {
+  // 作品少的博主：第 1 页拿满（恰好等于 expectedPageSize），第 2 页游标重复且无新内容。
+  // 旧逻辑标记 repeated_cursor + isComplete=false，触发前端误报"获取失败"。
+  // 现在应视为正常取尽（upstream_exhausted + isComplete=true）。
+  let calls = 0;
+  const result = await collectRecentAwemePages({
+    platform: "douyin",
+    days: 30,
+    expectedPageSize: 2,
+    nowMs: NOW,
+    fetchPage: async (_cursor, page) => {
+      calls += 1;
+      return {
+        data: {
+          data: {
+            // 第 2 页返回空且游标重复，模拟上游无法前进
+            aweme_list: page === 1 ? [videoAtAge("a", 1), videoAtAge("b", 2)] : [],
+            max_cursor: 5,
+            has_more: 1,
+          },
+        },
+      };
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(result.stopReason, "upstream_exhausted");
+  assert.equal(result.isComplete, true);
+  assert.equal(result.incompleteReason, null);
+  assert.deepEqual(result.videos.map(video => video.aweme_id), ["a", "b"]);
+});
+
+test("stops early when the first page returns fewer than the expected page size", async () => {
+  // 作品少的博主（如 4 条）：第 1 页返回的视频数 < 每页请求量（expectedPageSize），
+  // 说明上游已到底，无需再请求第 2 页。
+  let calls = 0;
+  const result = await collectRecentAwemePages({
+    platform: "douyin",
+    days: 15,
+    expectedPageSize: 20,
+    nowMs: NOW,
+    fetchPage: async (_cursor, page) => {
+      calls += 1;
+      return {
+        data: {
+          data: {
+            // 只返回 3 条，小于 expectedPageSize=20
+            aweme_list: [videoAtAge("a", 1), videoAtAge("b", 5), videoAtAge("c", 10)],
+            max_cursor: 100,
+            has_more: 1,
+          },
+        },
+      };
+    },
+  });
+
+  assert.equal(calls, 1);
+  assert.equal(result.stopReason, "upstream_exhausted");
+  assert.equal(result.isComplete, true);
+  assert.deepEqual(result.videos.map(video => video.aweme_id), ["a", "b", "c"]);
 });
 
 test("distinguishes an exact final page from a truncated final page", async () => {

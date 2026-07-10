@@ -200,6 +200,7 @@ app.post("/api/tikhub/batch", async (req, res) => {
           days: recentDays,
           maxPages,
           maxVideos: count,
+          expectedPageSize: 20,
           fetchPage: (cursor, page) => fetchJson(
             appendQuery(videosEndpoint, { ...videosParams, cursor }),
             {
@@ -268,6 +269,7 @@ app.post("/api/tikhub/batch", async (req, res) => {
           days: recentDays,
           maxPages,
           maxVideos: count,
+          expectedPageSize: 20,
           fetchPage: (cursor, page) => fetchJson(
             appendQuery(videosEndpoint, {
               sec_user_id: secUserId,
