@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Checkbox } from "./components/ui/checkbox";
@@ -55,6 +55,15 @@ interface Topic {
 
 type SourcePlatform = "douyin" | "wechat_channels" | "tiktok";
 
+type TopicResumeState = {
+  cursor?: unknown;
+  pageOffset?: number;
+  secUserId?: string;
+  username?: string;
+  accountResolved?: boolean;
+  sourceUrl?: string;
+};
+
 type TikhubBatchResult = {
   url?: string;
   platform?: "douyin" | "tiktok";
@@ -67,6 +76,7 @@ type TikhubBatchResult = {
   videosResponse?: unknown;
   topics?: Topic[];
   pageCount?: number;
+  totalPageCount?: number;
   rawVideosCount?: number;
   recentDays?: number;
   hasMore?: boolean;
@@ -75,6 +85,30 @@ type TikhubBatchResult = {
   incompleteReason?: string | null;
   error?: string | null;
   backgroundError?: string | null;
+  errorStatus?: number | null;
+  resume?: TopicResumeState | null;
+};
+
+type TopicFetchTarget = string | Record<string, string>;
+type TopicFetchJob = {
+  key: string;
+  target: TopicFetchTarget;
+  resume?: TopicResumeState | null;
+  failed: boolean;
+  done: boolean;
+  errorMessage?: string;
+  warningMessage?: string;
+};
+type TopicSliceFetcher = (
+  target: TopicFetchTarget,
+  days: number,
+  resume?: TopicResumeState | null,
+) => Promise<TikhubBatchResult[]>;
+
+type PersistedTopicFetchContext = {
+  requestedDays: number;
+  platform: SourcePlatform;
+  jobs: TopicFetchJob[];
 };
 
 type WeChatAccountCandidate = {
@@ -156,6 +190,7 @@ const mockData = {
 const TASK_AUTH_TOKEN_KEY = "kk_task_token";
 const TASK_USER_ID_KEY = "kk_task_user_id";
 const WECHAT_CHANNELS_ACCOUNT_CACHE_KEY = "wechatChannelsAccountCache";
+const TOPIC_FETCH_CONTEXT_KEY = "topicFetchContext";
 
 const base64UrlToUtf8 = (input: string) => {
   const normalized = String(input || "").replace(/-/g, "+").replace(/_/g, "/");
@@ -235,16 +270,75 @@ const writeWeChatAccountCache = (cache: Record<string, WeChatAccountCandidate>) 
   localStorage.setItem(WECHAT_CHANNELS_ACCOUNT_CACHE_KEY, JSON.stringify(cache));
 };
 
+const compactStoredVideo = (video: Record<string, any>) => ({
+  aweme_id: video?.aweme_id ?? video?.awemeId ?? video?.id,
+  id: video?.id,
+  create_time: video?.create_time ?? video?.createTime,
+  desc: video?.desc,
+  share_url: video?.share_url,
+  statistics: video?.statistics,
+  author: video?.author ? { nickname: video.author.nickname } : undefined,
+  suggest_words: Array.isArray(video?.suggest_words) ? video.suggest_words.slice(0, 5) : undefined,
+});
+
+const compactStoredVideosResponse = (response: unknown) => {
+  const payload = response as Record<string, any> | undefined;
+  if (!payload) return response;
+  const data = payload.data;
+  const list = Array.isArray(data) ? data : Array.isArray(data?.aweme_list) ? data.aweme_list : [];
+  const compact = list.map(compactStoredVideo);
+  return {
+    data: Array.isArray(data) ? compact : { aweme_list: compact },
+    topicWindow: payload.topicWindow,
+  };
+};
+
 const persistTikhubResults = (results: TikhubBatchResult[]) => {
   try {
-    sessionStorage.setItem("tikhubResults", JSON.stringify(results));
+    const compact = results.map(result => ({
+      ...result,
+      secUserResponse: undefined,
+      videosResponse: compactStoredVideosResponse(result.videosResponse),
+      topics: Array.isArray(result.topics)
+        ? result.topics.map(({ rawData: _rawData, ...topic }) => topic)
+        : result.topics,
+    }));
+    sessionStorage.setItem("tikhubResults", JSON.stringify(compact));
   } catch {
-    // Three-month windows can exceed the browser storage quota; keep live state usable.
+    // 极端高频账号仍可能超过配额；当前页面内状态继续可用。
     try {
       sessionStorage.removeItem("tikhubResults");
     } catch {
       // Storage can be fully unavailable in privacy-restricted contexts.
     }
+  }
+};
+
+const persistTopicFetchContext = (
+  context: { requestedDays: number; jobs: TopicFetchJob[] },
+  platform: SourcePlatform,
+) => {
+  try {
+    const payload: PersistedTopicFetchContext = {
+      requestedDays: context.requestedDays,
+      platform,
+      jobs: context.jobs.map(job => ({ ...job })),
+    };
+    sessionStorage.setItem(TOPIC_FETCH_CONTEXT_KEY, JSON.stringify(payload));
+  } catch {
+    // 续拉上下文很小；存储不可用时仍保留当前页面内的 useRef 作业。
+  }
+};
+
+const readTopicFetchContext = (): PersistedTopicFetchContext | null => {
+  try {
+    const raw = sessionStorage.getItem(TOPIC_FETCH_CONTEXT_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PersistedTopicFetchContext;
+    if (!parsed || !Array.isArray(parsed.jobs) || !Number.isInteger(parsed.requestedDays)) return null;
+    return parsed;
+  } catch {
+    return null;
   }
 };
 
@@ -271,6 +365,77 @@ const inferDefaultPlatform = (tasks: TaskItem[]): SourcePlatform => {
     .join(" ");
   return /视频号|微信/i.test(text) ? "wechat_channels" : "douyin";
 };
+
+/**
+ * IntersectionObserver 懒渲染 hook：元素进入视口（或接近视口）时才标记为可见。
+ * 用于 topic 卡片懒渲染——只有用户滚动到附近时才挂载完整卡片内容，
+ * 避免展开含数百条的分组时一次性渲染全部 DOM。
+ */
+function useInView(rootMargin = "600px") {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [inView, setInView] = useState(false);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || inView) return;
+    if (typeof IntersectionObserver === "undefined") {
+      setInView(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some(entry => entry.isIntersecting)) {
+          setInView(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [inView, rootMargin]);
+  return { ref, inView };
+}
+
+/**
+ * 懒渲染卡片包装器：卡片进入视口附近前只渲染一个占位 div，
+ * 进入视口后才挂载 children（完整的 topic 卡片内容）。
+ * 配合 CSS contentVisibility 双重保障大列表渲染性能。
+ */
+/**
+ * 懒计算 JSON 摘要的 <details> 面板：
+ * 只在用户展开时才执行 summarizeVideosResponse + JSON.stringify，
+ * 避免每次渲染都对所有账号结果同步计算。
+ */
+function LazyVideosResponseDetails({ response }: { response: unknown }) {
+  const [open, setOpen] = useState(false);
+  const [json, setJson] = useState<string | null>(null);
+  useEffect(() => {
+    setJson(open ? JSON.stringify(summarizeVideosResponse(response), null, 2) : null);
+  }, [open, response]);
+  return (
+    <details
+      className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2"
+      onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
+    >
+      <summary className="cursor-pointer text-xs font-semibold text-slate-600">主页作品接口摘要（最多 3 条）</summary>
+      <pre className="mt-2 whitespace-pre-wrap break-all text-xs text-slate-600">
+        {json ?? ""}
+      </pre>
+    </details>
+  );
+}
+
+function LazyTopicCard({ children }: { children: ReactNode }) {
+  const { ref, inView } = useInView("600px");
+  return (
+    <div
+      ref={ref}
+      style={{ contentVisibility: "auto", containIntrinsicSize: "0 180px" }}
+    >
+      {inView ? children : <div className="h-[140px] rounded-lg border border-slate-100 bg-slate-50/50" />}
+    </div>
+  );
+}
 
 export default function App() {
   const navigate = useNavigate();
@@ -332,7 +497,8 @@ export default function App() {
   const topicFetchGeneration = useRef(0);
   const lastTopicFetchRef = useRef<{
     requestedDays: number;
-    fetchRange: (days: number) => Promise<TikhubBatchResult[]>;
+    jobs: TopicFetchJob[];
+    fetchSlice: TopicSliceFetcher;
   } | null>(null);
   const [wechatSearchResults, setWechatSearchResults] = useState<WeChatAccountSearchResult[]>(() => {
     try {
@@ -440,6 +606,21 @@ export default function App() {
     [tikhubTopics, topicDays],
   );
 
+  // 排序 memo 化：只在 sortKey 或 topicGroups 变化时重排，
+  // 避免每次勾选/取消 topic 时对所有分组全量重排。
+  const sortedTopicGroups = useMemo(
+    () => topicGroups.map(group => ({
+      ...group,
+      topics: group.topics.length > 1
+        ? [...group.topics].sort((a, b) => b.stats[sortKey] - a.stats[sortKey])
+        : group.topics,
+    })),
+    [topicGroups, sortKey],
+  );
+
+  // Set 查找优化：O(1) 替代 O(n) 的 includes
+  const selectedTopicIdSet = useMemo(() => new Set(selectedTopics), [selectedTopics]);
+
   useEffect(() => {
     if (tasks.length > 0) return;
 
@@ -507,28 +688,39 @@ export default function App() {
     persistTikhubResults(results);
   };
 
-  const requestTikhubRange = async (urls: string[], days: number, platform: SourcePlatform) => {
+  const requestTikhubSlice = async (
+    target: TopicFetchTarget,
+    days: number,
+    resume?: TopicResumeState | null,
+  ) => {
+    const url = String(target || "").trim();
+    if (!url) throw new Error("账号链接为空");
     const limits = topicRequestLimits(days);
     const response = await fetchWithRetry(apiUrl("/api/tikhub/batch"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ urls, platform, days, ...limits }),
+      body: JSON.stringify({ urls: [url], platform: sourcePlatform, days, resume, ...limits }),
     });
     const data = await parseApiJson(response);
     if (!response.ok) throw new Error(data?.error || "请求失败");
     const results = Array.isArray(data?.results) ? data.results as TikhubBatchResult[] : [];
-    if (results.length !== urls.length) throw new Error("接口返回的账号结果不完整，请重试");
+    if (results.length !== 1) throw new Error("接口返回的账号结果不完整，请重试");
     return results;
   };
 
-  const requestWechatRange = async (accounts: Array<Record<string, string>>, days: number) => {
+  const requestWechatSlice = async (
+    target: TopicFetchTarget,
+    days: number,
+    resume?: TopicResumeState | null,
+  ) => {
+    if (typeof target === "string") throw new Error("视频号账号信息无效");
     const limits = topicRequestLimits(days);
     const response = await fetchWithRetry(apiUrl("/api/platform/topics/batch"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         platform: "wechat_channels",
-        accounts,
+        accounts: [{ ...target, resume }],
         days,
         ...limits,
       }),
@@ -536,79 +728,152 @@ export default function App() {
     const data = await parseApiJson(response);
     if (!response.ok) throw new Error(data?.error || "获取视频号作品失败");
     const results = Array.isArray(data?.results) ? data.results as TikhubBatchResult[] : [];
-    if (results.length !== accounts.length) throw new Error("视频号接口返回的账号结果不完整，请重试");
+    if (results.length !== 1) throw new Error("视频号接口返回的账号结果不完整，请重试");
     return results;
+  };
+
+  useEffect(() => {
+    const saved = readTopicFetchContext();
+    if (!saved || saved.platform !== sourcePlatform) return;
+    try {
+      parseTopicDays(saved.requestedDays);
+    } catch {
+      sessionStorage.removeItem(TOPIC_FETCH_CONTEXT_KEY);
+      return;
+    }
+    const jobs = saved.jobs.map(job => job.done
+      ? { ...job }
+      : {
+          ...job,
+          failed: true,
+          errorMessage: job.errorMessage || "页面刷新后任务已暂停，可从保存游标继续",
+        });
+    const fetchSlice = sourcePlatform === "wechat_channels" ? requestWechatSlice : requestTikhubSlice;
+    lastTopicFetchRef.current = { requestedDays: saved.requestedDays, jobs, fetchSlice };
+    const failedCount = jobs.filter(job => job.failed).length;
+    const warningCount = jobs.filter(job => job.warningMessage).length;
+    if (failedCount > 0) {
+      setOlderTopicsError(`${failedCount} 个账号任务已暂停，可从保存游标继续`);
+    } else if (warningCount > 0) {
+      setOlderTopicsError(`${warningCount} 个账号已达到安全上限，结果可能不完整`);
+    }
+  }, [sourcePlatform]);
+
+  const mergeTopicSlice = (sliceResults: TikhubBatchResult[]) => {
+    setTikhubResults((previous) => {
+      const next = mergeTopicBatchResults<Topic>(previous, sliceResults) as TikhubBatchResult[];
+      persistTikhubResults(next);
+      return next;
+    });
+  };
+
+  const runTopicJobs = async (
+    generation: number,
+    context: NonNullable<typeof lastTopicFetchRef.current>,
+  ) => {
+    while (generation === topicFetchGeneration.current) {
+      const runnable = context.jobs.filter(job => !job.done && !job.failed);
+      if (runnable.length === 0) break;
+
+      for (const job of runnable) {
+        if (generation !== topicFetchGeneration.current) return;
+        try {
+          const sliceResults = await context.fetchSlice(job.target, context.requestedDays, job.resume);
+          if (generation !== topicFetchGeneration.current) return;
+          mergeTopicSlice(sliceResults);
+          const result = sliceResults[0];
+          if (!result) throw new Error("接口未返回账号结果");
+
+          job.resume = result.resume || null;
+          if (result.error || result.stopReason === "page_error") {
+            job.failed = true;
+            job.errorMessage = result.error || result.backgroundError || "账号获取暂停";
+          } else if (result.stopReason === "slice_limit" && result.resume) {
+            // 正常切片结束：保留作业，下一轮从返回游标继续。
+          } else if (result.stopReason === "safety_limit" || result.isComplete === false) {
+            job.done = true;
+            job.warningMessage = result.incompleteReason || "已达到安全翻页上限，结果可能不完整";
+          } else {
+            job.done = true;
+          }
+        } catch (error) {
+          job.failed = true;
+          job.errorMessage = error instanceof Error ? error.message : "账号获取暂停";
+        }
+        persistTopicFetchContext(context, sourcePlatform);
+        await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+      }
+    }
+
+    if (generation !== topicFetchGeneration.current) return;
+    const failedJobs = context.jobs.filter(job => job.failed);
+    const warningJobs = context.jobs.filter(job => job.warningMessage);
+    const paymentRequired = failedJobs.some(job => /HTTP 402|Payment Required/i.test(job.errorMessage || ""));
+    setOlderTopicsError(failedJobs.length > 0
+      ? paymentRequired
+        ? `${failedJobs.length} 个账号因 TikHub 余额不足暂停；充值后可从失败页继续`
+        : `${failedJobs.length} 个账号获取暂停，可从失败页重试`
+      : warningJobs.length > 0
+        ? `${warningJobs.length} 个账号已达到安全上限，结果可能不完整`
+        : null);
+    if (failedJobs.length === 0 && warningJobs.length === 0) {
+      sessionStorage.removeItem(TOPIC_FETCH_CONTEXT_KEY);
+    } else {
+      persistTopicFetchContext(context, sourcePlatform);
+    }
   };
 
   const startProgressiveTopicFetch = async (
     requestedDays: number,
-    fetchRange: (days: number) => Promise<TikhubBatchResult[]>,
+    targets: TopicFetchTarget[],
+    fetchSlice: TopicSliceFetcher,
   ) => {
     const generation = ++topicFetchGeneration.current;
-    lastTopicFetchRef.current = { requestedDays, fetchRange };
+    const jobs = targets.map((target, index) => ({
+      key: typeof target === "string" ? target : String(target.finderUsername || target.inputName || index),
+      target,
+      resume: null,
+      failed: false,
+      done: false,
+    }));
+    const context = { requestedDays, jobs, fetchSlice };
+    lastTopicFetchRef.current = context;
+    persistTopicFetchContext(context, sourcePlatform);
     setExpandedTopicGroups([0]);
-    setOlderTopicsLoading(false);
+    setOlderTopicsLoading(true);
     setOlderTopicsError(null);
-
-    const firstResults = await fetchRange(Math.min(DEFAULT_TOPIC_DAYS, requestedDays));
-    if (generation !== topicFetchGeneration.current) return;
     setTopicDays(requestedDays);
     setTopicDaysInput(String(requestedDays));
     setTopicDaysError(null);
     sessionStorage.setItem("topicWindowDays", String(requestedDays));
-    storeTikhubResults(firstResults);
+    storeTikhubResults([]);
     setSelectedTopics([]);
     sessionStorage.removeItem("selectedTopicIds");
-
-    if (requestedDays <= DEFAULT_TOPIC_DAYS) return;
-    setOlderTopicsLoading(true);
-    void fetchRange(requestedDays)
-      .then((fullResults) => {
-        if (generation !== topicFetchGeneration.current) return;
-        setTikhubResults((previous) => {
-          const next = mergeTopicBatchResults<Topic>(previous, fullResults) as TikhubBatchResult[];
-          persistTikhubResults(next);
-          return next;
-        });
-        const failures = fullResults.filter(item => item.error || item.isComplete === false);
-        setOlderTopicsError(failures.length > 0 ? `${failures.length} 个账号的旧作品获取失败，可重试` : null);
-      })
-      .catch((error) => {
-        if (generation !== topicFetchGeneration.current) return;
-        setOlderTopicsError(error instanceof Error ? error.message : "旧作品获取失败");
-      })
-      .finally(() => {
-        if (generation === topicFetchGeneration.current) setOlderTopicsLoading(false);
-      });
+    await runTopicJobs(generation, context);
+    if (generation === topicFetchGeneration.current) setOlderTopicsLoading(false);
   };
 
   const retryOlderTopics = async () => {
-    if (topicDays <= DEFAULT_TOPIC_DAYS || olderTopicsLoading) return;
+    if (olderTopicsLoading) return;
     const context = lastTopicFetchRef.current;
     if (!context) {
       setOlderTopicsError("缺少上一次获取上下文，请重新开始获取");
       return;
     }
+    const failedJobs = context.jobs.filter(job => job.failed);
+    if (failedJobs.length === 0) {
+      setOlderTopicsError(null);
+      return;
+    }
     const generation = topicFetchGeneration.current;
     setOlderTopicsLoading(true);
-    setOlderTopicsError(null);
-    try {
-      const results = await context.fetchRange(context.requestedDays);
-      if (generation !== topicFetchGeneration.current) return;
-      setTikhubResults((previous) => {
-        const next = mergeTopicBatchResults<Topic>(previous, results) as TikhubBatchResult[];
-        persistTikhubResults(next);
-        return next;
-      });
-      const failures = results.filter(item => item.error || item.isComplete === false);
-      setOlderTopicsError(failures.length > 0 ? `${failures.length} 个账号的旧作品获取失败，可重试` : null);
-    } catch (error) {
-      if (generation === topicFetchGeneration.current) {
-        setOlderTopicsError(error instanceof Error ? error.message : "旧作品获取失败");
-      }
-    } finally {
-      if (generation === topicFetchGeneration.current) setOlderTopicsLoading(false);
-    }
+    failedJobs.forEach(job => {
+      job.failed = false;
+      job.done = false;
+      job.errorMessage = undefined;
+    });
+    await runTopicJobs(generation, context);
+    if (generation === topicFetchGeneration.current) setOlderTopicsLoading(false);
   };
 
   const runTikhubFetch = async () => {
@@ -673,7 +938,8 @@ export default function App() {
 
       await startProgressiveTopicFetch(
         requestedDays,
-        days => requestTikhubRange(rawItems, days, sourcePlatform),
+        rawItems,
+        requestTikhubSlice,
       );
       sessionStorage.setItem("tikhubInput", tikhubInput);
     } catch (error) {
@@ -741,7 +1007,8 @@ export default function App() {
     try {
       await startProgressiveTopicFetch(
         requestedDays,
-        days => requestWechatRange(accounts, days),
+        accounts,
+        requestWechatSlice,
       );
       sessionStorage.setItem("tikhubInput", tikhubInput);
       sessionStorage.setItem("sourcePlatform", "wechat_channels");
@@ -804,6 +1071,7 @@ export default function App() {
   };
 
   const taskCount = tasks.length;
+  const hasRetryableTopicJobs = Boolean(lastTopicFetchRef.current?.jobs.some(job => job.failed));
   const activeTask = useMemo(() => tasks[taskIndex], [tasks, taskIndex]);
 
   useEffect(() => {
@@ -1092,7 +1360,7 @@ export default function App() {
                   <div>
                     <div className="text-xs font-semibold text-slate-600">发布时间范围</div>
                     <div className="mt-2 flex flex-wrap gap-2">
-                      {[7, 15, 30, 90].map(days => (
+                      {[7, 15, 30, 90, 180, 365, 730].map(days => (
                         <button
                           key={days}
                           type="button"
@@ -1288,12 +1556,7 @@ export default function App() {
                               </details>
                             )}
                             {item.videosResponse && (
-                              <details className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-                                <summary className="cursor-pointer text-xs font-semibold text-slate-600">主页作品接口摘要（最多 3 条）</summary>
-                                <pre className="mt-2 whitespace-pre-wrap break-all text-xs text-slate-600">
-                                  {JSON.stringify(summarizeVideosResponse(item.videosResponse), null, 2)}
-                                </pre>
-                              </details>
+                              <LazyVideosResponseDetails response={item.videosResponse} />
                             )}
                           </div>
                         )}
@@ -1345,7 +1608,7 @@ export default function App() {
                 </div>
               </CardHeader>
               <CardContent className="space-y-3">
-                {topicGroups.map(group => {
+                {sortedTopicGroups.map(group => {
                   const expanded = group.index === 0 || expandedTopicGroups.includes(group.index);
                   const isOlderGroup = group.index > 0;
                   return (
@@ -1371,120 +1634,122 @@ export default function App() {
                     </button>
                     {expanded && (
                     <div className="space-y-3 border-t border-slate-100 p-3">
-                      {isOlderGroup && olderTopicsLoading && group.topics.length === 0 && (
+                      {olderTopicsLoading && group.topics.length === 0 && (
                         <div className="flex items-center justify-center gap-2 py-6 text-sm text-slate-500">
                           <LoaderCircle className="h-5 w-5 animate-spin text-indigo-500" />
                           正在获取这一时间段的作品…
                         </div>
                       )}
-                      {isOlderGroup && olderTopicsError && (
+                      {group.index === 0 && olderTopicsError && (
                         <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700">
                           <span>{olderTopicsError}</span>
-                          <Button type="button" size="sm" variant="outline" onClick={retryOlderTopics} disabled={olderTopicsLoading}>
-                            重试
-                          </Button>
+                          {hasRetryableTopicJobs && (
+                            <Button type="button" size="sm" variant="outline" onClick={retryOlderTopics} disabled={olderTopicsLoading}>
+                              重试
+                            </Button>
+                          )}
                         </div>
                       )}
-                      {group.topics
-                        .slice()
-                        .sort((a, b) => b.stats[sortKey] - a.stats[sortKey])
-                        .map(topic => (
-                  <div
-                    key={topic.id}
-                    style={{ contentVisibility: "auto", containIntrinsicSize: "0 180px" }}
-                    className={`rounded-lg border transition-all ${
-                      selectedTopics.includes(topic.id)
-                        ? "bg-indigo-50 border-indigo-300"
-                        : "bg-slate-50 border-slate-200 hover:border-slate-300"
-                    }`}
-                  >
-                    <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-start sm:gap-4">
-                      <div className="flex items-start gap-3">
-                        <Checkbox
-                          id={topic.id}
-                          checked={selectedTopics.includes(topic.id)}
-                          onCheckedChange={() => handleTopicToggle(topic.id)}
-                          className="mt-1"
-                        />
-                        <label htmlFor={topic.id} className="cursor-pointer">
-                          <div className="text-base font-medium text-slate-900 mb-2">
-                            {topic.title}
-                          </div>
-                          <div className="flex flex-wrap gap-2 mb-3">
-                            <Badge variant="secondary" className="bg-white text-slate-600 border-slate-200 text-xs">
-                              {topic.platform === "wechat_channels" ? "视频号" : topic.platform === "tiktok" ? "TikTok" : "抖音"}
-                            </Badge>
-                            <Badge variant="secondary" className="bg-white text-slate-600 border-slate-200 text-xs">
-                              作者：{topic.authorName || "未知"}
-                            </Badge>
-                            <Badge variant="secondary" className="bg-white text-slate-600 border-slate-200 text-xs">
-                              发布：{topic.publishDate || "未知"}
-                            </Badge>
-                            <Badge variant="secondary" className="bg-white text-slate-600 border-slate-200 text-xs">
-                              大家都在搜：{topic.hotTopics && topic.hotTopics.length > 0 ? topic.hotTopics.join(" / ") : "暂无推荐热词"}
-                            </Badge>
-                            {topic.tags.length > 0 && topic.tags.map(tag => (
-                              <Badge
-                                key={tag}
-                                variant="secondary"
-                                className="bg-white text-slate-600 border-slate-200 text-xs"
-                              >
-                                {tag}
-                              </Badge>
-                            ))}
-                          </div>
-                        </label>
-                      </div>
-                      <div className="flex flex-1 flex-col gap-2 sm:items-end sm:text-right">
-                        <div className="flex flex-wrap items-center gap-4 text-xs text-slate-600">
-                          <div className="flex items-center gap-1">
-                            <MessageCircle className="w-3.5 h-3.5" />
-                            <span>{formatNumber(topic.stats.comments)}</span>
-                          </div>
-                          <div className="flex items-center gap-1">
-                            <ThumbsUp className="w-3.5 h-3.5" />
-                            <span>{formatNumber(topic.stats.likes)}</span>
-                          </div>
-                          <div className="flex items-center gap-1">
-                            <Share2 className="w-3.5 h-3.5" />
-                            <span>{formatNumber(topic.stats.shares)}</span>
-                          </div>
-                          <div className="flex items-center gap-1">
-                            <Bookmark className="w-3.5 h-3.5" />
-                            <span>{formatNumber(topic.stats.bookmarks)}</span>
-                          </div>
-                        </div>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="text-indigo-600 hover:text-indigo-700 hover:bg-indigo-50 px-3 h-8 sm:-mr-2"
-                          disabled={topicLinkLoadingId === topic.id || (!topic.link && topic.platform !== "wechat_channels")}
-                          onClick={() => {
-                            if (topic.link) {
-                              window.open(topic.link, "_blank");
-                              return;
-                            }
-                            if (topic.platform === "wechat_channels") {
-                              generateWechatShareLink(topic);
-                            }
-                          }}
-                        >
-                          {topicLinkLoadingId === topic.id
-                            ? "生成中..."
-                            : topic.link
-                              ? "查看链接"
-                              : topic.platform === "wechat_channels"
-                                ? "生成链接"
-                                : "暂无链接"}
-                          <ExternalLink className="ml-1 w-3.5 h-3.5" />
-                        </Button>
-                      </div>
-                    </div>
-                  </div>
-                      ))}
                       {group.topics.length === 0 && !olderTopicsLoading && !olderTopicsError && (
                         <div className="py-5 text-center text-sm text-slate-400">这一时间段暂无作品</div>
                       )}
+                      {group.topics.map(topic => {
+                        const isSelected = selectedTopicIdSet.has(topic.id);
+                        return (
+                        <LazyTopicCard key={topic.id}>
+                          <div
+                            className={`rounded-lg border transition-all ${
+                              isSelected
+                                ? "bg-indigo-50 border-indigo-300"
+                                : "bg-slate-50 border-slate-200 hover:border-slate-300"
+                            }`}
+                          >
+                            <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-start sm:gap-4">
+                              <div className="flex items-start gap-3">
+                                <Checkbox
+                                  id={topic.id}
+                                  checked={isSelected}
+                                  onCheckedChange={() => handleTopicToggle(topic.id)}
+                                  className="mt-1"
+                                />
+                                <label htmlFor={topic.id} className="cursor-pointer">
+                                  <div className="text-base font-medium text-slate-900 mb-2">
+                                    {topic.title}
+                                  </div>
+                                  <div className="flex flex-wrap gap-2 mb-3">
+                                    <Badge variant="secondary" className="bg-white text-slate-600 border-slate-200 text-xs">
+                                      {topic.platform === "wechat_channels" ? "视频号" : topic.platform === "tiktok" ? "TikTok" : "抖音"}
+                                    </Badge>
+                                    <Badge variant="secondary" className="bg-white text-slate-600 border-slate-200 text-xs">
+                                      作者：{topic.authorName || "未知"}
+                                    </Badge>
+                                    <Badge variant="secondary" className="bg-white text-slate-600 border-slate-200 text-xs">
+                                      发布：{topic.publishDate || "未知"}
+                                    </Badge>
+                                    <Badge variant="secondary" className="bg-white text-slate-600 border-slate-200 text-xs">
+                                      大家都在搜：{topic.hotTopics && topic.hotTopics.length > 0 ? topic.hotTopics.join(" / ") : "暂无推荐热词"}
+                                    </Badge>
+                                    {topic.tags.length > 0 && topic.tags.map(tag => (
+                                      <Badge
+                                        key={tag}
+                                        variant="secondary"
+                                        className="bg-white text-slate-600 border-slate-200 text-xs"
+                                      >
+                                        {tag}
+                                      </Badge>
+                                    ))}
+                                  </div>
+                                </label>
+                              </div>
+                              <div className="flex flex-1 flex-col gap-2 sm:items-end sm:text-right">
+                                <div className="flex flex-wrap items-center gap-4 text-xs text-slate-600">
+                                  <div className="flex items-center gap-1">
+                                    <MessageCircle className="w-3.5 h-3.5" />
+                                    <span>{formatNumber(topic.stats.comments)}</span>
+                                  </div>
+                                  <div className="flex items-center gap-1">
+                                    <ThumbsUp className="w-3.5 h-3.5" />
+                                    <span>{formatNumber(topic.stats.likes)}</span>
+                                  </div>
+                                  <div className="flex items-center gap-1">
+                                    <Share2 className="w-3.5 h-3.5" />
+                                    <span>{formatNumber(topic.stats.shares)}</span>
+                                  </div>
+                                  <div className="flex items-center gap-1">
+                                    <Bookmark className="w-3.5 h-3.5" />
+                                    <span>{formatNumber(topic.stats.bookmarks)}</span>
+                                  </div>
+                                </div>
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="text-indigo-600 hover:text-indigo-700 hover:bg-indigo-50 px-3 h-8 sm:-mr-2"
+                                  disabled={topicLinkLoadingId === topic.id || (!topic.link && topic.platform !== "wechat_channels")}
+                                  onClick={() => {
+                                    if (topic.link) {
+                                      window.open(topic.link, "_blank");
+                                      return;
+                                    }
+                                    if (topic.platform === "wechat_channels") {
+                                      generateWechatShareLink(topic);
+                                    }
+                                  }}
+                                >
+                                  {topicLinkLoadingId === topic.id
+                                    ? "生成中..."
+                                    : topic.link
+                                      ? "查看链接"
+                                      : topic.platform === "wechat_channels"
+                                        ? "生成链接"
+                                        : "暂无链接"}
+                                  <ExternalLink className="ml-1 w-3.5 h-3.5" />
+                                </Button>
+                              </div>
+                            </div>
+                          </div>
+                        </LazyTopicCard>
+                        );
+                      })}
                     </div>
                     )}
                   </section>

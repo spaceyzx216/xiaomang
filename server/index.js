@@ -12,6 +12,8 @@ import { platformRouter } from "../api/_lib/routers/platform.js";
 import {
   buildCombinedVideosResponse,
   collectRecentAwemePages,
+  MAX_RECENT_DAYS,
+  MAX_TOPIC_SLICE_PAGES,
   parseRecentDays,
 } from "../api/_lib/topicPagination.js";
 import {
@@ -102,14 +104,14 @@ const writeFinalDrafts = async (payload) => {
 
 app.post("/api/tikhub/batch", async (req, res) => {
   const logger = createRequestLogger("api.tikhub.batch", req.headers["x-request-id"]);
-  const { urls, platform, days = 7, maxPages = 20, count = 400 } = req.body || {};
+  const { urls, platform, days = 7, maxPages = 20, count = 400, resume = null } = req.body || {};
   const normalizedPlatform = String(platform || "douyin").toLowerCase() === "tiktok" ? "tiktok" : "douyin";
   let recentDays;
   try {
     recentDays = parseRecentDays(days);
   } catch {
     return res.status(400).json({
-      error: "days must be an integer between 1 and 90",
+      error: `days must be an integer between 1 and ${MAX_RECENT_DAYS}`,
       code: "TOPIC_DAYS_INVALID",
     });
   }
@@ -123,6 +125,9 @@ app.post("/api/tikhub/batch", async (req, res) => {
     logger.warn("route.validation.error", { error: "urls must be a non-empty array" });
     return res.status(400).json({ error: "urls must be a non-empty array" });
   }
+  if (urls.length !== 1) {
+    return res.status(400).json({ error: "每次续拉请求只能包含一个账号", code: "TOPIC_SINGLE_ACCOUNT_REQUIRED" });
+  }
 
   if (!apiToken) {
     logger.error("route.config.error", { error: "Missing TIKHUB_API_TOKEN" });
@@ -132,7 +137,7 @@ app.post("/api/tikhub/batch", async (req, res) => {
   }
 
   const fetchOpts = {
-    timeoutMs: startupAgentConfig.requestTimeoutMs,
+    timeoutMs: Math.min(startupAgentConfig.requestTimeoutMs, 25_000),
     retries: Number.isFinite(apiRetryAttempts) ? apiRetryAttempts : 2,
     retryBaseDelayMs: Number.isFinite(apiRetryBaseDelayMs) ? apiRetryBaseDelayMs : 500,
     logger,
@@ -150,17 +155,32 @@ app.post("/api/tikhub/batch", async (req, res) => {
 
     const sanitizedUrl = sanitizeUrl(url);
     logger.info("tikhub.item.start", { url: safeLink(sanitizedUrl), platform: normalizedPlatform });
+    if (resume?.sourceUrl && sanitizeUrl(String(resume.sourceUrl)) !== sanitizedUrl) {
+      results.push({ url, platform: normalizedPlatform, error: "续拉状态与当前账号不匹配", errorStatus: 400 });
+      continue;
+    }
+
+    let secUserId = String(resume?.secUserId || "").trim();
+    let secUserResponse = null;
+    let resolvedUsername = String(resume?.username || "").trim();
+    let retryResume = {
+      cursor: resume?.cursor ?? 0,
+      pageOffset: resume?.pageOffset ?? 0,
+      ...(secUserId ? { secUserId } : {}),
+      ...(resolvedUsername ? { username: resolvedUsername } : {}),
+      sourceUrl: sanitizedUrl,
+    };
+    const slicePageBudget = secUserId ? MAX_TOPIC_SLICE_PAGES : 2;
 
     try {
-      let secUserId = "";
-      let secUserResponse = null;
 
       if (normalizedPlatform === "tiktok") {
         // TikTok：主页链接形如 https://www.tiktok.com/@username，提取 username 后查 sec_user_id。
-        const username = (() => {
+        const username = resolvedUsername || (() => {
           const m = sanitizedUrl.match(/tiktok\.com\/@?([A-Za-z0-9_.]+)/i);
           return m ? m[1] : "";
         })();
+        resolvedUsername = username;
         if (!username) {
           results.push({
             url,
@@ -169,7 +189,7 @@ app.post("/api/tikhub/batch", async (req, res) => {
           });
           continue;
         }
-        if (username) {
+        if (username && !secUserId && resume?.accountResolved !== true) {
           // TikHub TikTok 端点：用 username 换 sec_user_id（失败则 fallback 用 unique_id 直查作品）
           const secEndpoint = `${baseUrl}/api/v1/tiktok/app/v3/get_user_id_and_sec_user_id_by_username`;
           try {
@@ -180,12 +200,14 @@ app.post("/api/tikhub/batch", async (req, res) => {
             secUserResponse = secUserData;
             secUserId = secUserData?.data?.sec_user_id || secUserData?.sec_user_id || "";
           } catch (secError) {
+            if (Number(secError?.status) === 402) throw secError;
             logger.warn("tikhub.tiktok.sec_user_id.fallback", {
               username,
               error: secError instanceof Error ? secError.message : "sec_user_id resolve failed",
             });
           }
         }
+        retryResume = { ...retryResume, secUserId, username, accountResolved: true };
         const videosEndpoint = `${baseUrl}/api/v1/tiktok/app/v3/fetch_user_post_videos`;
         const videosParams = { count: 20 };
         if (secUserId) {
@@ -199,6 +221,9 @@ app.post("/api/tikhub/batch", async (req, res) => {
           platform: normalizedPlatform,
           days: recentDays,
           maxPages,
+          slicePages: slicePageBudget,
+          startCursor: resume?.cursor ?? 0,
+          pageOffset: resume?.pageOffset ?? 0,
           maxVideos: count,
           expectedPageSize: 20,
           fetchPage: (cursor, page) => fetchJson(
@@ -211,7 +236,8 @@ app.post("/api/tikhub/batch", async (req, res) => {
           ),
         });
         const videosList = collection.videos;
-        const videosResponse = buildCombinedVideosResponse(collection.pages, videosList, collection);
+        const nextResume = collection.resume ? { ...collection.resume, secUserId, username, accountResolved: true, sourceUrl: sanitizedUrl } : null;
+        const videosResponse = buildCombinedVideosResponse(collection.pages, videosList, { ...collection, resume: nextResume });
         const authorName = videosList?.[0]?.author?.nickname;
 
         results.push({
@@ -223,6 +249,7 @@ app.post("/api/tikhub/batch", async (req, res) => {
           secUserResponse,
           videosResponse,
           pageCount: collection.pageCount,
+          totalPageCount: collection.totalPageCount,
           rawVideosCount: collection.rawVideosCount,
           recentDays: collection.recentDays,
           hasMore: collection.hasMore,
@@ -230,6 +257,8 @@ app.post("/api/tikhub/batch", async (req, res) => {
           isComplete: collection.isComplete,
           incompleteReason: collection.incompleteReason,
           backgroundError: collection.partialError,
+          errorStatus: collection.partialErrorStatus,
+          resume: nextResume,
           error: null,
         });
         logger.info("tikhub.item.end", {
@@ -240,34 +269,40 @@ app.post("/api/tikhub/batch", async (req, res) => {
         });
       } else {
         // 抖音：主页链接 → sec_user_id → fetch_user_post_videos
-        const secEndpoint = `${baseUrl}/api/v1/douyin/web/get_sec_user_id`;
-        const { response: secResp, data: secUserData } = await fetchJson(
-          appendQuery(secEndpoint, { url: sanitizedUrl }),
-          { ...fetchOpts, interfaceName: "tikhub:get_sec_user_id" },
-        );
-        secUserResponse = secUserData;
-        secUserId = secUserData?.data || secUserData?.sec_user_id;
+        if (!secUserId) {
+          const secEndpoint = `${baseUrl}/api/v1/douyin/web/get_sec_user_id`;
+          const { response: secResp, data: secUserData } = await fetchJson(
+            appendQuery(secEndpoint, { url: sanitizedUrl }),
+            { ...fetchOpts, interfaceName: "tikhub:get_sec_user_id" },
+          );
+          secUserResponse = secUserData;
+          secUserId = secUserData?.data || secUserData?.sec_user_id;
 
-        if (!secResp.ok || !secUserId) {
-          logger.warn("tikhub.item.failed", {
-            step: "get_sec_user_id",
-            status: secResp.status,
-            error: secUserData?.message || "Failed to resolve sec_user_id",
-          });
-          results.push({
-            url,
-            platform: normalizedPlatform,
-            secUserResponse,
-            error: secUserData?.message || "Failed to resolve sec_user_id",
-          });
-          continue;
+          if (!secResp.ok || !secUserId) {
+            logger.warn("tikhub.item.failed", {
+              step: "get_sec_user_id",
+              status: secResp.status,
+              error: secUserData?.message || "Failed to resolve sec_user_id",
+            });
+            results.push({
+              url,
+              platform: normalizedPlatform,
+              secUserResponse,
+              error: secUserData?.message || "Failed to resolve sec_user_id",
+            });
+            continue;
+          }
         }
+        retryResume = { ...retryResume, secUserId };
 
         const videosEndpoint = `${baseUrl}/api/v1/douyin/app/v3/fetch_user_post_videos`;
         const collection = await collectRecentAwemePages({
           platform: normalizedPlatform,
           days: recentDays,
           maxPages,
+          slicePages: slicePageBudget,
+          startCursor: resume?.cursor ?? 0,
+          pageOffset: resume?.pageOffset ?? 0,
           maxVideos: count,
           expectedPageSize: 20,
           fetchPage: (cursor, page) => fetchJson(
@@ -285,7 +320,8 @@ app.post("/api/tikhub/batch", async (req, res) => {
           ),
         });
         const videosList = collection.videos;
-        const videosResponse = buildCombinedVideosResponse(collection.pages, videosList, collection);
+        const nextResume = collection.resume ? { ...collection.resume, secUserId, sourceUrl: sanitizedUrl } : null;
+        const videosResponse = buildCombinedVideosResponse(collection.pages, videosList, { ...collection, resume: nextResume });
         const authorName = videosList?.[0]?.author?.nickname;
 
         results.push({
@@ -297,6 +333,7 @@ app.post("/api/tikhub/batch", async (req, res) => {
           secUserResponse,
           videosResponse,
           pageCount: collection.pageCount,
+          totalPageCount: collection.totalPageCount,
           rawVideosCount: collection.rawVideosCount,
           recentDays: collection.recentDays,
           hasMore: collection.hasMore,
@@ -304,6 +341,8 @@ app.post("/api/tikhub/batch", async (req, res) => {
           isComplete: collection.isComplete,
           incompleteReason: collection.incompleteReason,
           backgroundError: collection.partialError,
+          errorStatus: collection.partialErrorStatus,
+          resume: nextResume,
           error: null,
         });
         logger.info("tikhub.item.end", {
@@ -321,6 +360,8 @@ app.post("/api/tikhub/batch", async (req, res) => {
       results.push({
         url,
         platform: normalizedPlatform,
+        errorStatus: Number(error?.status) || null,
+        resume: retryResume,
         error: error instanceof Error ? error.message : "Request failed",
       });
     }

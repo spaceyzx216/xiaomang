@@ -1,7 +1,8 @@
 const DAY_MS = 24 * 60 * 60 * 1000;
-export const MAX_RECENT_DAYS = 90;
-export const MAX_TOPIC_PAGES = 60;
-export const MAX_TOPIC_VIDEOS = 1200;
+export const MAX_RECENT_DAYS = 730;
+export const MAX_TOPIC_PAGES = 100;
+export const MAX_TOPIC_VIDEOS = 2000;
+export const MAX_TOPIC_SLICE_PAGES = 3;
 
 export const parseRecentDays = (value = 7) => {
   if (typeof value !== "number" && typeof value !== "string") {
@@ -74,20 +75,45 @@ const extractHasMore = (payload) => {
   return value === true || value === 1 || value === "1" || value === "true";
 };
 
+/**
+ * 解析可选的 daysFrom 参数（时间区间下界，距今天数，含）。
+ * 返回毫秒时间戳下界；若未指定则返回 -Infinity（无下界限制）。
+ */
+const parseOptionalDaysFrom = (daysFrom) => {
+  if (daysFrom === undefined || daysFrom === null || daysFrom === "") return -Infinity;
+  const text = String(daysFrom).trim();
+  if (!/^\d+$/.test(text)) {
+    throw new RangeError(`daysFrom must be a positive integer`);
+  }
+  const value = Number(text);
+  if (!Number.isInteger(value) || value < 1) {
+    throw new RangeError(`daysFrom must be a positive integer`);
+  }
+  return value;
+};
+
 export const reachedRecentTimeBoundary = (videos, days, nowMs = Date.now()) => {
   const cutoffMs = nowMs - parseRecentDays(days) * DAY_MS;
   return (Array.isArray(videos) ? videos : []).some((video) => {
     const timestamp = awemeTimestampMs(video);
-    return timestamp > 0 && timestamp <= cutoffMs;
+    if (timestamp <= 0) return false;
+    return timestamp < cutoffMs;
   });
 };
 
-export const filterRecentAwemes = (videos, days, nowMs = Date.now()) => {
+export const filterRecentAwemes = (videos, days, nowMs = Date.now(), daysFrom) => {
   const cutoffMs = nowMs - parseRecentDays(days) * DAY_MS;
+  const fromMs = parseOptionalDaysFrom(daysFrom);
+  // daysFrom 下界：排除比 daysFrom-1 天更新的视频（只保留 daysFrom 天及更早的）
+  const upperExcludeMs = fromMs === -Infinity ? Infinity : nowMs - (fromMs - 1) * DAY_MS;
   return (Array.isArray(videos) ? videos : [])
     .filter((video) => {
       const timestamp = awemeTimestampMs(video);
-      return timestamp > 0 && timestamp <= nowMs && timestamp >= cutoffMs;
+      if (timestamp <= 0) return false;
+      if (timestamp > nowMs) return false;       // 未来时间
+      if (timestamp < cutoffMs) return false;     // 超出 days 上界（太旧）
+      if (timestamp > upperExcludeMs) return false; // 在 daysFrom 下界之内（太新）
+      return true;
     })
     .sort((left, right) => awemeTimestampMs(right) - awemeTimestampMs(left));
 };
@@ -103,6 +129,8 @@ export const buildCombinedVideosResponse = (pages, videos, metadata = {}) => {
     stopReason: metadata.stopReason,
     isComplete: metadata.isComplete,
     incompleteReason: metadata.incompleteReason,
+    totalPageCount: metadata.totalPageCount,
+    resume: metadata.resume || null,
     ...(metadata.partialError ? { partialError: metadata.partialError } : {}),
   };
   if (Array.isArray(firstData)) {
@@ -128,33 +156,47 @@ export const buildCombinedVideosResponse = (pages, videos, metadata = {}) => {
 export const collectRecentAwemePages = async ({
   platform,
   days,
+  daysFrom,
   fetchPage,
   maxPages = 20,
+  slicePages = MAX_TOPIC_SLICE_PAGES,
   maxVideos = 400,
   expectedPageSize = 20,
   nowMs = Date.now(),
+  startCursor = 0,
+  pageOffset = 0,
 }) => {
   const recentDays = parseRecentDays(days);
-  const pageLimit = Math.max(1, Math.min(Number(maxPages) || 20, MAX_TOPIC_PAGES));
+  const totalPageLimit = Math.max(1, Math.min(Number(maxPages) || 20, MAX_TOPIC_PAGES));
+  const normalizedPageOffset = Math.max(0, Math.min(Number(pageOffset) || 0, totalPageLimit));
+  const remainingPages = Math.max(0, totalPageLimit - normalizedPageOffset);
+  const pageLimit = Math.min(
+    remainingPages,
+    Math.max(1, Math.min(Number(slicePages) || MAX_TOPIC_SLICE_PAGES, MAX_TOPIC_SLICE_PAGES)),
+  );
   const videoLimit = Math.max(20, Math.min(Number(maxVideos) || 400, MAX_TOPIC_VIDEOS));
   const pageSize = Math.max(1, Number(expectedPageSize) || 20);
   const pages = [];
   const allVideos = [];
   const seenVideos = new Set();
-  const seenCursors = new Set(["0"]);
-  let cursor = 0;
+  const initialCursor = startCursor ?? 0;
+  const seenCursors = new Set([String(initialCursor)]);
+  let cursor = initialCursor;
   let hasMore = false;
-  let stopReason = "safety_limit";
+  let stopReason = remainingPages === 0 ? "safety_limit" : "slice_limit";
   let partialError = null;
+  let partialErrorStatus = null;
   let hitVideoLimit = false;
 
   for (let page = 1; page <= pageLimit && allVideos.length < videoLimit; page += 1) {
+    const logicalPage = normalizedPageOffset + page;
     let pageResult;
     try {
-      pageResult = await fetchPage(cursor, page);
+      pageResult = await fetchPage(cursor, logicalPage);
     } catch (error) {
       if (pages.length === 0) throw error;
       partialError = error instanceof Error ? error.message : "Page fetch failed";
+      partialErrorStatus = Number(error?.status) || null;
       hasMore = true;
       stopReason = "page_error";
       break;
@@ -176,27 +218,29 @@ export const collectRecentAwemePages = async ({
       addedCount += 1;
     }
 
-    if (page > 1 && reachedRecentTimeBoundary(newPageVideos, recentDays, nowMs)) {
-      hasMore = false;
-      stopReason = "time_boundary";
-      break;
-    }
-
-    // 方案 2：当本页返回的视频数严格小于每页请求量时，说明上游已经没有更多内容，
-    // 无需继续翻页。这避免了对作品少的账号发起无意义的第 2 页请求，
-    // 也从源头减少了上游游标不前进导致的 repeated_cursor。
-    if (pageVideos.length > 0 && pageVideos.length < pageSize) {
-      hasMore = false;
-      stopReason = "upstream_exhausted";
-      break;
-    }
-
     const nextCursor = extractNextCursor(pageResult?.data, platform);
     const upstreamHasMore = extractHasMore(pageResult?.data);
     hasMore = upstreamHasMore === undefined
       ? nextCursor !== undefined && String(nextCursor) !== String(cursor)
       : upstreamHasMore;
     const canAdvance = nextCursor !== undefined && !seenCursors.has(String(nextCursor));
+
+    // 短页只有在上游明确 has_more=false 时才能视为取尽。有些账号会返回
+    // 少于 count 的页面但仍提供有效下一游标，单凭条数早停会漏作品。
+    if (pageVideos.length > 0 && pageVideos.length < pageSize && upstreamHasMore === false) {
+      hasMore = false;
+      stopReason = "upstream_exhausted";
+      break;
+    }
+
+    // 只有整个账号的真正第一页可以忽略置顶旧作品。续拉切片的本地第 1 页
+    // 仍使用 logicalPage > 1，因此不会重复获得“第一页例外”。先提取游标，
+    // 再判断边界，确保边界页内仍在范围中的作品已被保留。
+    if (logicalPage > 1 && reachedRecentTimeBoundary(newPageVideos, recentDays, nowMs, daysFrom)) {
+      hasMore = false;
+      stopReason = "time_boundary";
+      break;
+    }
     if (pageVideos.length === 0 || addedCount === 0) {
       if (hasMore && canAdvance) {
         cursor = nextCursor;
@@ -225,27 +269,34 @@ export const collectRecentAwemePages = async ({
     seenCursors.add(String(cursor));
   }
 
+  const totalPageCount = normalizedPageOffset + pages.length;
   if (hitVideoLimit || (hasMore && allVideos.length >= videoLimit)) {
     hasMore = true;
     stopReason = "safety_limit";
-  } else if (hasMore && pages.length >= pageLimit) {
+  } else if (hasMore && totalPageCount >= totalPageLimit) {
     stopReason = "safety_limit";
+  } else if (hasMore && pages.length >= pageLimit && stopReason !== "page_error") {
+    stopReason = "slice_limit";
   }
 
-  const videos = filterRecentAwemes(allVideos, recentDays, nowMs);
-  const isComplete = !["safety_limit", "page_error"].includes(stopReason);
+  const videos = filterRecentAwemes(allVideos, recentDays, nowMs, daysFrom);
+  const isComplete = !["slice_limit", "safety_limit", "page_error"].includes(stopReason);
+  const canResume = hasMore && ["slice_limit", "page_error"].includes(stopReason);
   return {
     videos,
     pages,
     pageCount: pages.length,
     rawVideosCount: allVideos.length,
     recentDays,
+    totalPageCount,
     hasMore: !isComplete && hasMore,
     stopReason,
     isComplete,
-    incompleteReason: isComplete
-      ? null
-      : partialError || "已达到安全翻页上限，结果可能不完整",
+    resume: canResume ? { cursor, pageOffset: totalPageCount } : null,
+    incompleteReason: stopReason === "page_error"
+      ? partialError
+      : stopReason === "safety_limit" ? "已达到安全翻页上限，结果可能不完整" : null,
     partialError,
+    partialErrorStatus,
   };
 };

@@ -125,7 +125,9 @@ export const fetchJson = async (url, options = {}) => {
       });
 
       if (!response.ok) {
-        const error = new AgentError(`HTTP ${response.status} from ${url}`, {
+        // 错误会被多层 logger 记录；只使用已去除 query 的 endpoint，避免把
+        // TikHub cursor/max_cursor、签名或其他敏感查询参数写入日志。
+        const error = new AgentError(`HTTP ${response.status} from ${endpoint}`, {
           status: response.status,
           code: "HTTP_ERROR",
           details: data,

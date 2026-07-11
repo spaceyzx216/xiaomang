@@ -1,6 +1,8 @@
 import { AgentError, fetchJson } from "./contentAgent/http.js";
 import {
+  MAX_RECENT_DAYS,
   MAX_TOPIC_PAGES,
+  MAX_TOPIC_SLICE_PAGES,
   MAX_TOPIC_VIDEOS,
   parseRecentDays,
   reachedRecentTimeBoundary,
@@ -73,11 +75,20 @@ const toTimestampMs = (value) => {
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
-export const isWithinRecentDays = (value, days, nowMs = Date.now()) => {
+export const isWithinRecentDays = (value, days, nowMs = Date.now(), daysFrom) => {
   const timestamp = toTimestampMs(value);
   if (!timestamp) return false;
-  return timestamp <= nowMs && nowMs - timestamp <= days * 24 * 60 * 60 * 1000;
+  if (timestamp > nowMs) return false;
+  const elapsedDays = (nowMs - timestamp) / (24 * 60 * 60 * 1000);
+  if (elapsedDays > days) return false;
+  const fromValue = daysFrom !== undefined && daysFrom !== null && daysFrom !== ""
+    ? Number(daysFrom) : 0;
+  if (fromValue > 0 && elapsedDays < fromValue - 1) return false;
+  return true;
 };
+
+// 注意：isWithinRecentDays 的 daysFrom 语义与 filterRecentAwemes 一致——
+// elapsedDays >= daysFrom-1 表示视频年龄至少 daysFrom-1 天（即第 daysFrom 天或更早）。
 
 const authHeaders = (config) => {
   if (!config?.tikhubApiToken) {
@@ -374,10 +385,14 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
       inputName: String(item?.inputName || item?.displayName || "").trim(),
       displayName: String(item?.displayName || item?.inputName || "").trim(),
       finderUsername: String(item?.finderUsername || item?.finder_username || "").trim(),
+      resume: item?.resume && typeof item.resume === "object" ? item.resume : null,
     }))
     .filter(item => item.finderUsername);
   if (selectedAccounts.length === 0) {
     throw new AgentError("accounts must include finderUsername", { code: "ACCOUNTS_EMPTY", status: 400 });
+  }
+  if (selectedAccounts.length !== 1) {
+    throw new AgentError("Each topic slice must include exactly one account", { code: "TOPIC_SINGLE_ACCOUNT_REQUIRED", status: 400 });
   }
 
   const limit = Math.max(1, Math.min(Number(count) || 200, MAX_TOPIC_VIDEOS));
@@ -385,24 +400,32 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
   try {
     recentDays = parseRecentDays(days);
   } catch {
-    throw new AgentError("days must be an integer between 1 and 90", { code: "TOPIC_DAYS_INVALID", status: 400 });
+    throw new AgentError(`days must be an integer between 1 and ${MAX_RECENT_DAYS}`, { code: "TOPIC_DAYS_INVALID", status: 400 });
   }
-  const pageLimit = Math.max(1, Math.min(Number(maxPages) || 10, MAX_TOPIC_PAGES));
+  const totalPageLimit = Math.max(1, Math.min(Number(maxPages) || 10, MAX_TOPIC_PAGES));
+  const topicConfig = {
+    ...config,
+    requestTimeoutMs: Math.min(Number(config?.requestTimeoutMs) || 120_000, 25_000),
+  };
   const nowMs = Date.now();
   const results = [];
   for (const account of selectedAccounts) {
     try {
+      const pageOffset = Math.max(0, Math.min(Number(account.resume?.pageOffset) || 0, totalPageLimit));
+      const pageLimit = Math.min(MAX_TOPIC_SLICE_PAGES, Math.max(0, totalPageLimit - pageOffset));
       const pageResponses = [];
       const allVideos = [];
       const seenVideoKeys = new Set();
-      const seenBuffers = new Set([""]);
-      let lastBuffer = "";
+      let lastBuffer = String(account.resume?.cursor || "").trim();
+      const seenBuffers = new Set([lastBuffer]);
       let hasMore = false;
-      let stopReason = "page_limit";
+      let stopReason = pageLimit === 0 ? "safety_limit" : "slice_limit";
       let partialError = null;
+      let partialErrorStatus = null;
       let hitVideoLimit = false;
 
       for (let page = 1; page <= pageLimit && allVideos.length < limit; page += 1) {
+        const logicalPage = pageOffset + page;
         let videosResponse;
         try {
           videosResponse = await postTikHub(
@@ -412,19 +435,20 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
               last_buffer: lastBuffer,
               raw: false,
             },
-            config,
+            topicConfig,
             {
               logger: options.logger,
               logFields: {
                 inputName: account.inputName,
                 finderUsername: account.finderUsername,
-                page,
+                page: logicalPage,
               },
             },
           );
         } catch (error) {
           if (pageResponses.length === 0) throw error;
           partialError = error instanceof Error ? error.message : "Page fetch failed";
+          partialErrorStatus = Number(error?.status) || null;
           hasMore = true;
           stopReason = "page_error";
           break;
@@ -447,16 +471,15 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
           addedCount += 1;
         }
 
-        if (page > 1 && reachedRecentTimeBoundary(newPageVideos, recentDays, nowMs)) {
-          stopReason = "time_boundary";
-          hasMore = false;
-          break;
-        }
-
         const nextBuffer = String(data?.last_buffer || data?.lastBuffer || "").trim();
         const apiHasNext = hasNextPage(data?.up_continue) || hasNextPage(data?.upContinueFlag);
         const canAdvance = Boolean(nextBuffer) && nextBuffer !== lastBuffer && !seenBuffers.has(nextBuffer);
         hasMore = Boolean(nextBuffer);
+        if (logicalPage > 1 && reachedRecentTimeBoundary(newPageVideos, recentDays, nowMs)) {
+          stopReason = "time_boundary";
+          hasMore = false;
+          break;
+        }
         if (!nextBuffer) {
           stopReason = "no_next_buffer";
           hasMore = false;
@@ -469,11 +492,13 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
             seenBuffers.add(lastBuffer);
             continue;
           }
-          stopReason = "repeated_buffer";
+          stopReason = "upstream_exhausted";
+          hasMore = false;
           break;
         }
         if (!canAdvance) {
-          stopReason = "repeated_buffer";
+          stopReason = "upstream_exhausted";
+          hasMore = false;
           break;
         }
         stopReason = apiHasNext ? "api_has_next" : "buffer_probe";
@@ -481,9 +506,12 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
         seenBuffers.add(lastBuffer);
       }
 
-      if (hitVideoLimit || (hasMore && (pageResponses.length >= pageLimit || allVideos.length >= limit))) {
+      const totalPageCount = pageOffset + pageResponses.length;
+      if (hitVideoLimit || (hasMore && allVideos.length >= limit) || (hasMore && totalPageCount >= totalPageLimit)) {
         hasMore = true;
         stopReason = "safety_limit";
+      } else if (hasMore && pageResponses.length >= pageLimit && stopReason !== "page_error") {
+        stopReason = "slice_limit";
       }
 
       const topics = allVideos
@@ -499,15 +527,18 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
         topics,
         videosResponse: pageResponses?.[0],
         pageCount: pageResponses.length,
+        totalPageCount,
         rawVideosCount: allVideos.length,
         recentDays,
         hasMore,
         stopReason,
-        isComplete: !["safety_limit", "page_error", "repeated_buffer"].includes(stopReason),
-        incompleteReason: partialError || (stopReason === "safety_limit"
-          ? "已达到安全翻页上限，结果可能不完整"
-          : stopReason === "repeated_buffer" ? "上游翻页游标重复，结果可能不完整" : null),
+        isComplete: !["slice_limit", "safety_limit", "page_error"].includes(stopReason),
+        incompleteReason: partialError || (stopReason === "safety_limit" ? "已达到安全翻页上限，结果可能不完整" : null),
         backgroundError: partialError,
+        errorStatus: partialErrorStatus,
+        resume: hasMore && ["slice_limit", "page_error"].includes(stopReason)
+          ? { cursor: lastBuffer, pageOffset: totalPageCount }
+          : null,
         error: null,
       });
     } catch (error) {
@@ -517,6 +548,8 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
         videosCount: 0,
         topics: [],
         recentDays,
+        errorStatus: Number(error?.status) || null,
+        resume: account.resume || { cursor: "", pageOffset: 0 },
         error: error instanceof Error ? error.message : "Failed to fetch videos",
       });
     }

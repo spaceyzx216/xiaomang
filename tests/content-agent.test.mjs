@@ -485,6 +485,34 @@ test("fetchJson retries retryable HTTP statuses and returns the successful respo
   }
 });
 
+test("fetchJson omits query parameters from errors and logs", async () => {
+  const originalFetch = global.fetch;
+  const errors = [];
+  global.fetch = async () => new Response(JSON.stringify({ error: "payment required" }), {
+    status: 402,
+    headers: { "Content-Type": "application/json" },
+  });
+
+  try {
+    await assert.rejects(
+      fetchJson("https://example.com/videos?max_cursor=secret-cursor", {
+        retries: 2,
+        logger: {
+          info() {},
+          warn() {},
+          error(_event, fields) { errors.push(fields); },
+        },
+      }),
+      error => error?.status === 402 &&
+        error.message === "HTTP 402 from https://example.com/videos" &&
+        !error.message.includes("secret-cursor"),
+    );
+    assert.equal(errors.some(fields => JSON.stringify(fields).includes("secret-cursor")), false);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test("creative agents fall back independently when DeepSeek requests fail", async () => {
   const originalFetch = global.fetch;
   let calls = 0;

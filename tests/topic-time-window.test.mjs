@@ -9,6 +9,7 @@ import {
   topicRequestLimits,
 } from "../src/app/topicTimeWindow.ts";
 import {
+  MAX_RECENT_DAYS,
   buildCombinedVideosResponse,
   collectRecentAwemePages,
   parseRecentDays,
@@ -34,12 +35,13 @@ const wechatVideoAtAge = (id, ageDays) => ({
   create_time: Math.floor((NOW - ageDays * DAY_MS) / 1000),
 });
 
-test("accepts a custom topic window up to three months", () => {
-  assert.equal(MAX_TOPIC_DAYS, 90);
+test("accepts a custom topic window up to two years", () => {
+  assert.equal(MAX_TOPIC_DAYS, 730);
+  assert.equal(MAX_RECENT_DAYS, 730);
   assert.equal(parseTopicDays(1), 1);
-  assert.equal(parseTopicDays("90"), 90);
-  assert.equal(parseRecentDays(90), 90);
-  for (const value of [0, 91, 1.5, "invalid", true, [7], { value: 7 }]) {
+  assert.equal(parseTopicDays("730"), 730);
+  assert.equal(parseRecentDays(730), 730);
+  for (const value of [0, 731, 1.5, "invalid", true, [7], { value: 7 }]) {
     assert.throws(() => parseTopicDays(value), RangeError);
     assert.throws(() => parseRecentDays(value), RangeError);
   }
@@ -48,7 +50,35 @@ test("accepts a custom topic window up to three months", () => {
 test("scales pagination safety limits with the selected window", () => {
   assert.deepEqual(topicRequestLimits(7), { maxPages: 20, count: 400 });
   assert.deepEqual(topicRequestLimits(30), { maxPages: 25, count: 450 });
-  assert.deepEqual(topicRequestLimits(90), { maxPages: 60, count: 1200 });
+  assert.deepEqual(topicRequestLimits(90), { maxPages: 65, count: 1350 });
+  assert.deepEqual(topicRequestLimits(365), { maxPages: 100, count: 2000 });
+  assert.deepEqual(topicRequestLimits(730), { maxPages: 100, count: 2000 });
+});
+
+test("filters awemes by daysFrom lower bound", async () => {
+  // days=30, daysFrom=8 → 只保留第 8-30 天的视频，排除近 7 天的
+  let calls = 0;
+  const result = await collectRecentAwemePages({
+    platform: "douyin",
+    days: 30,
+    daysFrom: 8,
+    expectedPageSize: 2,
+    nowMs: NOW,
+    fetchPage: async (_cursor, page) => {
+      calls += 1;
+      const pages = {
+        1: [videoAtAge("recent", 3)],
+        2: [videoAtAge("in-range-15", 15), videoAtAge("in-range-20", 20)],
+        3: [videoAtAge("in-range-25", 25), videoAtAge("outside", 31)],
+      };
+      return {
+        data: { data: { aweme_list: pages[page] || [], max_cursor: page, has_more: 1 } },
+      };
+    },
+  });
+  assert.equal(calls, 3);
+  assert.equal(result.stopReason, "time_boundary");
+  assert.deepEqual(result.videos.map(v => v.aweme_id), ["in-range-15", "in-range-20", "in-range-25"]);
 });
 
 test("groups ninety days of topics into seven-day collapsed buckets", () => {
@@ -74,6 +104,7 @@ test("merges background results without deleting first-week data on partial fail
   assert.deepEqual(failed[0].topics.map(topic => topic.id), ["a", "b"]);
   assert.equal(failed[0].error, null);
   assert.equal(failed[0].backgroundError, "timeout");
+  assert.equal(failed[0].videosCount, 2);
 
   const recovered = mergeTopicBatchResults(failed, [{
     inputName: "账号 A",
@@ -337,6 +368,51 @@ test("wechat pagination preserves earlier pages when a later page fails", async 
   }
 });
 
+test("wechat continuation starts after the saved last_buffer", async () => {
+  const originalFetch = global.fetch;
+  const requestBodies = [];
+  global.fetch = async (_url, options) => {
+    requestBodies.push(JSON.parse(options.body));
+    return new Response(JSON.stringify({
+      data: {
+        videos: [wechatVideoAtAge("old", 31)],
+        last_buffer: "buffer-8",
+        up_continue: 1,
+      },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+
+  try {
+    const payload = await fetchPlatformTopics(
+      {
+        platform: "wechat_channels",
+        accounts: [{
+          inputName: "账号 A",
+          finderUsername: "finder-a",
+          resume: { cursor: "buffer-7", pageOffset: 7 },
+        }],
+        days: 30,
+        maxPages: 100,
+      },
+      {
+        tikhubBaseUrl: "https://example.invalid",
+        tikhubApiToken: "test-token",
+        requestTimeoutMs: 1000,
+        apiRetryAttempts: 1,
+        apiRetryBaseDelayMs: 1,
+      },
+    );
+
+    assert.equal(requestBodies.length, 1);
+    assert.equal(requestBodies[0].last_buffer, "buffer-7");
+    assert.equal(payload.results[0].totalPageCount, 8);
+    assert.equal(payload.results[0].stopReason, "time_boundary");
+    assert.equal(payload.results[0].isComplete, true);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test("reports incomplete data when pagination reaches a safety cap", async () => {
   const result = await collectRecentAwemePages({
     platform: "tiktok",
@@ -411,7 +487,7 @@ test("stops early when the first page returns fewer than the expected page size"
             // 只返回 3 条，小于 expectedPageSize=20
             aweme_list: [videoAtAge("a", 1), videoAtAge("b", 5), videoAtAge("c", 10)],
             max_cursor: 100,
-            has_more: 1,
+            has_more: 0,
           },
         },
       };
@@ -450,7 +526,7 @@ test("distinguishes an exact final page from a truncated final page", async () =
   assert.equal(truncated.stopReason, "safety_limit");
 });
 
-test("keeps pagination internals out of the browser response payload", () => {
+test("returns only compact continuation metadata in the browser response payload", () => {
   const response = buildCombinedVideosResponse(
     [{ data: { data: { aweme_list: [videoAtAge("a", 1)] } } }],
     [videoAtAge("a", 1)],
@@ -464,6 +540,8 @@ test("keeps pagination internals out of the browser response payload", () => {
       stopReason: "time_boundary",
       isComplete: true,
       incompleteReason: null,
+      totalPageCount: 7,
+      resume: { cursor: "cursor-7", pageOffset: 7 },
     },
   );
 
@@ -475,7 +553,98 @@ test("keeps pagination internals out of the browser response payload", () => {
     stopReason: "time_boundary",
     isComplete: true,
     incompleteReason: null,
+    totalPageCount: 7,
+    resume: { cursor: "cursor-7", pageOffset: 7 },
   });
   assert.equal("pages" in response.topicWindow, false);
   assert.equal("videos" in response.topicWindow, false);
+});
+
+test("resumes from the supplied cursor and keeps logical page numbering", async () => {
+  const calls = [];
+  const result = await collectRecentAwemePages({
+    platform: "douyin",
+    days: 730,
+    maxPages: 100,
+    slicePages: 3,
+    startCursor: 700,
+    pageOffset: 7,
+    expectedPageSize: 1,
+    nowMs: NOW,
+    fetchPage: async (cursor, logicalPage) => {
+      calls.push({ cursor, logicalPage });
+      return {
+        data: {
+          data: {
+            aweme_list: [videoAtAge(`page-${logicalPage}`, logicalPage)],
+            max_cursor: 800,
+            has_more: 0,
+          },
+        },
+      };
+    },
+  });
+
+  assert.deepEqual(calls, [{ cursor: 700, logicalPage: 8 }]);
+  assert.equal(result.totalPageCount, 8);
+  assert.equal(result.isComplete, true);
+});
+
+test("returns a resumable cursor after a normal three-page slice", async () => {
+  const result = await collectRecentAwemePages({
+    platform: "tiktok",
+    days: 730,
+    maxPages: 100,
+    slicePages: 3,
+    expectedPageSize: 1,
+    nowMs: NOW,
+    fetchPage: async (_cursor, logicalPage) => ({
+      data: {
+        data: {
+          aweme_list: [videoAtAge(`page-${logicalPage}`, logicalPage)],
+          cursor: logicalPage * 10,
+          has_more: 1,
+        },
+      },
+    }),
+  });
+
+  assert.equal(result.stopReason, "slice_limit");
+  assert.equal(result.isComplete, false);
+  assert.deepEqual(result.resume, { cursor: 30, pageOffset: 3 });
+  assert.equal(result.incompleteReason, null);
+});
+
+test("keeps the failed page cursor when a resumed slice errors", async () => {
+  const result = await collectRecentAwemePages({
+    platform: "douyin",
+    days: 730,
+    maxPages: 100,
+    slicePages: 3,
+    startCursor: 700,
+    pageOffset: 7,
+    expectedPageSize: 1,
+    nowMs: NOW,
+    fetchPage: async (cursor, logicalPage) => {
+      if (logicalPage === 9) {
+        const error = new Error("HTTP 402");
+        error.status = 402;
+        throw error;
+      }
+      return {
+        data: {
+          data: {
+            aweme_list: [videoAtAge("page-8", 8)],
+            max_cursor: 800,
+            has_more: 1,
+          },
+        },
+      };
+    },
+  });
+
+  assert.equal(result.stopReason, "page_error");
+  assert.equal(result.partialErrorStatus, 402);
+  assert.deepEqual(result.resume, { cursor: 800, pageOffset: 8 });
+  assert.deepEqual(result.videos.map(video => video.aweme_id), ["page-8"]);
 });

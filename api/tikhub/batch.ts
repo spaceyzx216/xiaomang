@@ -5,8 +5,14 @@ import { createRequestLogger, safeLink } from "../_lib/contentAgent/logger.js";
 import {
   buildCombinedVideosResponse,
   collectRecentAwemePages,
+  MAX_RECENT_DAYS,
+  MAX_TOPIC_SLICE_PAGES,
   parseRecentDays,
 } from "../_lib/topicPagination.js";
+
+export const config = {
+  maxDuration: 300,
+};
 
 export default async function handler(req: any, res: any) {
   if (req.method !== "POST") {
@@ -15,14 +21,15 @@ export default async function handler(req: any, res: any) {
 
   const logger = createRequestLogger("api.tikhub.batch", req.headers?.["x-request-id"]);
   const agentConfig = getContentAgentConfig();
+  const topicRequestTimeoutMs = Math.min(agentConfig.requestTimeoutMs, 25_000);
 
-  const { urls, platform, days = 7, maxPages = 20, count = 400 } = readBody(req);
+  const { urls, platform, days = 7, maxPages = 20, count = 400, resume = null } = readBody(req);
   const normalizedPlatform = String(platform || "douyin").toLowerCase() === "tiktok" ? "tiktok" : "douyin";
   let recentDays;
   try {
     recentDays = parseRecentDays(days);
   } catch {
-    return json(res, 400, { error: "days must be an integer between 1 and 90", code: "TOPIC_DAYS_INVALID" });
+    return json(res, 400, { error: `days must be an integer between 1 and ${MAX_RECENT_DAYS}`, code: "TOPIC_DAYS_INVALID" });
   }
   logger.info("route.request.start", {
     interface: "/api/tikhub/batch",
@@ -33,6 +40,9 @@ export default async function handler(req: any, res: any) {
   if (!Array.isArray(urls) || urls.length === 0) {
     logger.warn("route.validation.error", { error: "urls must be a non-empty array" });
     return json(res, 400, { error: "urls must be a non-empty array" });
+  }
+  if (urls.length !== 1) {
+    return json(res, 400, { error: "每次续拉请求只能包含一个账号", code: "TOPIC_SINGLE_ACCOUNT_REQUIRED" });
   }
 
   if (!TIKHUB_API_TOKEN) {
@@ -50,17 +60,32 @@ export default async function handler(req: any, res: any) {
 
     const sanitizedUrl = sanitizeUrl(url);
     logger.info("tikhub.item.start", { url: safeLink(sanitizedUrl), platform: normalizedPlatform });
+    if (resume?.sourceUrl && sanitizeUrl(String(resume.sourceUrl)) !== sanitizedUrl) {
+      results.push({ url, platform: normalizedPlatform, error: "续拉状态与当前账号不匹配", errorStatus: 400 });
+      continue;
+    }
+
+    let secUserId = String(resume?.secUserId || "").trim();
+    let secUserResponse: any = null;
+    let resolvedUsername = String(resume?.username || "").trim();
+    let retryResume: Record<string, unknown> = {
+      cursor: resume?.cursor ?? 0,
+      pageOffset: resume?.pageOffset ?? 0,
+      ...(secUserId ? { secUserId } : {}),
+      ...(resolvedUsername ? { username: resolvedUsername } : {}),
+      sourceUrl: sanitizedUrl,
+    };
+    const slicePageBudget = secUserId ? MAX_TOPIC_SLICE_PAGES : 2;
 
     try {
-      let secUserId = "";
-      let secUserResponse: any = null;
 
       if (normalizedPlatform === "tiktok") {
         // TikTok：主页链接形如 https://www.tiktok.com/@username，提取 username 后查 sec_user_id。
-        const username = (() => {
+        const username = resolvedUsername || (() => {
           const m = sanitizedUrl.match(/tiktok\.com\/@?([A-Za-z0-9_.]+)/i);
           return m ? m[1] : "";
         })();
+        resolvedUsername = username;
         if (!username) {
           results.push({
             url,
@@ -69,14 +94,14 @@ export default async function handler(req: any, res: any) {
           });
           continue;
         }
-        if (username) {
+        if (username && !secUserId && resume?.accountResolved !== true) {
           // TikHub TikTok 端点：用 username 换 sec_user_id（失败则 fallback 用 unique_id 直查作品）
           const secEndpoint = `${TIKHUB_BASE_URL}/api/v1/tiktok/app/v3/get_user_id_and_sec_user_id_by_username`;
           try {
             const { data: secUserData } = await fetchJson(
               appendQuery(secEndpoint, { username }),
               {
-                timeoutMs: agentConfig.requestTimeoutMs,
+                timeoutMs: topicRequestTimeoutMs,
                 retries: agentConfig.apiRetryAttempts,
                 retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
                 logger,
@@ -87,6 +112,7 @@ export default async function handler(req: any, res: any) {
             secUserResponse = secUserData;
             secUserId = secUserData?.data?.sec_user_id || secUserData?.sec_user_id || "";
           } catch (secError) {
+            if (Number((secError as any)?.status) === 402) throw secError;
             // sec_user_id 解析失败不致命，下方用 unique_id 兜底
             logger.warn("tikhub.tiktok.sec_user_id.fallback", {
               username,
@@ -94,6 +120,12 @@ export default async function handler(req: any, res: any) {
             });
           }
         }
+        retryResume = {
+          ...retryResume,
+          secUserId,
+          username,
+          accountResolved: true,
+        };
         const videosEndpoint = `${TIKHUB_BASE_URL}/api/v1/tiktok/app/v3/fetch_user_post_videos`;
         const videosParams: Record<string, unknown> = { count: 20 };
         if (secUserId) {
@@ -107,12 +139,15 @@ export default async function handler(req: any, res: any) {
           platform: normalizedPlatform,
           days: recentDays,
           maxPages,
+          slicePages: slicePageBudget,
+          startCursor: resume?.cursor ?? 0,
+          pageOffset: resume?.pageOffset ?? 0,
           maxVideos: count,
           expectedPageSize: 20,
           fetchPage: (cursor: unknown, page: number) => fetchJson(
             appendQuery(videosEndpoint, { ...videosParams, cursor }),
             {
-              timeoutMs: agentConfig.requestTimeoutMs,
+              timeoutMs: topicRequestTimeoutMs,
               retries: agentConfig.apiRetryAttempts,
               retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
               logger,
@@ -123,7 +158,8 @@ export default async function handler(req: any, res: any) {
           ),
         });
         const videosList = collection.videos;
-        const videosResponse = buildCombinedVideosResponse(collection.pages, videosList, collection);
+        const nextResume = collection.resume ? { ...collection.resume, secUserId, username, accountResolved: true, sourceUrl: sanitizedUrl } : null;
+        const videosResponse = buildCombinedVideosResponse(collection.pages, videosList, { ...collection, resume: nextResume });
         const authorName = videosList?.[0]?.author?.nickname;
 
         results.push({
@@ -135,6 +171,7 @@ export default async function handler(req: any, res: any) {
           secUserResponse,
           videosResponse,
           pageCount: collection.pageCount,
+          totalPageCount: collection.totalPageCount,
           rawVideosCount: collection.rawVideosCount,
           recentDays: collection.recentDays,
           hasMore: collection.hasMore,
@@ -142,6 +179,8 @@ export default async function handler(req: any, res: any) {
           isComplete: collection.isComplete,
           incompleteReason: collection.incompleteReason,
           backgroundError: collection.partialError,
+          errorStatus: collection.partialErrorStatus,
+          resume: nextResume,
           error: null,
         });
         logger.info("tikhub.item.end", {
@@ -152,36 +191,42 @@ export default async function handler(req: any, res: any) {
         });
       } else {
         // 抖音：主页链接 → sec_user_id → fetch_user_post_videos
-        const secEndpoint = `${TIKHUB_BASE_URL}/api/v1/douyin/web/get_sec_user_id`;
-        const { response: secResp, data: secUserData } = await fetchJson(
-          appendQuery(secEndpoint, { url: sanitizedUrl }),
-          {
-            timeoutMs: agentConfig.requestTimeoutMs,
-            retries: agentConfig.apiRetryAttempts,
-            retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
-            logger,
-            interfaceName: "tikhub:get_sec_user_id",
-            headers: { Authorization: `Bearer ${TIKHUB_API_TOKEN}` },
-          },
-        );
-        secUserResponse = secUserData;
-        secUserId = secUserData?.data || secUserData?.sec_user_id;
+        if (!secUserId) {
+          const secEndpoint = `${TIKHUB_BASE_URL}/api/v1/douyin/web/get_sec_user_id`;
+          const { response: secResp, data: secUserData } = await fetchJson(
+            appendQuery(secEndpoint, { url: sanitizedUrl }),
+            {
+              timeoutMs: topicRequestTimeoutMs,
+              retries: agentConfig.apiRetryAttempts,
+              retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
+              logger,
+              interfaceName: "tikhub:get_sec_user_id",
+              headers: { Authorization: `Bearer ${TIKHUB_API_TOKEN}` },
+            },
+          );
+          secUserResponse = secUserData;
+          secUserId = secUserData?.data || secUserData?.sec_user_id;
 
-        if (!secResp.ok || !secUserId) {
-          results.push({
-            url,
-            platform: normalizedPlatform,
-            secUserResponse,
-            error: secUserResponse?.message || "Failed to resolve sec_user_id",
-          });
-          continue;
+          if (!secResp.ok || !secUserId) {
+            results.push({
+              url,
+              platform: normalizedPlatform,
+              secUserResponse,
+              error: secUserResponse?.message || "Failed to resolve sec_user_id",
+            });
+            continue;
+          }
         }
+        retryResume = { ...retryResume, secUserId };
 
         const videosEndpoint = `${TIKHUB_BASE_URL}/api/v1/douyin/app/v3/fetch_user_post_videos`;
         const collection = await collectRecentAwemePages({
           platform: normalizedPlatform,
           days: recentDays,
           maxPages,
+          slicePages: slicePageBudget,
+          startCursor: resume?.cursor ?? 0,
+          pageOffset: resume?.pageOffset ?? 0,
           maxVideos: count,
           expectedPageSize: 20,
           fetchPage: (cursor: unknown, page: number) => fetchJson(
@@ -192,7 +237,7 @@ export default async function handler(req: any, res: any) {
               sort_type: 0,
             }),
             {
-              timeoutMs: agentConfig.requestTimeoutMs,
+              timeoutMs: topicRequestTimeoutMs,
               retries: agentConfig.apiRetryAttempts,
               retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
               logger,
@@ -203,7 +248,8 @@ export default async function handler(req: any, res: any) {
           ),
         });
         const videosList = collection.videos;
-        const videosResponse = buildCombinedVideosResponse(collection.pages, videosList, collection);
+        const nextResume = collection.resume ? { ...collection.resume, secUserId, sourceUrl: sanitizedUrl } : null;
+        const videosResponse = buildCombinedVideosResponse(collection.pages, videosList, { ...collection, resume: nextResume });
         const authorName = videosList?.[0]?.author?.nickname;
 
         results.push({
@@ -215,6 +261,7 @@ export default async function handler(req: any, res: any) {
           secUserResponse,
           videosResponse,
           pageCount: collection.pageCount,
+          totalPageCount: collection.totalPageCount,
           rawVideosCount: collection.rawVideosCount,
           recentDays: collection.recentDays,
           hasMore: collection.hasMore,
@@ -222,6 +269,8 @@ export default async function handler(req: any, res: any) {
           isComplete: collection.isComplete,
           incompleteReason: collection.incompleteReason,
           backgroundError: collection.partialError,
+          errorStatus: collection.partialErrorStatus,
+          resume: nextResume,
           error: null,
         });
         logger.info("tikhub.item.end", {
@@ -240,6 +289,8 @@ export default async function handler(req: any, res: any) {
       results.push({
         url,
         platform: normalizedPlatform,
+        errorStatus: Number((error as any)?.status) || null,
+        resume: retryResume,
         error: error instanceof Error ? error.message : "Request failed",
       });
     }

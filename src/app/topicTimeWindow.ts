@@ -1,8 +1,8 @@
 export const DEFAULT_TOPIC_DAYS = 7;
-export const MAX_TOPIC_DAYS = 90;
+export const MAX_TOPIC_DAYS = 730;
 export const TOPIC_GROUP_DAYS = 7;
-export const MAX_TOPIC_PAGES = 60;
-export const MAX_TOPIC_VIDEOS = 1200;
+export const MAX_TOPIC_PAGES = 100;
+export const MAX_TOPIC_VIDEOS = 2000;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -26,7 +26,22 @@ type TopicBatchResult<T extends TopicTimeItem = TopicTimeItem> = {
   finderUsername?: string;
   secUserId?: string;
   topics?: T[];
+  videosCount?: number;
   videosResponse?: unknown;
+  pageCount?: number;
+  totalPageCount?: number;
+  rawVideosCount?: number;
+  resume?: {
+    cursor?: unknown;
+    pageOffset?: number;
+    secUserId?: string;
+    username?: string;
+    accountResolved?: boolean;
+    sourceUrl?: string;
+  } | null;
+  stopReason?: string;
+  isComplete?: boolean;
+  errorStatus?: number | null;
   error?: string | null;
   backgroundError?: string | null;
 };
@@ -200,12 +215,22 @@ export const mergeTopicBatchResults = <T extends TopicTimeItem>(
     // 会得到 []，而 Array.isArray([]) 为真，反而短路掉 videosResponse 的解析，
     // 导致渐进分页第二次请求合并后内容被清空。
     const hadTopics = Array.isArray(old.topics) || Array.isArray(next.topics);
-    const mergedTopics = hadTopics ? { topics: uniqueTopics(old.topics, next.topics) } : {};
+    const mergedTopicList = hadTopics ? uniqueTopics(old.topics, next.topics) : undefined;
+    const mergedTopics = mergedTopicList ? { topics: mergedTopicList } : {};
+    const mergedVideosResponse = mergeVideosResponse(old.videosResponse, next.videosResponse);
+    const accumulated = {
+      pageCount: (Number(old.pageCount) || 0) + (Number(next.pageCount) || 0),
+      totalPageCount: Number(next.totalPageCount) || Number(old.totalPageCount) || 0,
+      rawVideosCount: (Number(old.rawVideosCount) || 0) + (Number(next.rawVideosCount) || 0),
+      videosCount: mergedTopicList?.length ?? rawVideos(mergedVideosResponse).length,
+    };
     if (next.error) {
       return {
         ...old,
+        ...next,
         ...mergedTopics,
-        videosResponse: mergeVideosResponse(old.videosResponse, next.videosResponse),
+        ...accumulated,
+        videosResponse: mergedVideosResponse,
         backgroundError: next.error,
         error: old.error || null,
       };
@@ -214,7 +239,8 @@ export const mergeTopicBatchResults = <T extends TopicTimeItem>(
       ...old,
       ...next,
       ...mergedTopics,
-      videosResponse: mergeVideosResponse(old.videosResponse, next.videosResponse),
+      ...accumulated,
+      videosResponse: mergedVideosResponse,
       error: null,
       backgroundError: next.backgroundError || null,
     };
