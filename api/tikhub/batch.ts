@@ -14,6 +14,11 @@ export const config = {
   maxDuration: 300,
 };
 
+// 每个浏览器请求只顺序处理 3 页。游标是上一页响应生成的，不能安全跳页并发；
+// 20 秒 ×（首次 + 1 次重试）× 3 页，远低于 Vercel 的 300 秒函数上限。
+const TOPIC_PAGE_TIMEOUT_MS = 20_000;
+const TOPIC_PAGE_RETRIES = 1;
+
 export default async function handler(req: any, res: any) {
   if (req.method !== "POST") {
     return json(res, 405, { error: "Method not allowed" });
@@ -21,7 +26,8 @@ export default async function handler(req: any, res: any) {
 
   const logger = createRequestLogger("api.tikhub.batch", req.headers?.["x-request-id"]);
   const agentConfig = getContentAgentConfig();
-  const topicRequestTimeoutMs = Math.min(agentConfig.requestTimeoutMs, 25_000);
+  const topicRequestTimeoutMs = Math.min(agentConfig.requestTimeoutMs, TOPIC_PAGE_TIMEOUT_MS);
+  const topicRequestRetries = Math.min(Math.max(0, Number(agentConfig.apiRetryAttempts) || 0), TOPIC_PAGE_RETRIES);
 
   const { urls, platform, days = 7, maxPages = 20, count = 400, resume = null } = readBody(req);
   const normalizedPlatform = String(platform || "douyin").toLowerCase() === "tiktok" ? "tiktok" : "douyin";
@@ -75,7 +81,7 @@ export default async function handler(req: any, res: any) {
       ...(resolvedUsername ? { username: resolvedUsername } : {}),
       sourceUrl: sanitizedUrl,
     };
-    const slicePageBudget = secUserId ? MAX_TOPIC_SLICE_PAGES : 2;
+    const slicePageBudget = MAX_TOPIC_SLICE_PAGES;
 
     try {
 
@@ -102,7 +108,7 @@ export default async function handler(req: any, res: any) {
               appendQuery(secEndpoint, { username }),
               {
                 timeoutMs: topicRequestTimeoutMs,
-                retries: agentConfig.apiRetryAttempts,
+                retries: topicRequestRetries,
                 retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
                 logger,
                 interfaceName: "tikhub:tiktok:get_sec_user_id",
@@ -144,11 +150,13 @@ export default async function handler(req: any, res: any) {
           pageOffset: resume?.pageOffset ?? 0,
           maxVideos: count,
           expectedPageSize: 20,
+          logger,
+          logFields: { url: safeLink(sanitizedUrl), pageType: "tiktok" },
           fetchPage: (cursor: unknown, page: number) => fetchJson(
-            appendQuery(videosEndpoint, { ...videosParams, cursor }),
+            appendQuery(videosEndpoint, { ...videosParams, max_cursor: cursor }),
             {
               timeoutMs: topicRequestTimeoutMs,
-              retries: agentConfig.apiRetryAttempts,
+              retries: topicRequestRetries,
               retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
               logger,
               interfaceName: "tikhub:tiktok:fetch_user_post_videos",
@@ -187,6 +195,11 @@ export default async function handler(req: any, res: any) {
           url: safeLink(sanitizedUrl),
           secUserId,
           videosCount: videosList.length,
+          pageCount: collection.pageCount,
+          totalPageCount: collection.totalPageCount,
+          stopReason: collection.stopReason,
+          hasMore: collection.hasMore,
+          resumePageOffset: nextResume?.pageOffset ?? "",
           error: "",
         });
       } else {
@@ -197,7 +210,7 @@ export default async function handler(req: any, res: any) {
             appendQuery(secEndpoint, { url: sanitizedUrl }),
             {
               timeoutMs: topicRequestTimeoutMs,
-              retries: agentConfig.apiRetryAttempts,
+              retries: topicRequestRetries,
               retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
               logger,
               interfaceName: "tikhub:get_sec_user_id",
@@ -229,6 +242,8 @@ export default async function handler(req: any, res: any) {
           pageOffset: resume?.pageOffset ?? 0,
           maxVideos: count,
           expectedPageSize: 20,
+          logger,
+          logFields: { url: safeLink(sanitizedUrl), pageType: "douyin" },
           fetchPage: (cursor: unknown, page: number) => fetchJson(
             appendQuery(videosEndpoint, {
               sec_user_id: secUserId,
@@ -238,7 +253,7 @@ export default async function handler(req: any, res: any) {
             }),
             {
               timeoutMs: topicRequestTimeoutMs,
-              retries: agentConfig.apiRetryAttempts,
+              retries: topicRequestRetries,
               retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
               logger,
               interfaceName: "tikhub:fetch_user_post_videos",
@@ -277,6 +292,11 @@ export default async function handler(req: any, res: any) {
           url: safeLink(sanitizedUrl),
           secUserId,
           videosCount: videosList.length,
+          pageCount: collection.pageCount,
+          totalPageCount: collection.totalPageCount,
+          stopReason: collection.stopReason,
+          hasMore: collection.hasMore,
+          resumePageOffset: nextResume?.pageOffset ?? "",
           error: "",
         });
       }

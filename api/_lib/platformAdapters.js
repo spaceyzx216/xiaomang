@@ -423,6 +423,8 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
       let partialError = null;
       let partialErrorStatus = null;
       let hitVideoLimit = false;
+      let consecutiveEmptyPages = 0;
+      const MAX_CONSECUTIVE_EMPTY_PAGES = 2;
 
       for (let page = 1; page <= pageLimit && allVideos.length < limit; page += 1) {
         const logicalPage = pageOffset + page;
@@ -457,7 +459,6 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
         const data = videosResponse?.data || {};
         const videos = Array.isArray(data?.videos) ? data.videos : [];
         let addedCount = 0;
-        const newPageVideos = [];
         for (const video of videos) {
           if (allVideos.length >= limit) {
             hitVideoLimit = true;
@@ -467,15 +468,19 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
           if (seenVideoKeys.has(identity)) continue;
           seenVideoKeys.add(identity);
           allVideos.push(video);
-          newPageVideos.push(video);
           addedCount += 1;
         }
 
         const nextBuffer = String(data?.last_buffer || data?.lastBuffer || "").trim();
-        const apiHasNext = hasNextPage(data?.up_continue) || hasNextPage(data?.upContinueFlag);
+        const upContinue = data?.up_continue ?? data?.upContinueFlag;
+        const apiHasNext = hasNextPage(upContinue);
         const canAdvance = Boolean(nextBuffer) && nextBuffer !== lastBuffer && !seenBuffers.has(nextBuffer);
+        // 视频号的 up_continue 不是可靠的账号作品结束标记：它可能为 0，
+        // 但同一 last_buffer 链后仍有更早的作品。只要 last_buffer 有变化，
+        // 就必须继续续拉；真正的结束由空 buffer、重复 buffer、空页或时间边界判定。
         hasMore = Boolean(nextBuffer);
-        if (logicalPage > 1 && reachedRecentTimeBoundary(newPageVideos, recentDays, nowMs)) {
+        // 首页可能包含置顶旧作品；后续页面按时间倒序，遇到时间窗外作品即可停止。
+        if (logicalPage > 1 && reachedRecentTimeBoundary(videos, recentDays, nowMs)) {
           stopReason = "time_boundary";
           hasMore = false;
           break;
@@ -485,7 +490,20 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
           hasMore = false;
           break;
         }
-        if (videos.length === 0 || addedCount === 0) {
+        if (videos.length === 0) {
+          stopReason = "upstream_exhausted";
+          hasMore = false;
+          break;
+        }
+        if (addedCount === 0) {
+          consecutiveEmptyPages += 1;
+          // 连续多页无新增：上游 buffer 虽在前进但实际已无新内容（账号作品已取尽），
+          // 继续翻只会浪费 API 余额。
+          if (consecutiveEmptyPages >= MAX_CONSECUTIVE_EMPTY_PAGES) {
+            stopReason = "upstream_exhausted";
+            hasMore = false;
+            break;
+          }
           if (canAdvance) {
             stopReason = "duplicate_page_advanced";
             lastBuffer = nextBuffer;
@@ -494,6 +512,11 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
           }
           stopReason = "upstream_exhausted";
           hasMore = false;
+          break;
+        }
+        consecutiveEmptyPages = 0;
+        if (!hasMore) {
+          stopReason = "upstream_exhausted";
           break;
         }
         if (!canAdvance) {

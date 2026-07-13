@@ -217,6 +217,101 @@ test("continues past a duplicate-only page when the cursor advances", async () =
   assert.deepEqual(result.videos.map(video => video.aweme_id), ["a", "b"]);
 });
 
+test("prefers TikHub max_cursor over legacy cursor when continuing", async () => {
+  const cursors = [];
+  const result = await collectRecentAwemePages({
+    platform: "tiktok",
+    days: 30,
+    expectedPageSize: 1,
+    nowMs: NOW,
+    fetchPage: async (cursor, page) => {
+      cursors.push(cursor);
+      if (page === 1) {
+        return {
+          data: { data: { aweme_list: [videoAtAge("a", 1)], cursor: "legacy-cursor", max_cursor: "official-cursor", has_more: 1 } },
+        };
+      }
+      return {
+        data: { data: { aweme_list: [videoAtAge("b", 2)], max_cursor: "end", has_more: 0 } },
+      };
+    },
+  });
+
+  assert.deepEqual(cursors, [0, "official-cursor"]);
+  assert.equal(result.stopReason, "upstream_exhausted");
+  assert.deepEqual(result.videos.map(video => video.aweme_id), ["a", "b"]);
+});
+
+test("treats an empty page as upstream exhaustion even if a cursor is present", async () => {
+  let calls = 0;
+  const result = await collectRecentAwemePages({
+    platform: "douyin",
+    days: 30,
+    expectedPageSize: 1,
+    nowMs: NOW,
+    fetchPage: async (_cursor, page) => {
+      calls += 1;
+      return page === 1
+        ? { data: { data: { aweme_list: [videoAtAge("a", 1)], max_cursor: 1, has_more: 1 } } }
+        : { data: { data: { aweme_list: [], max_cursor: 2, has_more: 1 } } };
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(result.stopReason, "upstream_exhausted");
+  assert.equal(result.isComplete, true);
+  assert.deepEqual(result.videos.map(video => video.aweme_id), ["a"]);
+});
+
+test("stops after consecutive duplicate-only pages to avoid wasting API calls", async () => {
+  // 账号作品已取尽，但 TikHub 持续返回新游标 + 全是重复视频的页面。
+  // 第 1 页有新作品；随后连续两页重复时停止。允许穿过一页重叠数据，
+  // 同时避免无意义地持续调用 API。
+  let calls = 0;
+  const result = await collectRecentAwemePages({
+    platform: "douyin",
+    days: 730,
+    expectedPageSize: 20,
+    maxPages: 100,
+    nowMs: NOW,
+    fetchPage: async (_cursor, page) => {
+      calls += 1;
+      // 每页都返回同样的 2 条视频（全是已见过的重复）
+      return { data: { data: { aweme_list: [videoAtAge("a", 1), videoAtAge("b", 2)], max_cursor: page, has_more: 1 } } };
+    },
+  });
+
+  assert.equal(calls, 3);
+  assert.equal(result.stopReason, "upstream_exhausted");
+  assert.equal(result.isComplete, true);
+  assert.deepEqual(result.videos.map(video => video.aweme_id), ["a", "b"]);
+});
+
+test("resets consecutive duplicate counter when a page has new videos", async () => {
+  // 第 1 页有新视频 → consecutiveEmptyPages 重置为 0，
+  // 第 2 页重复(计数=1)，第 3 页重复(计数=2 >= 2 → 触发停止)
+  let calls = 0;
+  const result = await collectRecentAwemePages({
+    platform: "douyin",
+    days: 730,
+    expectedPageSize: 20,
+    maxPages: 100,
+    nowMs: NOW,
+    fetchPage: async (_cursor, page) => {
+      calls += 1;
+      if (page === 1) return { data: { data: { aweme_list: [videoAtAge("a", 1), videoAtAge("b", 2)], max_cursor: page, has_more: 1 } } };
+      // pages 2+ 全是重复
+      return { data: { data: { aweme_list: [videoAtAge("a", 1), videoAtAge("b", 2)], max_cursor: page, has_more: 1 } } };
+    },
+  });
+
+  // 第 1 页有新增(2 条)→重置(计数=0), 第 2 页重复(计数=1), 第 3 页重复(计数=2 >= 2 → 停止)
+  assert.equal(calls, 3);
+  assert.equal(result.stopReason, "upstream_exhausted");
+  assert.equal(result.isComplete, true);
+  assert.deepEqual(result.videos.map(v => v.aweme_id), ["a", "b"]);
+});
+
 test("keeps successful pages when a later page fails", async () => {
   const result = await collectRecentAwemePages({
     platform: "douyin",
@@ -316,6 +411,53 @@ test("wechat pagination advances beyond a duplicate-only page", async () => {
     );
 
     assert.equal(calls, 3);
+    assert.deepEqual(payload.results[0].topics.map(topic => topic.id), [
+      "wechat_channels:a",
+      "wechat_channels:b",
+    ]);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("wechat continues from last_buffer even when up_continue is zero", async () => {
+  const originalFetch = global.fetch;
+  let calls = 0;
+  const pages = [
+    { videos: [wechatVideoAtAge("a", 1)], last_buffer: "buffer-1", up_continue: 0 },
+    { videos: [wechatVideoAtAge("b", 12)], last_buffer: "buffer-2", up_continue: 0 },
+    { videos: [wechatVideoAtAge("old", 31)], last_buffer: "buffer-3", up_continue: 0 },
+  ];
+  global.fetch = async () => {
+    const page = pages[calls];
+    calls += 1;
+    return new Response(JSON.stringify({ data: page }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    const payload = await fetchPlatformTopics(
+      {
+        platform: "wechat_channels",
+        accounts: [{ inputName: "账号 A", finderUsername: "finder-a" }],
+        days: 30,
+        count: 400,
+        maxPages: 10,
+      },
+      {
+        tikhubBaseUrl: "https://example.invalid",
+        tikhubApiToken: "test-token",
+        requestTimeoutMs: 1000,
+        apiRetryAttempts: 1,
+        apiRetryBaseDelayMs: 1,
+      },
+    );
+
+    assert.equal(calls, 3);
+    assert.equal(payload.results[0].stopReason, "time_boundary");
+    assert.equal(payload.results[0].isComplete, true);
     assert.deepEqual(payload.results[0].topics.map(topic => topic.id), [
       "wechat_channels:a",
       "wechat_channels:b",

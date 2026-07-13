@@ -789,7 +789,9 @@ export default function App() {
             job.failed = true;
             job.errorMessage = result.error || result.backgroundError || "账号获取暂停";
           } else if (result.stopReason === "slice_limit" && result.resume) {
-            // 正常切片结束：保留作业，下一轮从返回游标继续。
+            // 只是一段三页切片完成，后端提供的游标应由下一轮原样续拉。
+          } else if (result.stopReason === "time_boundary" || result.stopReason === "upstream_exhausted") {
+            job.done = true;
           } else if (result.stopReason === "safety_limit" || result.isComplete === false) {
             job.done = true;
             job.warningMessage = result.incompleteReason || "已达到安全翻页上限，结果可能不完整";

@@ -61,11 +61,11 @@ export const extractAwemeList = (payload) => {
 
 const firstPresent = (...values) => values.find(value => value !== undefined && value !== null && value !== "");
 
-const extractNextCursor = (payload, platform) => {
+const extractNextCursor = (payload) => {
   const data = payload?.data || {};
-  return platform === "tiktok"
-    ? firstPresent(data?.cursor, data?.max_cursor, payload?.cursor, payload?.max_cursor)
-    : firstPresent(data?.max_cursor, data?.cursor, payload?.max_cursor, payload?.cursor);
+  // TikHub 的抖音和 TikTok APP V3 账号作品接口均以 max_cursor 续拉。
+  // 保留 cursor 作为兼容旧响应的 fallback，不能反过来优先使用它。
+  return firstPresent(data?.max_cursor, data?.cursor, payload?.max_cursor, payload?.cursor);
 };
 
 const extractHasMore = (payload) => {
@@ -165,6 +165,8 @@ export const collectRecentAwemePages = async ({
   nowMs = Date.now(),
   startCursor = 0,
   pageOffset = 0,
+  logger = null,
+  logFields = {},
 }) => {
   const recentDays = parseRecentDays(days);
   const totalPageLimit = Math.max(1, Math.min(Number(maxPages) || 20, MAX_TOPIC_PAGES));
@@ -175,11 +177,21 @@ export const collectRecentAwemePages = async ({
     Math.max(1, Math.min(Number(slicePages) || MAX_TOPIC_SLICE_PAGES, MAX_TOPIC_SLICE_PAGES)),
   );
   const videoLimit = Math.max(20, Math.min(Number(maxVideos) || 400, MAX_TOPIC_VIDEOS));
-  const pageSize = Math.max(1, Number(expectedPageSize) || 20);
   const pages = [];
   const allVideos = [];
-  const seenVideos = new Set();
   const initialCursor = startCursor ?? 0;
+  logger?.info?.("topic.pagination.start", {
+    ...logFields,
+    platform,
+    days: recentDays,
+    daysFrom: daysFrom ?? "",
+    maxPages: totalPageLimit,
+    slicePages: pageLimit,
+    maxVideos: videoLimit,
+    startCursor: String(initialCursor),
+    pageOffset: normalizedPageOffset,
+  });
+  const seenVideos = new Set();
   const seenCursors = new Set([String(initialCursor)]);
   let cursor = initialCursor;
   let hasMore = false;
@@ -187,6 +199,8 @@ export const collectRecentAwemePages = async ({
   let partialError = null;
   let partialErrorStatus = null;
   let hitVideoLimit = false;
+  let consecutiveDuplicatePages = 0;
+  const MAX_CONSECUTIVE_DUPLICATE_PAGES = 2;
 
   for (let page = 1; page <= pageLimit && allVideos.length < videoLimit; page += 1) {
     const logicalPage = normalizedPageOffset + page;
@@ -204,7 +218,6 @@ export const collectRecentAwemePages = async ({
     pages.push(pageResult);
     const pageVideos = extractAwemeList(pageResult?.data);
     let addedCount = 0;
-    const newPageVideos = [];
     for (const video of pageVideos) {
       if (allVideos.length >= videoLimit) {
         hitVideoLimit = true;
@@ -214,55 +227,123 @@ export const collectRecentAwemePages = async ({
       if (seenVideos.has(identity)) continue;
       seenVideos.add(identity);
       allVideos.push(video);
-      newPageVideos.push(video);
       addedCount += 1;
     }
 
-    const nextCursor = extractNextCursor(pageResult?.data, platform);
+    const nextCursor = extractNextCursor(pageResult?.data);
     const upstreamHasMore = extractHasMore(pageResult?.data);
     hasMore = upstreamHasMore === undefined
       ? nextCursor !== undefined && String(nextCursor) !== String(cursor)
       : upstreamHasMore;
     const canAdvance = nextCursor !== undefined && !seenCursors.has(String(nextCursor));
 
-    // 短页只有在上游明确 has_more=false 时才能视为取尽。有些账号会返回
-    // 少于 count 的页面但仍提供有效下一游标，单凭条数早停会漏作品。
-    if (pageVideos.length > 0 && pageVideos.length < pageSize && upstreamHasMore === false) {
+    logger?.debug?.("topic.pagination.page", {
+      ...logFields,
+      page: logicalPage,
+      cursor: String(cursor),
+      nextCursor: nextCursor === undefined ? "" : String(nextCursor),
+      hasMore,
+      upstreamHasMore: upstreamHasMore === undefined ? "" : String(upstreamHasMore),
+      pageVideosCount: pageVideos.length,
+      addedCount,
+      rawVideosCount: allVideos.length,
+      canAdvance,
+    });
+
+    // 首页可能混入置顶旧作品，不能据此断言后续没有新作品；其余页面按
+    // newest-first 的接口顺序，出现时间窗外作品即可安全停止。
+    if (logicalPage > 1 && reachedRecentTimeBoundary(pageVideos, recentDays, nowMs, daysFrom)) {
       hasMore = false;
-      stopReason = "upstream_exhausted";
+      stopReason = "time_boundary";
+      logger?.info?.("topic.pagination.stop", {
+        ...logFields,
+        page: logicalPage,
+        stopReason,
+        cursor: String(cursor),
+        nextCursor: nextCursor === undefined ? "" : String(nextCursor),
+        pageVideosCount: pageVideos.length,
+        addedCount,
+      });
       break;
     }
 
-    // 只有整个账号的真正第一页可以忽略置顶旧作品。续拉切片的本地第 1 页
-    // 仍使用 logicalPage > 1，因此不会重复获得“第一页例外”。先提取游标，
-    // 再判断边界，确保边界页内仍在范围中的作品已被保留。
-    if (logicalPage > 1 && reachedRecentTimeBoundary(newPageVideos, recentDays, nowMs, daysFrom)) {
+    // 空页代表账号作品已取尽。即使上游仍给了游标，也不再为不存在的作品付费。
+    if (pageVideos.length === 0) {
+      stopReason = "upstream_exhausted";
       hasMore = false;
-      stopReason = "time_boundary";
+      logger?.info?.("topic.pagination.stop", {
+        ...logFields,
+        page: logicalPage,
+        stopReason,
+        cursor: String(cursor),
+        nextCursor: nextCursor === undefined ? "" : String(nextCursor),
+        pageVideosCount: pageVideos.length,
+        addedCount,
+      });
       break;
     }
-    if (pageVideos.length === 0 || addedCount === 0) {
+
+    if (addedCount === 0) {
+      consecutiveDuplicatePages += 1;
+      // 允许穿过一次重复页，避免偶发的重叠页漏数据；连续两页都没有新作品
+      // 则视为上游已到尾部，避免在无效游标上持续消耗额度。
+      if (consecutiveDuplicatePages >= MAX_CONSECUTIVE_DUPLICATE_PAGES || !hasMore || !canAdvance) {
+        stopReason = "upstream_exhausted";
+        hasMore = false;
+        logger?.info?.("topic.pagination.stop", {
+          ...logFields,
+          page: logicalPage,
+          stopReason,
+          cursor: String(cursor),
+          nextCursor: nextCursor === undefined ? "" : String(nextCursor),
+          pageVideosCount: pageVideos.length,
+          addedCount,
+        });
+        break;
+      }
       if (hasMore && canAdvance) {
         cursor = nextCursor;
         seenCursors.add(String(cursor));
         stopReason = "duplicate_page_advanced";
+        logger?.info?.("topic.pagination.advance", {
+          ...logFields,
+          page: logicalPage,
+          stopReason,
+          cursor: String(cursor),
+          nextCursor: nextCursor === undefined ? "" : String(nextCursor),
+          pageVideosCount: pageVideos.length,
+          addedCount,
+        });
         continue;
       }
-      // 游标重复但数据已收到：上游虽暗示有更多，但无法前进，视为已取尽。
-      stopReason = "upstream_exhausted";
-      hasMore = false;
-      break;
     }
+    consecutiveDuplicatePages = 0;
+
     if (!hasMore) {
       stopReason = "upstream_exhausted";
+      logger?.info?.("topic.pagination.stop", {
+        ...logFields,
+        page: logicalPage,
+        stopReason,
+        cursor: String(cursor),
+        nextCursor: nextCursor === undefined ? "" : String(nextCursor),
+        pageVideosCount: pageVideos.length,
+        addedCount,
+      });
       break;
     }
-    // 方案 1：游标重复时不再判定为"失败"。上游已无新游标可前进，
-    // 说明该账号的可见作品已经取尽（常见于作品少的博主），数据是完整的。
-    // 旧逻辑会标记 repeated_cursor + isComplete=false，触发前端误报警告。
     if (!canAdvance) {
       stopReason = "upstream_exhausted";
       hasMore = false;
+      logger?.info?.("topic.pagination.stop", {
+        ...logFields,
+        page: logicalPage,
+        stopReason,
+        cursor: String(cursor),
+        nextCursor: nextCursor === undefined ? "" : String(nextCursor),
+        pageVideosCount: pageVideos.length,
+        addedCount,
+      });
       break;
     }
     cursor = nextCursor;
@@ -278,6 +359,18 @@ export const collectRecentAwemePages = async ({
   } else if (hasMore && pages.length >= pageLimit && stopReason !== "page_error") {
     stopReason = "slice_limit";
   }
+
+  logger?.info?.("topic.pagination.done", {
+    ...logFields,
+    stopReason,
+    hasMore,
+    pageCount: pages.length,
+    totalPageCount,
+    rawVideosCount: allVideos.length,
+    videoCount: filterRecentAwemes(allVideos, recentDays, nowMs, daysFrom).length,
+    startCursor: String(initialCursor),
+    endCursor: String(cursor),
+  });
 
   const videos = filterRecentAwemes(allVideos, recentDays, nowMs, daysFrom);
   const isComplete = !["slice_limit", "safety_limit", "page_error"].includes(stopReason);

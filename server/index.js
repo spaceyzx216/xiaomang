@@ -46,6 +46,8 @@ const apiToken = process.env.TIKHUB_API_TOKEN || "";
 const apiRetryAttempts = Number.parseInt(process.env.AGENT_API_RETRY_ATTEMPTS || "2", 10);
 const apiRetryBaseDelayMs = Number.parseInt(process.env.AGENT_API_RETRY_BASE_DELAY_MS || "500", 10);
 const startupAgentConfig = getContentAgentConfig();
+const TOPIC_PAGE_TIMEOUT_MS = 20_000;
+const TOPIC_PAGE_RETRIES = 1;
 createRequestLogger("server", "startup").info("server.config", {
   port,
   contentProvider: startupAgentConfig.provider,
@@ -137,8 +139,8 @@ app.post("/api/tikhub/batch", async (req, res) => {
   }
 
   const fetchOpts = {
-    timeoutMs: Math.min(startupAgentConfig.requestTimeoutMs, 25_000),
-    retries: Number.isFinite(apiRetryAttempts) ? apiRetryAttempts : 2,
+    timeoutMs: Math.min(startupAgentConfig.requestTimeoutMs, TOPIC_PAGE_TIMEOUT_MS),
+    retries: Math.min(Math.max(0, Number.isFinite(apiRetryAttempts) ? apiRetryAttempts : 1), TOPIC_PAGE_RETRIES),
     retryBaseDelayMs: Number.isFinite(apiRetryBaseDelayMs) ? apiRetryBaseDelayMs : 500,
     logger,
     headers: { Authorization: `Bearer ${apiToken}` },
@@ -170,7 +172,7 @@ app.post("/api/tikhub/batch", async (req, res) => {
       ...(resolvedUsername ? { username: resolvedUsername } : {}),
       sourceUrl: sanitizedUrl,
     };
-    const slicePageBudget = secUserId ? MAX_TOPIC_SLICE_PAGES : 2;
+    const slicePageBudget = MAX_TOPIC_SLICE_PAGES;
 
     try {
 
@@ -226,8 +228,10 @@ app.post("/api/tikhub/batch", async (req, res) => {
           pageOffset: resume?.pageOffset ?? 0,
           maxVideos: count,
           expectedPageSize: 20,
+          logger,
+          logFields: { url: safeLink(sanitizedUrl), pageType: "tiktok" },
           fetchPage: (cursor, page) => fetchJson(
-            appendQuery(videosEndpoint, { ...videosParams, cursor }),
+            appendQuery(videosEndpoint, { ...videosParams, max_cursor: cursor }),
             {
               ...fetchOpts,
               interfaceName: "tikhub:tiktok:fetch_user_post_videos",
@@ -265,6 +269,11 @@ app.post("/api/tikhub/batch", async (req, res) => {
           url: safeLink(sanitizedUrl),
           secUserId,
           videosCount: videosList.length,
+          pageCount: collection.pageCount,
+          totalPageCount: collection.totalPageCount,
+          stopReason: collection.stopReason,
+          hasMore: collection.hasMore,
+          resumePageOffset: nextResume?.pageOffset ?? "",
           error: "",
         });
       } else {
@@ -305,6 +314,8 @@ app.post("/api/tikhub/batch", async (req, res) => {
           pageOffset: resume?.pageOffset ?? 0,
           maxVideos: count,
           expectedPageSize: 20,
+          logger,
+          logFields: { url: safeLink(sanitizedUrl), pageType: "douyin" },
           fetchPage: (cursor, page) => fetchJson(
             appendQuery(videosEndpoint, {
               sec_user_id: secUserId,
@@ -349,6 +360,11 @@ app.post("/api/tikhub/batch", async (req, res) => {
           url: safeLink(sanitizedUrl),
           secUserId,
           videosCount: videosList.length,
+          pageCount: collection.pageCount,
+          totalPageCount: collection.totalPageCount,
+          stopReason: collection.stopReason,
+          hasMore: collection.hasMore,
+          resumePageOffset: nextResume?.pageOffset ?? "",
           error: "",
         });
       }
