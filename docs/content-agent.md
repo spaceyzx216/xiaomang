@@ -8,6 +8,7 @@ The frontend posts to `/api/agent/workflow/stream-run`, and the server returns a
 1. Split `_input.share_links` or `parameters.share_links` by line.
 2. Resolve each Douyin or TikTok share link with TikHub and obtain title, cover, and playable video URL.
 3. Generate transcript with ordered providers:
+   - `tikhub-music`: the fastest path — downloads the `music.play_url` mp3 direct link (returned by TikHub's APP V3 endpoint) and sends it straight to Doubao flash ASR, skipping ffmpeg audio extraction entirely (~12x faster than `tikhub-ffmpeg`). When the music track is background-only with no vocals, ASR returns empty and the provider chain falls back to `tikhub-ffmpeg` automatically.
    - `tikhub-ffmpeg`: for TikHub-returned TikTok/ByteDance CDN URLs, keep multiple playable CDN candidates, fetch media with Node retry logic, and stream it into bundled `ffmpeg-static`, then call Doubao flash ASR with base64 audio. It starts with a fast ffmpeg probe and retries once with conservative probing only for ffmpeg probe/decode failures. If one CDN candidate fails to download, it quickly moves to the next candidate. With `ASR_AUDIO_FORMAT=auto`, it tries WAV first for short media and falls back to MP3 when WAV is too large or ASR rejects it.
    - `ffmpeg`: generic fallback that lets `ffmpeg-static` read stable direct video URLs, then calls Doubao flash ASR.
    - `doubao-video`: fallback to `doubao-seed-2-0-mini-260428` directly against the video URL and ask it to reconstruct the spoken script.
@@ -69,6 +70,7 @@ TIKHUB_BASE_URL=https://api.tikhub.dev
 TIKHUB_API_TOKEN=...
 TRANSCRIPT_PROVIDERS=tikhub-ffmpeg,ffmpeg,doubao-video
 TIKHUB_TRANSCRIPT_PROVIDER_ENABLED=true
+TIKHUB_MUSIC_PROVIDER_ENABLED=true
 FFMPEG_FAST_PROBE_SIZE=4194304
 FFMPEG_FAST_ANALYZE_DURATION=3000000
 ASR_AUDIO_FORMAT=auto

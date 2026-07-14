@@ -242,6 +242,7 @@ test("configures TikHub media provider, ffmpeg fallback, and Doubao video fallba
     DOUBAO_VIDEO_ENDPOINT: process.env.DOUBAO_VIDEO_ENDPOINT,
     DOUBAO_VIDEO_API_KEY: process.env.DOUBAO_VIDEO_API_KEY,
     TIKHUB_TRANSCRIPT_PROVIDER_ENABLED: process.env.TIKHUB_TRANSCRIPT_PROVIDER_ENABLED,
+    TIKHUB_MUSIC_PROVIDER_ENABLED: process.env.TIKHUB_MUSIC_PROVIDER_ENABLED,
     FFMPEG_FAST_PROBE_SIZE: process.env.FFMPEG_FAST_PROBE_SIZE,
     FFMPEG_FAST_ANALYZE_DURATION: process.env.FFMPEG_FAST_ANALYZE_DURATION,
     ASR_AUDIO_FORMAT: process.env.ASR_AUDIO_FORMAT,
@@ -254,6 +255,7 @@ test("configures TikHub media provider, ffmpeg fallback, and Doubao video fallba
   try {
     process.env.TRANSCRIPT_PROVIDERS = "legacy-provider,ffmpeg,doubao-video";
     delete process.env.TIKHUB_TRANSCRIPT_PROVIDER_ENABLED;
+    delete process.env.TIKHUB_MUSIC_PROVIDER_ENABLED;
     process.env.FFMPEG_FAST_PROBE_SIZE = "2M";
     process.env.FFMPEG_FAST_ANALYZE_DURATION = "750k";
     process.env.ASR_AUDIO_FORMAT = "auto";
@@ -269,7 +271,9 @@ test("configures TikHub media provider, ffmpeg fallback, and Doubao video fallba
     process.env.DOUBAO_VIDEO_API_KEY = "test-key";
 
     const config = getContentAgentConfig();
-    assert.deepEqual(config.transcriptProviders, ["tikhub-ffmpeg", "ffmpeg", "doubao-video"]);
+    // TIKHUB_TRANSCRIPT_PROVIDER_ENABLED + TIKHUB_MUSIC_PROVIDER_ENABLED 默认均为 true：
+    // tikhub-music → tikhub-ffmpeg → ffmpeg → doubao-video
+    assert.deepEqual(config.transcriptProviders, ["tikhub-music", "tikhub-ffmpeg", "ffmpeg", "doubao-video"]);
     assert.equal(config.ffmpegFastProbeSize, "2M");
     assert.equal(config.ffmpegFastAnalyzeDuration, "750k");
     assert.equal(config.asrAudioFormat, "auto");

@@ -30,14 +30,22 @@ const normalizeTranscriptProvider = (value) => {
 };
 
 const getTranscriptProviders = () => {
-  const allowed = new Set(["tikhub-ffmpeg", "ffmpeg", "doubao-video"]);
+  const allowed = new Set(["tikhub-music", "tikhub-ffmpeg", "ffmpeg", "doubao-video"]);
   const enableTikHubProvider = String(process.env.TIKHUB_TRANSCRIPT_PROVIDER_ENABLED || "true").toLowerCase() !== "false";
+  // tikhub-music 用 music.play_url mp3 直送 ASR，跳过 ffmpeg 提取（实测快约 12 倍）。
+  // 默认开启。music 是纯背景音乐（无人声）时 ASR 返回空，provider 链自动回退到 tikhub-ffmpeg。
+  // 如需关闭设 TIKHUB_MUSIC_PROVIDER_ENABLED=false。
+  const enableMusicProvider = String(process.env.TIKHUB_MUSIC_PROVIDER_ENABLED || "true").toLowerCase() !== "false";
   const providers = splitCsv(process.env.TRANSCRIPT_PROVIDERS, ["ffmpeg", "doubao-video"])
     .map(normalizeTranscriptProvider)
     .filter(item => allowed.has(item));
   const normalized = providers.length > 0 ? providers : ["ffmpeg", "doubao-video"];
   if (enableTikHubProvider && normalized.includes("ffmpeg") && !normalized.includes("tikhub-ffmpeg")) {
     normalized.unshift("tikhub-ffmpeg");
+  }
+  // tikhub-music 插入链首（优先于 tikhub-ffmpeg），ASR 返回空时自动回退
+  if (enableMusicProvider && normalized.includes("tikhub-ffmpeg") && !normalized.includes("tikhub-music")) {
+    normalized.unshift("tikhub-music");
   }
   return Array.from(new Set(normalized));
 };

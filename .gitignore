@@ -4,8 +4,10 @@ dist
 .DS_Store
 .env
 .env.*
+!.env.example
 server/.env
 server/.env.*
+!server/.env.example
 .idea
 .git.broken-backup
 gitdata

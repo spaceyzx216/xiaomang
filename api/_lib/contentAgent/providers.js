@@ -321,6 +321,11 @@ const extractVideoMeta = (payload, shareLink) => {
     }
   }
 
+  // music.play_url：抖音单独返回的原声音频 mp3 直链（douyinstatic.com/obj/ies-music/*.mp3）。
+  // 用于 tikhub-music provider 实验：直接下载 mp3 送 ASR，跳过 ffmpeg 提取（省 55s+）。
+  // 风险：可能是纯背景音乐无人声，ASR 返回空时 provider 链会自动回退到 tikhub-ffmpeg。
+  const musicUrl = firstByPath(data, [/music.*play_url.*url_list/i], isHttpUrl) || "";
+
   return {
     awemeId: extractAwemeId(data, shareLink),
     title,
@@ -329,6 +334,7 @@ const extractVideoMeta = (payload, shareLink) => {
     videoUrls,
     videoUrlSizes,
     videoUrlPriorities,
+    musicUrl,
     raw: data,
   };
 };
@@ -353,6 +359,7 @@ const mergeMeta = (base, next, options = {}) => {
     videoUrls,
     videoUrlSizes,
     videoUrlPriorities,
+    musicUrl: base.musicUrl || next.musicUrl || "",
     raw: base.raw || next.raw || null,
   };
 };
@@ -757,6 +764,9 @@ const fetchBinary = async (url, config, options = {}) => {
   const logger = options.logger;
   const maxAttempts = Math.max(1, Number(config.apiRetryAttempts || 0) + 1);
   const maxBytes = Number(config.wechatMediaMaxBytes || 220 * 1024 * 1024);
+  const interfaceName = options.interfaceName || "wechat_channels:media-download";
+  const errorLabel = options.errorLabel || "WeChat Channels media";
+  const failureCode = options.failureCode || "WECHAT_MEDIA_DOWNLOAD_FAILED";
   let lastError = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -764,7 +774,7 @@ const fetchBinary = async (url, config, options = {}) => {
     const startedAt = Date.now();
     const endpoint = mediaEndpointForLogs(url);
     logger?.info("external.request.start", {
-      interface: "wechat_channels:media-download",
+      interface: interfaceName,
       method: "GET",
       endpoint,
       attempt,
@@ -775,28 +785,28 @@ const fetchBinary = async (url, config, options = {}) => {
       const response = await fetch(url, { signal: timeout.signal });
       const contentLength = Number(response.headers.get("content-length") || 0);
       if (contentLength > maxBytes) {
-        throw new AgentError("WeChat Channels media exceeded download limit", {
+        throw new AgentError(`${errorLabel} exceeded download limit`, {
           code: "WECHAT_MEDIA_TOO_LARGE",
           status: 413,
           details: { contentLength, maxBytes },
         });
       }
       if (!response.ok) {
-        throw new AgentError(`HTTP ${response.status} from WeChat Channels media`, {
+        throw new AgentError(`HTTP ${response.status} from ${errorLabel}`, {
           code: "HTTP_ERROR",
           status: response.status,
         });
       }
       const buffer = Buffer.from(await response.arrayBuffer());
       if (buffer.length > maxBytes) {
-        throw new AgentError("WeChat Channels media exceeded download limit", {
+        throw new AgentError(`${errorLabel} exceeded download limit`, {
           code: "WECHAT_MEDIA_TOO_LARGE",
           status: 413,
           details: { bytes: buffer.length, maxBytes },
         });
       }
       logger?.info("external.request.end", {
-        interface: "wechat_channels:media-download",
+        interface: interfaceName,
         method: "GET",
         endpoint,
         status: response.status,
@@ -809,7 +819,7 @@ const fetchBinary = async (url, config, options = {}) => {
     } catch (error) {
       lastError = error;
       logger?.warn("external.request.error", {
-        interface: "wechat_channels:media-download",
+        interface: interfaceName,
         method: "GET",
         endpoint,
         durationMs: Date.now() - startedAt,
@@ -827,7 +837,7 @@ const fetchBinary = async (url, config, options = {}) => {
 
   throw lastError instanceof Error
     ? lastError
-    : new AgentError("WeChat Channels media download failed", { code: "WECHAT_MEDIA_DOWNLOAD_FAILED" });
+    : new AgentError(`${errorLabel} download failed`, { code: failureCode });
 };
 
 /**
@@ -1523,8 +1533,25 @@ export const transcribeVideo = async (videoMeta, config, options = {}) => {
   const prepared = await prepareVideoInput(videoMeta, config, { logger });
   const providers = Array.isArray(config.transcriptProviders) ? config.transcriptProviders : [];
   const hasTikHubProvider = providers.includes("tikhub-ffmpeg");
+  const hasMusicProvider = providers.includes("tikhub-music");
   try {
     for (const provider of providers) {
+      if (provider === "tikhub-music" && !videoMeta.musicUrl) {
+        logger?.info("transcript.provider.skipped", {
+          provider,
+          reason: "no music.play_url available (non-TikHub video or missing field)",
+          videoTitle: videoMeta.title,
+        });
+        continue;
+      }
+      if (provider === "tikhub-music" && isWeChatChannelsVideo(videoMeta)) {
+        logger?.info("transcript.provider.skipped", {
+          provider,
+          reason: "tikhub-music only applies to douyin/tiktok videos",
+          videoTitle: videoMeta.title,
+        });
+        continue;
+      }
       if (provider === "tikhub-ffmpeg" && !shouldUseTikHubFfmpegProvider(videoMeta)) {
         logger?.info("transcript.provider.skipped", {
           provider,
@@ -1556,6 +1583,52 @@ export const transcribeVideo = async (videoMeta, config, options = {}) => {
           provider,
           message: `尝试转写方案：${provider}`,
         });
+        if (provider === "tikhub-music") {
+          // tikhub-music：直接下载 music.play_url 的 mp3 → base64 → 送 ASR，跳过 ffmpeg 提取。
+          // 若 ASR 返回空（纯背景音乐无人声），抛 DOUBAO_ASR_EMPTY → provider 链自动回退到 tikhub-ffmpeg。
+          logger?.info("tikhub.music.download.start", {
+            musicUrl: describeVideoUrlForDiagnostics(videoMeta.musicUrl),
+            title: videoMeta.title,
+          });
+          const buffer = await fetchBinary(videoMeta.musicUrl, config, {
+            logger,
+            interfaceName: "tikhub:music-download",
+            errorLabel: "TikHub music audio",
+            failureCode: "TIKHUB_MUSIC_DOWNLOAD_FAILED",
+          });
+          // 极小文件（<1KB）说明不是有效音频，直接跳过让回退
+          if (buffer.length < 1024) {
+            throw new AgentError("TikHub music audio too small, likely invalid", {
+              code: "MUSIC_AUDIO_TOO_SMALL",
+              details: { bytes: buffer.length },
+            });
+          }
+          onProgress({
+            step: "audio-extracted",
+            provider,
+            audioBytes: buffer.length,
+            message: `music.play_url 已下载 ${buffer.length} 字节 mp3，直接调用豆包 ASR（跳过 ffmpeg）`,
+          });
+          const asr = await recognizeDoubaoAudio(
+            { audioDataBase64: buffer.toString("base64"), audioFormat: "mp3", audioBytes: buffer.length },
+            config,
+            { logger },
+          );
+          const value = { ...asr, provider: "tikhub-music+doubao-asr:mp3", warnings };
+          logger?.info("transcript.provider.success", {
+            provider: value.provider,
+            textLength: value.text.length,
+            duration: value.duration,
+            audioBytes: buffer.length,
+          });
+          onProgress({
+            step: "transcript-provider-success",
+            provider: value.provider,
+            message: `转写方案成功：${value.provider}`,
+          });
+          transcriptCache.set(cacheKey, { createdAt: Date.now(), value });
+          return value;
+        }
         if (provider === "tikhub-ffmpeg") {
           const audioFormats = tikhubAudioFormatAttempts(config);
           let lastAudioFormatError = null;
