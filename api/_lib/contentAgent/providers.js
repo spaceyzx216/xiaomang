@@ -254,6 +254,24 @@ const extractAwemeId = (payload, shareLink) => {
   );
 };
 
+// 抖音/视频号 URL 的来源类型分级，用于候选排序。
+// 抖音使用 MPEG-DASH 分离音画：高码率 play_addr variant 可能是纯视频流（无音频），
+// 而 download_addr 是音视频合成流、music.play_url 是纯音频直链。
+// 转写只需音频，故按"含音频的确定性"分级，而非画质/码率。
+// 数值越小优先级越高（0 最先试）。
+const urlSourcePriority = path => {
+  // music.play_url：纯音频直链（mp3），无需 ffmpeg 提取，确定性最高
+  if (/music.*play_url/i.test(path)) return 0;
+  // download_addr：音视频合成流，ffprobe 实测含 audio 流
+  if (/download_addr/i.test(path)) return 1;
+  // bit_rate 数组里的非 original 档位：低/中码率合成流，通常含音频
+  if (/bit_rate\[\d+\]/i.test(path) && !/original/i.test(path)) return 2;
+  // play_addr（顶层）：可能是纯视频 DASH 流，音频不确定
+  if (/play_addr/i.test(path)) return 3;
+  // 其余未知来源（含 high_quality 端点返回的裸 URL）排最后
+  return 4;
+};
+
 const extractVideoMeta = (payload, shareLink) => {
   const data = payload?.data ?? payload;
   const strings = collectStrings(data);
@@ -264,7 +282,7 @@ const extractVideoMeta = (payload, shareLink) => {
       value => value.length > 0 && value.length < 600 && !isHttpUrl(value),
     ) || "";
   const cover = strings.find(item => isImageUrl(item.value))?.value || "";
-  // URL 选择优先级：
+  // URL 选择优先级（videoUrls 数组顺序，用于 videoUrl 首选 + 兜底）：
   //   1. .mp4 直链（最稳，ffmpeg/doubao 都能直接用）
   //   2. CDN 直链（tiktokcdn/bytecdn 等真实视频流，TikTok 常见，不以 .mp4 结尾但可访问）
   //   3. play_addr/download_addr 里的跳转链接（含 aweme/v1/play，部分场景可用作兜底）
@@ -280,12 +298,37 @@ const extractVideoMeta = (payload, shareLink) => {
   ]);
   const videoUrl = videoUrls[0] || "";
 
+  // 为每个 URL 记录来源类型优先级和文件大小，供 getTikHubMediaCandidates 做复合排序：
+  //   主排序键 = urlSourcePriority（music/download_addr > play_addr > 未知）
+  //   次排序键 = data_size 升序（同类型内小文件优先，转写不需高画质）
+  // 抖音 API 中 data_size 与 url_list 同级，配对规则：把 path 末尾 .url_list[N]/.url 替换为 .data_size。
+  const sizeByPath = {};
+  for (const item of strings) {
+    if (/\.data_size$/i.test(item.path) && /^\d+$/.test(item.value)) {
+      sizeByPath[item.path] = Number(item.value);
+    }
+  }
+  const videoUrlSizes = {};
+  const videoUrlPriorities = {};
+  for (const item of strings) {
+    if (!isHttpUrl(item.value)) continue;
+    const sizePath = item.path
+      .replace(/\.url_list\[\d+\]$/i, ".data_size")
+      .replace(/\.url$/i, ".data_size");
+    if (sizeByPath[sizePath]) videoUrlSizes[item.value] = sizeByPath[sizePath];
+    if (videoUrlPriorities[item.value] === undefined) {
+      videoUrlPriorities[item.value] = urlSourcePriority(item.path);
+    }
+  }
+
   return {
     awemeId: extractAwemeId(data, shareLink),
     title,
     cover,
     videoUrl,
     videoUrls,
+    videoUrlSizes,
+    videoUrlPriorities,
     raw: data,
   };
 };
@@ -298,6 +341,9 @@ const mergeMeta = (base, next, options = {}) => {
     next.videoUrl,
     base.videoUrl,
   ]);
+  // 合并 url→size/priority 映射：next 优先（preferVideo 端点的 data_size 更准确），再补 base
+  const videoUrlSizes = { ...(base.videoUrlSizes || {}), ...(next.videoUrlSizes || {}) };
+  const videoUrlPriorities = { ...(base.videoUrlPriorities || {}), ...(next.videoUrlPriorities || {}) };
   return {
     ...base,
     awemeId: base.awemeId || next.awemeId || "",
@@ -305,6 +351,8 @@ const mergeMeta = (base, next, options = {}) => {
     cover: base.cover || next.cover || "",
     videoUrl: preferVideo ? next.videoUrl || base.videoUrl || "" : base.videoUrl || next.videoUrl || "",
     videoUrls,
+    videoUrlSizes,
+    videoUrlPriorities,
     raw: base.raw || next.raw || null,
   };
 };
@@ -342,13 +390,11 @@ export const buildTikHubVideoAttempts = (shareLink, platform, config) => {
       },
     ];
   }
-  // 默认抖音：混合端点 + douyin app/web 端点
+  // 默认抖音：优先用字段最全的 APP V3 端点（含 data_size + download_addr + bit_rate）。
+  // 已移除 fetch_video_high_quality_play_url（web/app）：调研确认它返回的最高画质直链
+  // 最可能是纯视频 DASH 流（无音频），且不返回 data_size，对转写有害无益。
+  // hybrid 端点作为兜底保留（自动判定，多数走 APP V3）。
   return [
-    {
-      path: "/api/v1/hybrid/video_data",
-      params: { url: shareLink, minimal: false },
-      preferVideo: false,
-    },
     {
       path: "/api/v1/douyin/app/v3/fetch_one_video_by_share_url",
       params: { share_url: shareLink },
@@ -360,14 +406,9 @@ export const buildTikHubVideoAttempts = (shareLink, platform, config) => {
       preferVideo: false,
     },
     {
-      path: "/api/v1/douyin/web/fetch_video_high_quality_play_url",
-      params: { share_url: shareLink, region: config.tikhubRegion },
-      preferVideo: true,
-    },
-    {
-      path: "/api/v1/douyin/app/v3/fetch_video_high_quality_play_url",
-      params: { share_url: shareLink, region: config.tikhubRegion },
-      preferVideo: true,
+      path: "/api/v1/hybrid/video_data",
+      params: { url: shareLink, minimal: false },
+      preferVideo: false,
     },
   ];
 };
@@ -393,7 +434,10 @@ export const resolveTikHubVideo = async (shareLink, config, options = {}) => {
     try {
       const payload = await fetchTikHub(attempt.path, attempt.params, config, logger);
       meta = mergeMeta(meta, extractVideoMeta(payload, shareLink), { preferVideo: attempt.preferVideo });
-      if (meta.title && meta.cover && meta.videoUrl && attempt.preferVideo) break;
+      // 拿到完整信息（标题 + 封面 + 可用视频 URL）即提前结束，避免无谓的串行调用。
+      // 旧的 break 条件要求 attempt.preferVideo，是因为旧列表里有专门拿高清直链的端点；
+      // 现在该端点已移除（返回纯视频流对转写有害），故改为信息完整即 break。
+      if (meta.title && meta.cover && meta.videoUrl) break;
     } catch (error) {
       warnings.push({
         provider: "tikhub",
@@ -954,10 +998,27 @@ export const shouldStreamVideoInputForFfmpeg = value => isCdnDirectVideoUrl(valu
 const shouldUseTikHubFfmpegProvider = videoMeta =>
   videoMeta?.sourceProvider === "tikhub" && getTikHubMediaCandidates(videoMeta).some(shouldStreamVideoInputForFfmpeg);
 
-const getTikHubMediaCandidates = videoMeta => uniqueStrings([
-  ...(Array.isArray(videoMeta?.videoUrls) ? videoMeta.videoUrls : []),
-  videoMeta?.videoUrl,
-]).filter(shouldStreamVideoInputForFfmpeg);
+const getTikHubMediaCandidates = videoMeta => {
+  const sizes = videoMeta?.videoUrlSizes || {};
+  const priorities = videoMeta?.videoUrlPriorities || {};
+  return uniqueStrings([
+    ...(Array.isArray(videoMeta?.videoUrls) ? videoMeta.videoUrls : []),
+    videoMeta?.videoUrl,
+  ])
+    .filter(shouldStreamVideoInputForFfmpeg)
+    .sort((a, b) => {
+      // 复合排序：先按来源类型优先级（music/download_addr > play_addr > 未知），
+      // 再按文件大小升序（同类型内小文件优先，转写不需高画质）。
+      // 无信息的 URL 排最后，但不会被丢弃。
+      // 这是解决抖音 DASH 音画分离问题的关键：避免选到纯视频流（无音频）的高码率 URL。
+      const pa = priorities[a] ?? 4;
+      const pb = priorities[b] ?? 4;
+      if (pa !== pb) return pa - pb;
+      const sa = sizes[a] || Infinity;
+      const sb = sizes[b] || Infinity;
+      return sa - sb;
+    });
+};
 
 const audioOutputLimitBytes = (config, audioFormat) => {
   const format = normalizeAudioFormat(audioFormat);
@@ -995,7 +1056,7 @@ const describeInvalidAudio = (buffer, audioFormat) => {
 
 const extractAudioFromFetchedMedia = async (videoUrl, config, options = {}) => {
   const logger = options.logger;
-  const { body, cancelTimeout } = await fetchMediaResponse(videoUrl, config, {
+  const { body, contentLength, cancelTimeout } = await fetchMediaResponse(videoUrl, config, {
     logger,
     interfaceName: options.interfaceName || "video:media-download-stream",
     errorLabel: options.errorLabel || "video media",
@@ -1003,6 +1064,17 @@ const extractAudioFromFetchedMedia = async (videoUrl, config, options = {}) => {
     failureCode: options.failureCode || "MEDIA_DOWNLOAD_FAILED",
     headers: VIDEO_STREAM_FETCH_HEADERS,
   });
+  // 方案 B：超大文件预警。配合方案 A 的 URL 按大小排序，正常情况下小文件已优先命中，
+  // 只有所有小文件都失败时才会试到大文件。这里只记录警告，不硬拒绝（避免误伤正常高清视频）。
+  const largeThreshold = Number(config.tikhubMediaLargeBytes || 50 * 1024 * 1024);
+  if (contentLength > largeThreshold) {
+    logger?.warn("media.download.large_file", {
+      interface: options.interfaceName || "video:media-download-stream",
+      contentLength,
+      threshold: largeThreshold,
+      ...describeVideoUrlForDiagnostics(videoUrl),
+    });
+  }
   const inputStream = toNodeReadable(body);
 
   try {
@@ -1076,7 +1148,7 @@ const extractAudioWithTikHubFfmpegProvider = async (videoMeta, config, options =
     inputLabel: "tikhub-media-stream",
     maxAttempts: 1,
   };
-  const candidates = getTikHubMediaCandidates(videoMeta).slice(0, Math.max(1, Number(config.tikhubMediaUrlMaxAttempts || 6)));
+  const candidates = getTikHubMediaCandidates(videoMeta).slice(0, Math.max(1, Number(config.tikhubMediaUrlMaxAttempts || 2)));
   let lastError = null;
 
   for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {

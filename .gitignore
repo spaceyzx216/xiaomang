@@ -10,3 +10,4 @@ server/.env.*
 .git.broken-backup
 gitdata
 .codegraph
+.zcode/

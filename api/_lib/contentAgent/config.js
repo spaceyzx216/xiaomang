@@ -68,7 +68,10 @@ export const getContentAgentConfig = () => {
     ffmpegFastAnalyzeDuration: toFfmpegSize(process.env.FFMPEG_FAST_ANALYZE_DURATION, "3000000"),
     asrAudioFormat: normalizeAsrAudioFormat(process.env.ASR_AUDIO_FORMAT || "auto"),
     asrWavMaxBytes: toInt(process.env.ASR_WAV_MAX_BYTES, 20 * 1024 * 1024),
-    tikhubMediaUrlMaxAttempts: toInt(process.env.TIKHUB_MEDIA_URL_MAX_ATTEMPTS, 6),
+    tikhubMediaUrlMaxAttempts: toInt(process.env.TIKHUB_MEDIA_URL_MAX_ATTEMPTS, 2),
+    // TikHub CDN 媒体下载大小预警阈值（仅日志，不硬拒绝）。
+    // 超过此值的文件会被标记为「超大」，配合 URL 按大小排序，确保只有小文件全失败时才回退到大文件。
+    tikhubMediaLargeBytes: toInt(process.env.TIKHUB_MEDIA_LARGE_BYTES, 50 * 1024 * 1024),
     mediaProxyUrl: process.env.TIKTOK_MEDIA_PROXY_URL || process.env.TIKHUB_MEDIA_PROXY_URL || process.env.MEDIA_PROXY_URL || "",
     mediaUseEnvProxy: String(process.env.MEDIA_USE_ENV_PROXY || "true").toLowerCase() !== "false",
     wechatMediaMaxBytes: toInt(process.env.WECHAT_CHANNELS_MEDIA_MAX_BYTES, 220 * 1024 * 1024),
