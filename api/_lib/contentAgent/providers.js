@@ -608,9 +608,9 @@ export const buildFfmpegAudioExtractArgs = ({ input = "pipe:0", fastProbe = fals
   if (fastProbe) {
     args.push(
       "-probesize",
-      String(config.ffmpegFastProbeSize || "1048576"),
+      String(config.ffmpegFastProbeSize || "4194304"),
       "-analyzeduration",
-      String(config.ffmpegFastAnalyzeDuration || "1000000"),
+      String(config.ffmpegFastAnalyzeDuration || "3000000"),
     );
   }
   args.push(
@@ -968,6 +968,31 @@ const audioOutputLimitBytes = (config, audioFormat) => {
 const audioOutputLimitCode = audioFormat =>
   normalizeAudioFormat(audioFormat) === "wav" ? "ASR_WAV_TOO_LARGE" : "FFMPEG_OUTPUT_TOO_LARGE";
 
+// ffmpeg 在 fast-probe（probesize/analyzeduration 很小）模式下，遇到无音轨或探测不到
+// 音频流的视频时，可能 exit code === 0 却只写出文件头、没有有效采样帧。这种「空壳音频」
+// 字节数 > 0，能绕过旧的 buffer.length === 0 校验，最终让豆包 ASR 报 11105 empty audio。
+// 这里按格式给一个最小有效字节数阈值，低于它即视为无效音频，提前拒绝并走向兜底。
+//
+// 阈值取值依据：
+//  - wav：标准 PCM 头 44 字节 + 至少 1 秒 mono/16k/16bit 采样 ≈ 32000 字节。留足余量。
+//  - mp3：无固定头开销，一段有效 mp3 至少包含若干帧 + 一定持续时长，取保守下限。
+const audioOutputMinBytes = audioFormat => {
+  const format = normalizeAudioFormat(audioFormat);
+  if (format === "wav") return 32 * 1024; // 32KB：覆盖 44 字节头 + ≥1s 单声道 16kHz 采样
+  return 8 * 1024; // 8KB：mp3 一段有实际时长的音频，远大于纯头/单帧
+};
+
+// 判断 ffmpeg 输出的音频 buffer 是否「有效」：非零、且达到该格式的最小阈值。
+// 无效时返回一个描述原因的字符串；有效时返回 null。
+const describeInvalidAudio = (buffer, audioFormat) => {
+  if (!buffer || buffer.length === 0) return "ffmpeg produced empty audio";
+  const minBytes = audioOutputMinBytes(audioFormat);
+  if (buffer.length < minBytes) {
+    return `ffmpeg produced invalid audio: only ${buffer.length} bytes (below ${minBytes} threshold for ${normalizeAudioFormat(audioFormat)})`;
+  }
+  return null;
+};
+
 const extractAudioFromFetchedMedia = async (videoUrl, config, options = {}) => {
   const logger = options.logger;
   const { body, cancelTimeout } = await fetchMediaResponse(videoUrl, config, {
@@ -1010,12 +1035,29 @@ const tikhubAudioFormatAttempts = config => {
   return ["wav", "mp3"];
 };
 
-const shouldFallbackAudioFormat = error => (
-  error?.code === "ASR_WAV_TOO_LARGE" ||
-  error?.code === "DOUBAO_ASR_EMPTY" ||
-  error?.code === "DOUBAO_ASR_FAILED" ||
-  String(error?.details?.statusCode || "") === "45000151"
-);
+// 豆包 ASR 返回的错误子码，嵌入在 details.apiMessage 里，形如 "code: 11105 message: empty audio"。
+// 提取它以区分「换一种音频格式可能解决」和「上游压根没提到音频」两类失败。
+const DOUBAO_ASR_EMPTY_AUDIO_SUBCODE = "11105"; // empty audio —— ffmpeg 提出的是空壳，换格式无济于事
+
+const doubaoAsrSubCode = (error) => {
+  const message = String(error?.details?.apiMessage || "");
+  const match = message.match(/code:\s*(\d+)/i);
+  return match ? match[1] : "";
+};
+
+const shouldFallbackAudioFormat = error => {
+  if (error?.code === "ASR_WAV_TOO_LARGE") return true;
+  if (error?.code === "DOUBAO_ASR_EMPTY") return true;
+  // DOUBAO_ASR_FAILED 是个宽泛码，需要再细分子码：
+  //  - 11105 empty audio：ffmpeg 提出的是空/坏音频，换 wav/mp3 也不会变好，
+  //    不应触发格式回退，直接走向兜底 provider。
+  //  - 其余（如 11103 convert failed、45000151 等）：换格式可能有效，回退。
+  if (error?.code === "DOUBAO_ASR_FAILED") {
+    return doubaoAsrSubCode(error) !== DOUBAO_ASR_EMPTY_AUDIO_SUBCODE;
+  }
+  if (String(error?.details?.statusCode || "") === "45000151") return true;
+  return false;
+};
 
 const extractAudioWithTikHubFfmpegProvider = async (videoMeta, config, options = {}) => {
   if (!shouldUseTikHubFfmpegProvider(videoMeta)) {
@@ -1174,8 +1216,22 @@ const extractAudioWithFfmpeg = async (videoUrl, config, options = {}) => {
         return;
       }
       const buffer = Buffer.concat(chunks);
-      if (buffer.length === 0) {
-        reject(new AgentError("ffmpeg produced empty audio", { code: "FFMPEG_EMPTY" }));
+      const invalidReason = describeInvalidAudio(buffer, audioFormat);
+      if (invalidReason) {
+        // exit code === 0 但输出是空/空壳音频：fast-probe 没真正读到音频流的典型症状。
+        // 统一抛 FFMPEG_EMPTY，让 provider 编排切到 conservative-probe / 下一个候选 URL / 兜底。
+        logger?.error("ffmpeg.extract.error", {
+          interface: "ffmpeg-static",
+          durationMs: Date.now() - startedAt,
+          exitCode: code,
+          bytes: buffer.length,
+          threshold: audioOutputMinBytes(audioFormat),
+          error: invalidReason,
+        });
+        reject(new AgentError(invalidReason, {
+          code: "FFMPEG_EMPTY",
+          details: { bytes: buffer.length, threshold: audioOutputMinBytes(audioFormat) },
+        }));
         return;
       }
       logger?.info("ffmpeg.extract.end", {
@@ -1279,8 +1335,22 @@ const extractAudioFromStream = async (inputStream, config, options = {}) => {
         return;
       }
       const buffer = Buffer.concat(chunks);
-      if (buffer.length === 0) {
-        reject(new AgentError("ffmpeg produced empty audio", { code: "FFMPEG_EMPTY" }));
+      const invalidReason = describeInvalidAudio(buffer, audioFormat);
+      if (invalidReason) {
+        // exit code === 0 但输出是空/空壳音频：fast-probe 没真正读到音频流的典型症状。
+        // 统一抛 FFMPEG_EMPTY，让 provider 编排切到 conservative-probe / 下一个候选 URL / 兜底。
+        logger?.error("ffmpeg.extract.error", {
+          interface: "ffmpeg-static",
+          durationMs: Date.now() - startedAt,
+          exitCode: code,
+          bytes: buffer.length,
+          threshold: audioOutputMinBytes(audioFormat),
+          error: invalidReason,
+        });
+        reject(new AgentError(invalidReason, {
+          code: "FFMPEG_EMPTY",
+          details: { bytes: buffer.length, threshold: audioOutputMinBytes(audioFormat) },
+        }));
         return;
       }
       logger?.info("ffmpeg.extract.end", {
