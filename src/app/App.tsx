@@ -25,6 +25,12 @@ import {
 } from "./components/ui/carousel";
 import { Target, TrendingUp, MessageCircle, ThumbsUp, Share2, Bookmark, ExternalLink, User, CalendarDays, Phone, Layers, Sparkles, CheckCircle2, RefreshCw, ChevronDown, ChevronRight, LoaderCircle } from "lucide-react";
 
+// 跨账号节流：连续抓取多个对标账号时，账号之间间隔一段时间再发请求，
+// 规避上游（TikHub）对短时间高频连续请求的限流——其表现为不报错而返回空数据，
+// 导致第 4 个及以后的账号被误判为"无作品"。同一账号的游标续拉不受此限制。
+const TOPIC_ACCOUNT_THROTTLE_MS = 1500;
+const sleepMs = (ms: number) => new Promise<void>(resolve => window.setTimeout(resolve, ms));
+
 interface Topic {
   id: string;
   platform?: "douyin" | "wechat_channels" | "tiktok";
@@ -771,12 +777,20 @@ export default function App() {
     generation: number,
     context: NonNullable<typeof lastTopicFetchRef.current>,
   ) => {
+    let lastAccountKey = "";
     while (generation === topicFetchGeneration.current) {
       const runnable = context.jobs.filter(job => !job.done && !job.failed);
       if (runnable.length === 0) break;
 
       for (const job of runnable) {
         if (generation !== topicFetchGeneration.current) return;
+        // 切换到新账号时先节流等待，规避上游对连续高频请求的限流。
+        // 同一账号的游标续拉（slice_limit）不等待。
+        if (lastAccountKey && job.key !== lastAccountKey) {
+          await sleepMs(TOPIC_ACCOUNT_THROTTLE_MS);
+          if (generation !== topicFetchGeneration.current) return;
+        }
+        lastAccountKey = job.key;
         try {
           const sliceResults = await context.fetchSlice(job.target, context.requestedDays, job.resume);
           if (generation !== topicFetchGeneration.current) return;
@@ -798,6 +812,18 @@ export default function App() {
           } else {
             job.done = true;
           }
+          // 诊断日志：记录每个账号每一段的抓取结果，便于排查"第 N 个账号没抓到"类问题。
+          // eslint-disable-next-line no-console
+          console.info("[topic-fetch]", job.key, {
+            stopReason: result.stopReason,
+            isComplete: result.isComplete,
+            videosCount: result.videosCount,
+            rawVideosCount: result.rawVideosCount,
+            hasMore: result.hasMore,
+            hasResume: Boolean(result.resume),
+            done: job.done,
+            failed: job.failed,
+          });
         } catch (error) {
           job.failed = true;
           job.errorMessage = error instanceof Error ? error.message : "账号获取暂停";
