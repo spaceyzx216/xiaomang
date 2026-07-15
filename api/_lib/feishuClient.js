@@ -130,6 +130,63 @@ export const getTenantAccessToken = async (config = getFeishuConfig(), options =
   return token;
 };
 
+/**
+ * 将云文档（多维表格 / 飞书文档）的链接分享权限设置为「互联网任何人获得链接均可编辑」。
+ *
+ * 背景：当前所有资源都以 tenant_access_token（应用身份）创建，默认归属应用且不公开，
+ * 导致同租户成员只有只读、外部用户无法访问。建表 / 建文档后调用本函数统一放开权限。
+ *
+ * 容错策略：权限设置失败不应中断已完成的导出主流程，因此失败时只记日志并返回
+ * { applied: false, error }，由调用方决定是否把错误透传给前端提示。
+ *
+ * @param {string} token 多维表格的 app_token 或文档的 document_id
+ * @param {"bitable"|"docx"} type 资源类型，作为 /public 接口的 type 查询参数
+ */
+export const setFeishuDocumentPublic = async (
+  token,
+  type,
+  tenantAccessToken,
+  config = getFeishuConfig(),
+  options = {},
+) => {
+  const resourceToken = String(token || "").trim();
+  if (!resourceToken) {
+    return { applied: false, error: "empty token" };
+  }
+
+  try {
+    const query = new URLSearchParams({ type: type === "docx" ? "docx" : "bitable" });
+    await feishuRequest(
+      `/open-apis/drive/v1/permissions/${encodeURIComponent(resourceToken)}/public?${query.toString()}`,
+      { link_share_entity: "anyone_editable" },
+      config,
+      {
+        ...options,
+        method: "PATCH",
+        tenantAccessToken,
+        interfaceName: "feishu:permission.public",
+      },
+    );
+    options.logger?.info("feishu.permission.public.applied", {
+      type,
+      token: resourceToken,
+      linkShareEntity: "anyone_editable",
+    });
+    return { applied: true, error: null };
+  } catch (error) {
+    options.logger?.warn("feishu.permission.public.failed", {
+      type,
+      token: resourceToken,
+      feishuCode: error?.details?.feishuCode,
+      msg: error?.message,
+    });
+    return {
+      applied: false,
+      error: error?.message || "set public permission failed",
+    };
+  }
+};
+
 const trimTitle = (value) => {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   return text.slice(0, 120) || `小芒最终文案 ${new Date().toISOString().slice(0, 10)}`;
@@ -277,6 +334,9 @@ export const writeFinalDraftToFeishu = async (draft = {}, options = {}) => {
     options,
   );
 
+  // 新建的飞书文档默认归属应用且不公开，统一放开为「互联网任何人获得链接均可编辑」。
+  const permissionResult = await setFeishuDocumentPublic(document.document_id, "docx", tenantAccessToken, config, options);
+
   return {
     documentId: document.document_id,
     revisionId: document.revision_id,
@@ -284,6 +344,8 @@ export const writeFinalDraftToFeishu = async (draft = {}, options = {}) => {
     documentUrl: buildDocumentUrl(document.document_id, config),
     blocksCreated,
     markdown,
+    permissionApplied: permissionResult.applied,
+    permissionError: permissionResult.error,
   };
 };
 
@@ -616,6 +678,9 @@ export const createFeishuBitableForTask = async (payload = {}, options = {}) => 
 
   const fieldResult = await ensureFeishuBitableFields(appToken, tableId, tenantAccessToken, config, options);
 
+  // 新建的多维表格默认归属应用且不公开，这里统一放开为「互联网任何人获得链接均可编辑」。
+  const permissionResult = await setFeishuDocumentPublic(appToken, "bitable", tenantAccessToken, config, options);
+
   return {
     appToken,
     tableId,
@@ -624,6 +689,8 @@ export const createFeishuBitableForTask = async (payload = {}, options = {}) => 
     appCreated: true,
     tableCreated: !table.reused,
     fieldsCreated: fieldResult.createdCount,
+    permissionApplied: permissionResult.applied,
+    permissionError: permissionResult.error,
   };
 };
 
@@ -713,6 +780,16 @@ export const writeFinalDraftToFeishuBitable = async (draft = {}, options = {}) =
     options,
   );
 
+  // 仅对本次新建的多维表格放开「互联网任何人获得链接均可编辑」权限；
+  // 复用用户已绑定的表格时保留其原有权限，不强行覆盖。
+  let permissionApplied = null;
+  let permissionError = null;
+  if (appCreated) {
+    const permissionResult = await setFeishuDocumentPublic(appToken, "bitable", tenantAccessToken, config, options);
+    permissionApplied = permissionResult.applied;
+    permissionError = permissionResult.error;
+  }
+
   return {
     appToken,
     tableId,
@@ -723,5 +800,7 @@ export const writeFinalDraftToFeishuBitable = async (draft = {}, options = {}) =
     tableCreated,
     fieldsCreated,
     tableName: requestedTableName,
+    permissionApplied,
+    permissionError,
   };
 };
