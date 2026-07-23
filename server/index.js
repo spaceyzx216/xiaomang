@@ -197,7 +197,7 @@ app.post("/api/tikhub/batch", async (req, res) => {
           try {
             const { data: secUserData } = await fetchJson(
               appendQuery(secEndpoint, { username }),
-              { ...fetchOpts, interfaceName: "tikhub:tiktok:get_sec_user_id" },
+              { ...fetchOpts, interfaceName: "tikhub:tiktok:get_sec_user_id", retryableExtraStatuses: 400 },
             );
             secUserResponse = secUserData;
             secUserId = secUserData?.data?.sec_user_id || secUserData?.sec_user_id || "";
@@ -236,6 +236,7 @@ app.post("/api/tikhub/batch", async (req, res) => {
               ...fetchOpts,
               interfaceName: "tikhub:tiktok:fetch_user_post_videos",
               logFields: { page },
+              retryableExtraStatuses: 400,
             },
           ),
         });
@@ -282,7 +283,7 @@ app.post("/api/tikhub/batch", async (req, res) => {
           const secEndpoint = `${baseUrl}/api/v1/douyin/web/get_sec_user_id`;
           const { response: secResp, data: secUserData } = await fetchJson(
             appendQuery(secEndpoint, { url: sanitizedUrl }),
-            { ...fetchOpts, interfaceName: "tikhub:get_sec_user_id" },
+            { ...fetchOpts, interfaceName: "tikhub:get_sec_user_id", retryableExtraStatuses: 400 },
           );
           secUserResponse = secUserData;
           secUserId = secUserData?.data || secUserData?.sec_user_id;
@@ -327,6 +328,7 @@ app.post("/api/tikhub/batch", async (req, res) => {
               ...fetchOpts,
               interfaceName: "tikhub:fetch_user_post_videos",
               logFields: { page },
+              retryableExtraStatuses: 400,
             },
           ),
         });

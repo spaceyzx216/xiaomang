@@ -112,6 +112,7 @@ export default async function handler(req: any, res: any) {
                 retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
                 logger,
                 interfaceName: "tikhub:tiktok:get_sec_user_id",
+                retryableExtraStatuses: 400,
                 headers: { Authorization: `Bearer ${TIKHUB_API_TOKEN}` },
               },
             );
@@ -161,6 +162,7 @@ export default async function handler(req: any, res: any) {
               logger,
               interfaceName: "tikhub:tiktok:fetch_user_post_videos",
               logFields: { page },
+              retryableExtraStatuses: 400,
               headers: { Authorization: `Bearer ${TIKHUB_API_TOKEN}` },
             },
           ),
@@ -214,6 +216,7 @@ export default async function handler(req: any, res: any) {
               retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
               logger,
               interfaceName: "tikhub:get_sec_user_id",
+              retryableExtraStatuses: 400,
               headers: { Authorization: `Bearer ${TIKHUB_API_TOKEN}` },
             },
           );
@@ -258,6 +261,7 @@ export default async function handler(req: any, res: any) {
               logger,
               interfaceName: "tikhub:fetch_user_post_videos",
               logFields: { page },
+              retryableExtraStatuses: 400,
               headers: { Authorization: `Bearer ${TIKHUB_API_TOKEN}` },
             },
           ),
