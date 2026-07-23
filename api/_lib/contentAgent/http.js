@@ -84,6 +84,10 @@ export const fetchJson = async (url, options = {}) => {
     retries,
     retryBaseDelayMs,
     logFields = {},
+    // 部分上游（如 TikHub 抖音接口）会把偶发限流/抖动以 HTTP 400 返回，与真正的
+    // 参数错误不可区分；调用方可通过 retryableExtraStatuses 显式声明该端点的 400
+    // 属于可重试抖动。默认不放宽，避免掩盖真正的客户端错误。接受 Set | number[] | number。
+    retryableExtraStatuses,
     ...fetchOptions
   } = options;
   const maxRetries = toPositiveInt(retries, DEFAULT_RETRY_ATTEMPTS);
@@ -91,6 +95,13 @@ export const fetchJson = async (url, options = {}) => {
   const baseDelayMs = toPositiveInt(retryBaseDelayMs, DEFAULT_RETRY_BASE_DELAY_MS);
   const method = fetchOptions.method || "GET";
   const endpoint = safeEndpoint(url);
+  const extraRetryable = (() => {
+    if (retryableExtraStatuses == null) return new Set();
+    if (retryableExtraStatuses instanceof Set) return retryableExtraStatuses;
+    if (Array.isArray(retryableExtraStatuses)) return new Set(retryableExtraStatuses);
+    return new Set([Number(retryableExtraStatuses)]);
+  })();
+  const isRetryableStatus = (status) => isRetryableHttpStatus(status) || extraRetryable.has(Number(status));
 
   let lastError = null;
 
@@ -133,7 +144,7 @@ export const fetchJson = async (url, options = {}) => {
           details: data,
         });
         lastError = error;
-        if (attempt < maxAttempts && isRetryableHttpStatus(response.status)) {
+        if (attempt < maxAttempts && isRetryableStatus(response.status)) {
           const delayMs = retryDelayMs(attempt, baseDelayMs);
           logger?.warn("external.request.retry", {
             interface: interfaceName,
