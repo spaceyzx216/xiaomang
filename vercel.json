@@ -1,5 +1,9 @@
 {
   "functions": {
+    "api/tikhub/batch.ts": {
+      "maxDuration": 300,
+      "regions": ["hkg1"]
+    },
     "api/agent/workflow/stream-run.ts": {
       "maxDuration": 300
     },
