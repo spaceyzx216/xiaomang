@@ -51,22 +51,37 @@ export const isRetryableHttpStatus = (status) => RETRYABLE_HTTP_STATUSES.has(Num
 
 export const isRetryableNetworkError = (error) => {
   if (!error) return false;
-  if (error instanceof AgentError) {
-    return error.code === "HTTP_ERROR" && isRetryableHttpStatus(error.status);
+  // Undici 在响应体读取期间被对端断开时，顶层常是 TypeError("terminated")，
+  // 真正的 UND_ERR_SOCKET 则藏在 cause。逐层检查，避免将这类瞬断误判为不可重试。
+  const seen = new Set();
+  let current = error;
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    if (current instanceof AgentError) {
+      if (current.code === "HTTP_ERROR" && isRetryableHttpStatus(current.status)) return true;
+    } else {
+      const name = String(current.name || "");
+      const code = String(current.code || "");
+      const message = String(current.message || "").trim().toLowerCase();
+      if (
+        name === "AbortError" ||
+        message === "terminated" ||
+        message === "request timed out" ||
+        code === "UND_ERR_SOCKET" ||
+        code === "UND_ERR_ABORTED" ||
+        code === "UND_ERR_CONNECT_TIMEOUT" ||
+        code === "UND_ERR_HEADERS_TIMEOUT" ||
+        code === "UND_ERR_BODY_TIMEOUT" ||
+        code === "ECONNRESET" ||
+        code === "ETIMEDOUT" ||
+        code === "EAI_AGAIN" ||
+        code === "ENOTFOUND" ||
+        code === "ECONNREFUSED"
+      ) return true;
+    }
+    current = current.cause;
   }
-  const name = String(error.name || "");
-  const code = String(error.code || "");
-  return (
-    name === "AbortError" ||
-    code === "UND_ERR_CONNECT_TIMEOUT" ||
-    code === "UND_ERR_HEADERS_TIMEOUT" ||
-    code === "UND_ERR_BODY_TIMEOUT" ||
-    code === "ECONNRESET" ||
-    code === "ETIMEDOUT" ||
-    code === "EAI_AGAIN" ||
-    code === "ENOTFOUND" ||
-    code === "ECONNREFUSED"
-  );
+  return false;
 };
 
 export const retryDelayMs = (attempt, baseDelayMs = DEFAULT_RETRY_BASE_DELAY_MS) => {

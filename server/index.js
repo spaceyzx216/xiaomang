@@ -5,7 +5,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { runContentAgentWorkflow } from "../api/_lib/contentAgent/index.js";
 import { getContentAgentConfig } from "../api/_lib/contentAgent/config.js";
-import { appendQuery, fetchJson } from "../api/_lib/contentAgent/http.js";
+import { appendQuery, fetchJson, isRetryableNetworkError } from "../api/_lib/contentAgent/http.js";
 import { createRequestLogger, safeLink } from "../api/_lib/contentAgent/logger.js";
 import { runRewriteAgent, runTranslationAgent } from "../api/_lib/contentAgent/providers.js";
 import { platformRouter } from "../api/_lib/routers/platform.js";
@@ -41,13 +41,18 @@ const app = express();
 const port = Number(process.env.PORT || 8787);
 const dataDir = path.resolve(__dirname, "data");
 const finalDraftFile = path.join(dataDir, "final-drafts.json");
-const baseUrl = process.env.TIKHUB_BASE_URL || "https://api.tikhub.dev";
+const baseUrl = process.env.TIKHUB_BASE_URL || "https://api.tikhub.io";
 const apiToken = process.env.TIKHUB_API_TOKEN || "";
 const apiRetryAttempts = Number.parseInt(process.env.AGENT_API_RETRY_ATTEMPTS || "2", 10);
 const apiRetryBaseDelayMs = Number.parseInt(process.env.AGENT_API_RETRY_BASE_DELAY_MS || "500", 10);
 const startupAgentConfig = getContentAgentConfig();
 const TOPIC_PAGE_TIMEOUT_MS = 20_000;
 const TOPIC_PAGE_RETRIES = 1;
+const TOPIC_INITIAL_PAGE_RETRIES = 1;
+const TOPIC_INITIAL_PAGE_RETRY_DELAY_MS = 1200;
+const shouldRetryInitialTopicPage = error => (
+  isRetryableNetworkError(error) || Number(error?.status) === 400
+);
 createRequestLogger("server", "startup").info("server.config", {
   port,
   contentProvider: startupAgentConfig.provider,
@@ -228,6 +233,9 @@ app.post("/api/tikhub/batch", async (req, res) => {
           pageOffset: resume?.pageOffset ?? 0,
           maxVideos: count,
           expectedPageSize: 20,
+          initialPageRetries: TOPIC_INITIAL_PAGE_RETRIES,
+          initialPageRetryDelayMs: TOPIC_INITIAL_PAGE_RETRY_DELAY_MS,
+          shouldRetryInitialPageError: shouldRetryInitialTopicPage,
           logger,
           logFields: { url: safeLink(sanitizedUrl), pageType: "tiktok" },
           fetchPage: (cursor, page) => fetchJson(
@@ -305,7 +313,54 @@ app.post("/api/tikhub/batch", async (req, res) => {
         }
         retryResume = { ...retryResume, secUserId };
 
-        const videosEndpoint = `${baseUrl}/api/v1/douyin/app/v3/fetch_user_post_videos`;
+        const appVideosEndpoint = `${baseUrl}/api/v1/douyin/app/v3/fetch_user_post_videos`;
+        const webVideosEndpoint = `${baseUrl}/api/v1/douyin/web/fetch_user_post_videos`;
+        const initialLogicalPage = (Number(resume?.pageOffset) || 0) + 1;
+        let useWebVideosEndpoint = false;
+        const fetchDouyinVideosPage = async (cursor, page) => {
+          const appRequest = () => fetchJson(
+            appendQuery(appVideosEndpoint, {
+              sec_user_id: secUserId,
+              count: 20,
+              max_cursor: cursor,
+              sort_type: 0,
+            }),
+            {
+              ...fetchOpts,
+              interfaceName: "tikhub:douyin:app:fetch_user_post_videos",
+              logFields: { page },
+              retryableExtraStatuses: 400,
+            },
+          );
+          const webRequest = () => fetchJson(
+            appendQuery(webVideosEndpoint, {
+              sec_user_id: secUserId,
+              count: 20,
+              max_cursor: cursor,
+              filter_type: 0,
+            }),
+            {
+              ...fetchOpts,
+              interfaceName: "tikhub:douyin:web:fetch_user_post_videos",
+              logFields: { page },
+            },
+          );
+
+          if (useWebVideosEndpoint) return webRequest();
+          try {
+            return await appRequest();
+          } catch (error) {
+            if (page !== initialLogicalPage || !shouldRetryInitialTopicPage(error)) throw error;
+            useWebVideosEndpoint = true;
+            logger.warn("tikhub.douyin.app_to_web_fallback", {
+              page,
+              error: error instanceof Error ? error.message : "App V3 request failed",
+              code: error?.code,
+              status: error?.status,
+            });
+            return webRequest();
+          }
+        };
         const collection = await collectRecentAwemePages({
           platform: normalizedPlatform,
           days: recentDays,
@@ -315,22 +370,12 @@ app.post("/api/tikhub/batch", async (req, res) => {
           pageOffset: resume?.pageOffset ?? 0,
           maxVideos: count,
           expectedPageSize: 20,
+          initialPageRetries: TOPIC_INITIAL_PAGE_RETRIES,
+          initialPageRetryDelayMs: TOPIC_INITIAL_PAGE_RETRY_DELAY_MS,
+          shouldRetryInitialPageError: shouldRetryInitialTopicPage,
           logger,
           logFields: { url: safeLink(sanitizedUrl), pageType: "douyin" },
-          fetchPage: (cursor, page) => fetchJson(
-            appendQuery(videosEndpoint, {
-              sec_user_id: secUserId,
-              count: 20,
-              max_cursor: cursor,
-              sort_type: 0,
-            }),
-            {
-              ...fetchOpts,
-              interfaceName: "tikhub:fetch_user_post_videos",
-              logFields: { page },
-              retryableExtraStatuses: 400,
-            },
-          ),
+          fetchPage: fetchDouyinVideosPage,
         });
         const videosList = collection.videos;
         const nextResume = collection.resume ? { ...collection.resume, secUserId, sourceUrl: sanitizedUrl } : null;

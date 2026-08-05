@@ -167,6 +167,9 @@ export const collectRecentAwemePages = async ({
   pageOffset = 0,
   logger = null,
   logFields = {},
+  initialPageRetries = 0,
+  initialPageRetryDelayMs = 1000,
+  shouldRetryInitialPageError = () => false,
 }) => {
   const recentDays = parseRecentDays(days);
   const totalPageLimit = Math.max(1, Math.min(Number(maxPages) || 20, MAX_TOPIC_PAGES));
@@ -200,6 +203,7 @@ export const collectRecentAwemePages = async ({
   let partialErrorStatus = null;
   let hitVideoLimit = false;
   let consecutiveDuplicatePages = 0;
+  let initialPageRetryCount = 0;
   const MAX_CONSECUTIVE_DUPLICATE_PAGES = 2;
 
   for (let page = 1; page <= pageLimit && allVideos.length < videoLimit; page += 1) {
@@ -208,6 +212,27 @@ export const collectRecentAwemePages = async ({
     try {
       pageResult = await fetchPage(cursor, logicalPage);
     } catch (error) {
+      const canRetryInitialPage = pages.length === 0
+        && initialPageRetryCount < Math.max(0, Number(initialPageRetries) || 0)
+        && shouldRetryInitialPageError(error);
+      if (canRetryInitialPage) {
+        initialPageRetryCount += 1;
+        const delayMs = Math.max(0, Number(initialPageRetryDelayMs) || 0);
+        logger?.warn?.("topic.pagination.initial_page.retry", {
+          ...logFields,
+          page: logicalPage,
+          attempt: initialPageRetryCount,
+          nextAttempt: initialPageRetryCount + 1,
+          maxAttempts: Math.max(0, Number(initialPageRetries) || 0) + 1,
+          delayMs,
+          error: error instanceof Error ? error.message : "Page fetch failed",
+          code: error?.code,
+          status: error?.status,
+        });
+        if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+        page -= 1;
+        continue;
+      }
       if (pages.length === 0) throw error;
       partialError = error instanceof Error ? error.message : "Page fetch failed";
       partialErrorStatus = Number(error?.status) || null;

@@ -3,7 +3,7 @@ declare const process: any;
 type VercelRequest = any;
 type VercelResponse = any;
 
-export const TIKHUB_BASE_URL = process.env.TIKHUB_BASE_URL || "https://api.tikhub.dev";
+export const TIKHUB_BASE_URL = process.env.TIKHUB_BASE_URL || "https://api.tikhub.io";
 export const TIKHUB_API_TOKEN = process.env.TIKHUB_API_TOKEN || "";
 
 export const json = (res: VercelResponse, status: number, payload: unknown) => {
