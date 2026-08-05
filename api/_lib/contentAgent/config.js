@@ -60,7 +60,7 @@ export const getContentAgentConfig = () => {
     mainWorkflowId,
     maxLinksPerRun: toInt(process.env.AGENT_MAX_LINKS_PER_RUN, 5),
     requestTimeoutMs: toInt(process.env.AGENT_REQUEST_TIMEOUT_MS, 120000),
-    tikhubBaseUrl: process.env.TIKHUB_BASE_URL || "https://api.tikhub.dev",
+    tikhubBaseUrl: process.env.TIKHUB_BASE_URL || "https://api.tikhub.io",
     tikhubApiToken: process.env.TIKHUB_API_TOKEN || "",
     tikhubRegion: process.env.AGENT_VIDEO_REGION || "CN",
     apiRetryAttempts: toInt(process.env.AGENT_API_RETRY_ATTEMPTS, 2),

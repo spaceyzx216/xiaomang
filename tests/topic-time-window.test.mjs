@@ -81,6 +81,38 @@ test("filters awemes by daysFrom lower bound", async () => {
   assert.deepEqual(result.videos.map(v => v.aweme_id), ["in-range-15", "in-range-20", "in-range-25"]);
 });
 
+test("retries a transient first-page failure before marking an account as failed", async () => {
+  let calls = 0;
+  const result = await collectRecentAwemePages({
+    platform: "douyin",
+    days: 7,
+    expectedPageSize: 20,
+    nowMs: NOW,
+    initialPageRetries: 1,
+    initialPageRetryDelayMs: 0,
+    shouldRetryInitialPageError: error => error?.code === "UND_ERR_SOCKET",
+    fetchPage: async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw Object.assign(new Error("terminated"), { code: "UND_ERR_SOCKET" });
+      }
+      return {
+        data: {
+          data: {
+            aweme_list: [videoAtAge("recovered", 1)],
+            max_cursor: 1,
+            has_more: 0,
+          },
+        },
+      };
+    },
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(result.stopReason, "upstream_exhausted");
+  assert.deepEqual(result.videos.map(video => video.aweme_id), ["recovered"]);
+});
+
 test("groups ninety days of topics into seven-day collapsed buckets", () => {
   const groups = groupTopicsByWeek([
     topicAtAge("latest", 1),
@@ -363,6 +395,7 @@ test("wechat pagination also ignores old pinned posts on page one", async () => 
         apiRetryAttempts: 1,
         apiRetryBaseDelayMs: 1,
       },
+      { nowMs: NOW },
     );
 
     assert.equal(calls, 3);
@@ -408,6 +441,7 @@ test("wechat pagination advances beyond a duplicate-only page", async () => {
         apiRetryAttempts: 1,
         apiRetryBaseDelayMs: 1,
       },
+      { nowMs: NOW },
     );
 
     assert.equal(calls, 3);
@@ -453,6 +487,7 @@ test("wechat continues from last_buffer even when up_continue is zero", async ()
         apiRetryAttempts: 1,
         apiRetryBaseDelayMs: 1,
       },
+      { nowMs: NOW },
     );
 
     assert.equal(calls, 3);

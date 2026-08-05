@@ -407,7 +407,8 @@ export const fetchPlatformTopics = async ({ platform, accounts, count = 200, day
     ...config,
     requestTimeoutMs: Math.min(Number(config?.requestTimeoutMs) || 120_000, 25_000),
   };
-  const nowMs = Date.now();
+  // 允许测试/调用方注入统一的时间基准；生产环境仍使用当前时间。
+  const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
   const results = [];
   for (const account of selectedAccounts) {
     try {

@@ -1,6 +1,6 @@
 import { TIKHUB_API_TOKEN, TIKHUB_BASE_URL, json, readBody, sanitizeUrl } from "../_lib/common.js";
 import { getContentAgentConfig } from "../_lib/contentAgent/config.js";
-import { appendQuery, fetchJson } from "../_lib/contentAgent/http.js";
+import { appendQuery, fetchJson, isRetryableNetworkError } from "../_lib/contentAgent/http.js";
 import { createRequestLogger, safeLink } from "../_lib/contentAgent/logger.js";
 import {
   buildCombinedVideosResponse,
@@ -18,6 +18,12 @@ export const config = {
 // 20 秒 ×（首次 + 1 次重试）× 3 页，远低于 Vercel 的 300 秒函数上限。
 const TOPIC_PAGE_TIMEOUT_MS = 20_000;
 const TOPIC_PAGE_RETRIES = 1;
+// 单页请求本身会重试一次；若首个作品页仍因上游抖动失败，再从同一游标整体补试一次。
+const TOPIC_INITIAL_PAGE_RETRIES = 1;
+const TOPIC_INITIAL_PAGE_RETRY_DELAY_MS = 1200;
+const shouldRetryInitialTopicPage = (error: unknown) => (
+  isRetryableNetworkError(error) || Number((error as any)?.status) === 400
+);
 
 export default async function handler(req: any, res: any) {
   if (req.method !== "POST") {
@@ -151,6 +157,9 @@ export default async function handler(req: any, res: any) {
           pageOffset: resume?.pageOffset ?? 0,
           maxVideos: count,
           expectedPageSize: 20,
+          initialPageRetries: TOPIC_INITIAL_PAGE_RETRIES,
+          initialPageRetryDelayMs: TOPIC_INITIAL_PAGE_RETRY_DELAY_MS,
+          shouldRetryInitialPageError: shouldRetryInitialTopicPage,
           logger,
           logFields: { url: safeLink(sanitizedUrl), pageType: "tiktok" },
           fetchPage: (cursor: unknown, page: number) => fetchJson(
@@ -235,20 +244,15 @@ export default async function handler(req: any, res: any) {
         }
         retryResume = { ...retryResume, secUserId };
 
-        const videosEndpoint = `${TIKHUB_BASE_URL}/api/v1/douyin/app/v3/fetch_user_post_videos`;
-        const collection = await collectRecentAwemePages({
-          platform: normalizedPlatform,
-          days: recentDays,
-          maxPages,
-          slicePages: slicePageBudget,
-          startCursor: resume?.cursor ?? 0,
-          pageOffset: resume?.pageOffset ?? 0,
-          maxVideos: count,
-          expectedPageSize: 20,
-          logger,
-          logFields: { url: safeLink(sanitizedUrl), pageType: "douyin" },
-          fetchPage: (cursor: unknown, page: number) => fetchJson(
-            appendQuery(videosEndpoint, {
+        const appVideosEndpoint = `${TIKHUB_BASE_URL}/api/v1/douyin/app/v3/fetch_user_post_videos`;
+        const webVideosEndpoint = `${TIKHUB_BASE_URL}/api/v1/douyin/web/fetch_user_post_videos`;
+        const initialLogicalPage = (Number(resume?.pageOffset) || 0) + 1;
+        // 两套接口的 max_cursor 分页约定相同，但不在同一轮里混用游标：
+        // 只有 App V3 首页彻底失败才切到 Web，并由后续页持续使用 Web。
+        let useWebVideosEndpoint = false;
+        const fetchDouyinVideosPage = async (cursor: unknown, page: number) => {
+          const appRequest = () => fetchJson(
+            appendQuery(appVideosEndpoint, {
               sec_user_id: secUserId,
               count: 20,
               max_cursor: cursor,
@@ -259,12 +263,60 @@ export default async function handler(req: any, res: any) {
               retries: topicRequestRetries,
               retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
               logger,
-              interfaceName: "tikhub:fetch_user_post_videos",
+              interfaceName: "tikhub:douyin:app:fetch_user_post_videos",
               logFields: { page },
               retryableExtraStatuses: 400,
               headers: { Authorization: `Bearer ${TIKHUB_API_TOKEN}` },
             },
-          ),
+          );
+          const webRequest = () => fetchJson(
+            appendQuery(webVideosEndpoint, {
+              sec_user_id: secUserId,
+              count: 20,
+              max_cursor: cursor,
+              filter_type: 0,
+            }),
+            {
+              timeoutMs: topicRequestTimeoutMs,
+              retries: topicRequestRetries,
+              retryBaseDelayMs: agentConfig.apiRetryBaseDelayMs,
+              logger,
+              interfaceName: "tikhub:douyin:web:fetch_user_post_videos",
+              logFields: { page },
+              headers: { Authorization: `Bearer ${TIKHUB_API_TOKEN}` },
+            },
+          );
+
+          if (useWebVideosEndpoint) return webRequest();
+          try {
+            return await appRequest();
+          } catch (error) {
+            if (page !== initialLogicalPage || !shouldRetryInitialTopicPage(error)) throw error;
+            useWebVideosEndpoint = true;
+            logger.warn("tikhub.douyin.app_to_web_fallback", {
+              page,
+              error: error instanceof Error ? error.message : "App V3 request failed",
+              code: (error as any)?.code,
+              status: (error as any)?.status,
+            });
+            return webRequest();
+          }
+        };
+        const collection = await collectRecentAwemePages({
+          platform: normalizedPlatform,
+          days: recentDays,
+          maxPages,
+          slicePages: slicePageBudget,
+          startCursor: resume?.cursor ?? 0,
+          pageOffset: resume?.pageOffset ?? 0,
+          maxVideos: count,
+          expectedPageSize: 20,
+          initialPageRetries: TOPIC_INITIAL_PAGE_RETRIES,
+          initialPageRetryDelayMs: TOPIC_INITIAL_PAGE_RETRY_DELAY_MS,
+          shouldRetryInitialPageError: shouldRetryInitialTopicPage,
+          logger,
+          logFields: { url: safeLink(sanitizedUrl), pageType: "douyin" },
+          fetchPage: fetchDouyinVideosPage,
         });
         const videosList = collection.videos;
         const nextResume = collection.resume ? { ...collection.resume, secUserId, sourceUrl: sanitizedUrl } : null;

@@ -489,6 +489,38 @@ test("fetchJson retries retryable HTTP statuses and returns the successful respo
   }
 });
 
+test("fetchJson retries an Undici terminated socket error using its cause", async () => {
+  const originalFetch = global.fetch;
+  const originalRandom = Math.random;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      const socketError = Object.assign(new Error("socket closed"), { code: "UND_ERR_SOCKET" });
+      throw Object.assign(new TypeError("terminated"), { cause: socketError });
+    }
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+  Math.random = () => 0;
+
+  try {
+    const { data } = await fetchJson("https://example.com/retry-terminated", {
+      retries: 1,
+      retryBaseDelayMs: 0,
+      logger: { info() {}, warn() {}, error() {} },
+    });
+
+    assert.deepEqual(data, { ok: true });
+    assert.equal(calls, 2);
+  } finally {
+    global.fetch = originalFetch;
+    Math.random = originalRandom;
+  }
+});
+
 test("fetchJson omits query parameters from errors and logs", async () => {
   const originalFetch = global.fetch;
   const errors = [];
