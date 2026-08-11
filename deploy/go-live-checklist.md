@@ -23,12 +23,14 @@
 - [ ] 最终编辑页首次粘贴多维表格 URL 后，可自动创建当前任务数据表；同任务后续选题会复用同一张表
 - [ ] `WORKBENCH_URL` 已配置为线上地址（KKClaw）
 - [ ] `MONGODB_URI` 已配置（task-server）
+- [ ] `MONGODB_URI`、`TASK_DEMO_SESSION_SECRET` 已配置到 Xiaomang 本地服务与 Vercel 环境变量
 
 ## C. 鉴权与任务过滤（KKClaw）
 - [ ] 任务面板登录成功（`staff-a` / `staff-b`）
 - [ ] 登录后可拉取今日任务
 - [ ] 不同员工账号拉到不同任务
 - [ ] 未登录时 `GET /api/tasks/today` 返回 `401`
+- [ ] 桌宠打开工作站后，地址栏不再保留 `taskToken`、`todayTasks` 等任务数据参数
 
 ## D. 业务主链路
 - [ ] 项目经理创建任务并分配员工
