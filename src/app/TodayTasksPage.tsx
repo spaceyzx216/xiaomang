@@ -11,6 +11,7 @@ import {
   Sparkles,
   UserRound,
 } from "lucide-react";
+import { apiUrl } from "./api";
 
 type TaskStatus = "pending" | "in_progress" | "completed";
 
@@ -30,9 +31,6 @@ type TodayTask = {
   priority?: "low" | "medium" | "high";
   status?: TaskStatus;
 };
-
-const TASK_AUTH_TOKEN_KEY = "kk_task_token";
-const TASK_USER_ID_KEY = "kk_task_user_id";
 
 const toDate = (offset = 0) => {
   const date = new Date();
@@ -85,23 +83,6 @@ const previewTasks: TodayTask[] = [
   },
 ];
 
-const decodeBase64Url = (input: string) => {
-  const normalized = input.replace(/-/g, "+").replace(/_/g, "/");
-  const padded = normalized + "=".repeat((4 - (normalized.length % 4 || 4)) % 4);
-  return decodeURIComponent(Array.from(atob(padded)).map(char => `%${char.charCodeAt(0).toString(16).padStart(2, "0")}`).join(""));
-};
-
-const readUrlTasks = (params: URLSearchParams): TodayTask[] => {
-  const raw = String(params.get("todayTasks") || "").trim();
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(decodeBase64Url(raw));
-    return Array.isArray(parsed?.tasks) ? parsed.tasks : [];
-  } catch {
-    return [];
-  }
-};
-
 const formatPeriod = (period?: TodayTask["collaborationPeriod"]) => {
   if (!period?.start || !period?.end) return "未设置任务周期";
   return `${String(period.start).slice(5, 10).replace("-", "/")} — ${String(period.end).slice(5, 10).replace("-", "/")}`;
@@ -117,44 +98,41 @@ export default function TodayTasksPage() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const urlTasks = readUrlTasks(params);
-    const urlToken = String(params.get("taskToken") || "").trim();
     const urlUserId = String(params.get("taskUserId") || "").trim();
-    if (urlToken) localStorage.setItem(TASK_AUTH_TOKEN_KEY, urlToken);
-    if (urlUserId) localStorage.setItem(TASK_USER_ID_KEY, urlUserId);
 
-    if (urlToken || urlUserId || params.has("from") || params.has("todayTasks") || params.has("todayTaskCount")) {
+    if (params.has("taskToken") || urlUserId || params.has("from") || params.has("todayTasks") || params.has("todayTaskCount")) {
       ["taskToken", "taskUserId", "todayTasks", "todayTaskCount", "from"].forEach(key => params.delete(key));
       const query = params.toString();
       window.history.replaceState({}, "", `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`);
     }
 
-    if (urlTasks.length) {
-      setTasks(urlTasks);
-      setLoading(false);
-      return;
-    }
+    const loadTasks = async () => {
+      try {
+        let response: Response;
+        if (urlUserId) {
+          response = await fetch(apiUrl("/api/tasks/session"), {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ taskUserId: urlUserId }),
+          });
+        } else {
+          response = await fetch(apiUrl("/api/tasks/today"), { credentials: "same-origin" });
+        }
 
-    const token = urlToken || String(localStorage.getItem(TASK_AUTH_TOKEN_KEY) || "").trim();
-    if (!token) {
-      setTasks(previewTasks);
-      setUsingPreview(true);
-      setLoading(false);
-      return;
-    }
-
-    void fetch("http://127.0.0.1:18891/api/tasks/today", { headers: { Authorization: `Bearer ${token}` } })
-      .then(async response => {
         const data = await response.json();
         if (!response.ok || !data?.success) throw new Error("任务服务不可用");
-        return Array.isArray(data.data) ? data.data as TodayTask[] : [];
-      })
-      .then(data => setTasks(data))
-      .catch(() => {
+        setTasks(Array.isArray(data.data) ? data.data as TodayTask[] : []);
+        setUsingPreview(false);
+      } catch {
         setTasks(previewTasks);
         setUsingPreview(true);
-      })
-      .finally(() => setLoading(false));
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    void loadTasks();
   }, []);
 
   const counts = useMemo(() => ({

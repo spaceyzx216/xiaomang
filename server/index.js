@@ -25,6 +25,13 @@ import {
   writeFinalDraftToFeishu,
   writeFinalDraftToFeishuBitable,
 } from "../api/_lib/feishuClient.js";
+import { getTodayTasksForUser, isActiveTaskUser, isTaskUserId } from "../api/_lib/taskStore.js";
+import {
+  issueTaskSession,
+  readTaskSessionUserId,
+  requestIsSecure,
+  taskSessionCookie,
+} from "../api/_lib/taskSession.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -74,6 +81,39 @@ app.get("/health", (_req, res) => {
     service: "xiaomang-proxy",
     time: new Date().toISOString(),
   });
+});
+
+// 演示期兼容桌宠：桌宠提供员工 ID 一次，服务端将它收敛为 HttpOnly 会话。
+// 正式多人上线应替换为桌宠签发的一次性、可验证启动凭证。
+app.post("/api/tasks/session", async (req, res) => {
+  const taskUserId = String(req.body?.taskUserId || "").trim();
+  if (!isTaskUserId(taskUserId)) {
+    return res.status(400).json({ success: false, error: "Invalid task user identity" });
+  }
+
+  try {
+    if (!await isActiveTaskUser(taskUserId)) {
+      return res.status(401).json({ success: false, error: "Task user is not active" });
+    }
+    const session = issueTaskSession(taskUserId);
+    res.setHeader("Set-Cookie", taskSessionCookie(session, requestIsSecure(req)));
+    return res.json({ success: true, data: await getTodayTasksForUser(taskUserId) });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error instanceof Error ? error.message : "Session setup failed" });
+  }
+});
+
+app.get("/api/tasks/today", async (req, res) => {
+  const userId = readTaskSessionUserId(req.headers.cookie);
+  if (!userId) {
+    return res.status(401).json({ success: false, error: "Task session is missing or expired" });
+  }
+
+  try {
+    return res.json({ success: true, data: await getTodayTasksForUser(userId) });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error instanceof Error ? error.message : "Task query failed" });
+  }
 });
 
 const sanitizeUrl = (rawUrl) => {
