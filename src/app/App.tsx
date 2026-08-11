@@ -29,6 +29,8 @@ import { Target, TrendingUp, MessageCircle, ThumbsUp, Share2, Bookmark, External
 // 规避上游（TikHub）对短时间高频连续请求的限流——其表现为不报错而返回空数据，
 // 导致第 4 个及以后的账号被误判为"无作品"。同一账号的游标续拉不受此限制。
 const TOPIC_ACCOUNT_THROTTLE_MS = 1500;
+// 视频号分享链接接口按次计费且存在限流；仅为已勾选选题自动补链，并严格串行。
+const WECHAT_SHARE_LINK_THROTTLE_MS = 1200;
 const sleepMs = (ms: number) => new Promise<void>(resolve => window.setTimeout(resolve, ms));
 
 interface Topic {
@@ -516,6 +518,31 @@ export default function App() {
   });
   const [confirmedWechatAccounts, setConfirmedWechatAccounts] = useState<Record<string, WeChatAccountCandidate>>(() => readWeChatAccountCache());
   const [topicLinkLoadingId, setTopicLinkLoadingId] = useState<string | null>(null);
+  const [wechatShareLinksLoading, setWechatShareLinksLoading] = useState(false);
+  const autoWechatShareLinkRef = useRef({
+    runId: 0,
+    running: false,
+    attemptedIds: new Set<string>(),
+  });
+  const selectedTopicIdsRef = useRef(new Set(selectedTopics));
+
+  useEffect(() => {
+    const selectedIds = new Set(selectedTopics);
+    selectedTopicIdsRef.current = selectedIds;
+    for (const topicId of autoWechatShareLinkRef.current.attemptedIds) {
+      if (!selectedIds.has(topicId)) {
+        autoWechatShareLinkRef.current.attemptedIds.delete(topicId);
+      }
+    }
+  }, [selectedTopics]);
+
+  const resetAutoWechatShareLinkGeneration = () => {
+    const state = autoWechatShareLinkRef.current;
+    state.runId += 1;
+    state.running = false;
+    state.attemptedIds.clear();
+    setWechatShareLinksLoading(false);
+  };
 
   const handleTopicToggle = (topicId: string) => {
     setSelectedTopics(prev => {
@@ -1032,6 +1059,7 @@ export default function App() {
 
     setTikhubLoading(true);
     setTikhubError(null);
+    resetAutoWechatShareLinkGeneration();
     try {
       await startProgressiveTopicFetch(
         requestedDays,
@@ -1061,6 +1089,33 @@ export default function App() {
     });
   };
 
+  const requestWechatShareLink = async (topic: Topic) => {
+    const objectId = String(topic.source?.objectId || "").trim();
+    if (!objectId) {
+      throw new Error("该视频号作品缺少 objectId，无法生成分享链接。");
+    }
+
+    const response = await fetchWithRetry(apiUrl("/api/platform/topics/share-link"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        platform: "wechat_channels",
+        objectId,
+      }),
+    });
+    const data = await parseApiJson(response);
+    if (!response.ok) {
+      throw new Error(data?.error || "生成视频号分享链接失败");
+    }
+    const shareUrl = String(data?.shareUrl || "").trim();
+    if (!shareUrl) {
+      throw new Error("接口未返回可用分享链接");
+    }
+    return shareUrl;
+  };
+
   const generateWechatShareLink = async (topic: Topic) => {
     const objectId = String(topic.source?.objectId || "").trim();
     if (!objectId) {
@@ -1070,25 +1125,9 @@ export default function App() {
 
     setTopicLinkLoadingId(topic.id);
     setTikhubError(null);
+    autoWechatShareLinkRef.current.attemptedIds.add(topic.id);
     try {
-      const response = await fetchWithRetry(apiUrl("/api/platform/topics/share-link"), {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          platform: "wechat_channels",
-          objectId,
-        }),
-      });
-      const data = await parseApiJson(response);
-      if (!response.ok) {
-        throw new Error(data?.error || "生成视频号分享链接失败");
-      }
-      const shareUrl = String(data?.shareUrl || "").trim();
-      if (!shareUrl) {
-        throw new Error("接口未返回可用分享链接");
-      }
+      const shareUrl = await requestWechatShareLink(topic);
       updateTopicLink(topic.id, shareUrl);
       window.open(shareUrl, "_blank");
     } catch (error) {
@@ -1097,6 +1136,68 @@ export default function App() {
       setTopicLinkLoadingId(null);
     }
   };
+
+  useEffect(() => {
+    if (sourcePlatform !== "wechat_channels") {
+      const state = autoWechatShareLinkRef.current;
+      state.runId += 1;
+      state.running = false;
+      setWechatShareLinksLoading(false);
+      return;
+    }
+    if (tikhubLoading || olderTopicsLoading || autoWechatShareLinkRef.current.running) return;
+
+    const state = autoWechatShareLinkRef.current;
+    const selectedIds = new Set(selectedTopics);
+    // 未勾选的作品不请求 TikHub，避免为不会使用的链接消耗调用次数。
+    const pendingTopics = tikhubResults.flatMap(result => Array.isArray(result.topics) ? result.topics : [])
+      .filter(topic => (
+        topic.platform === "wechat_channels"
+        && !topic.link
+        && Boolean(String(topic.source?.objectId || "").trim())
+        && selectedIds.has(topic.id)
+        && !state.attemptedIds.has(topic.id)
+      ));
+    if (pendingTopics.length === 0) return;
+
+    state.running = true;
+    const runId = ++state.runId;
+    setWechatShareLinksLoading(true);
+    setTikhubError(null);
+
+    void (async () => {
+      const failedTopics: string[] = [];
+      for (const topic of pendingTopics) {
+        if (autoWechatShareLinkRef.current.runId !== runId) break;
+        if (!selectedTopicIdsRef.current.has(topic.id)) continue;
+        state.attemptedIds.add(topic.id);
+        setTopicLinkLoadingId(topic.id);
+        try {
+          const shareUrl = await requestWechatShareLink(topic);
+          if (autoWechatShareLinkRef.current.runId !== runId) break;
+          updateTopicLink(topic.id, shareUrl);
+        } catch {
+          failedTopics.push(topic.title || topic.id);
+        } finally {
+          if (autoWechatShareLinkRef.current.runId === runId) {
+            setTopicLinkLoadingId(null);
+          }
+        }
+
+        if (autoWechatShareLinkRef.current.runId === runId) {
+          await sleepMs(WECHAT_SHARE_LINK_THROTTLE_MS);
+        }
+      }
+
+      if (autoWechatShareLinkRef.current.runId !== runId) return;
+      state.running = false;
+      setWechatShareLinksLoading(false);
+      setTopicLinkLoadingId(null);
+      if (failedTopics.length > 0) {
+        setTikhubError(`${failedTopics.length} 条已勾选的视频号作品未能自动生成分享链接，取消勾选后重新勾选可重试。`);
+      }
+    })();
+  }, [olderTopicsLoading, selectedTopics, sourcePlatform, tikhubLoading, tikhubResults, wechatShareLinksLoading]);
 
   const taskCount = tasks.length;
   const hasRetryableTopicJobs = Boolean(lastTopicFetchRef.current?.jobs.some(job => job.failed));
@@ -1752,7 +1853,7 @@ export default function App() {
                                   variant="ghost"
                                   size="sm"
                                   className="text-indigo-600 hover:text-indigo-700 hover:bg-indigo-50 px-3 h-8 sm:-mr-2"
-                                  disabled={topicLinkLoadingId === topic.id || (!topic.link && topic.platform !== "wechat_channels")}
+                                  disabled={topicLinkLoadingId === topic.id || (!topic.link && (wechatShareLinksLoading || topic.platform !== "wechat_channels"))}
                                   onClick={() => {
                                     if (topic.link) {
                                       window.open(topic.link, "_blank");
