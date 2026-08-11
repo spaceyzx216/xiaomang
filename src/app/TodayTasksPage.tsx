@@ -90,6 +90,19 @@ const formatPeriod = (period?: TodayTask["collaborationPeriod"]) => {
 
 const taskStatus = (task: TodayTask): TaskStatus => task.status || "pending";
 
+const isMeaningfulTaskText = (value?: string) => {
+  const text = String(value || "").trim();
+  return Boolean(text && !["无", "暂无", "未提供", "none", "n/a"].includes(text.toLowerCase()));
+};
+
+const benchmarkSummary = (value?: string) => {
+  const accounts = String(value || "")
+    .split(/[\n,，;；]+/)
+    .map(item => item.trim())
+    .filter(Boolean);
+  return accounts.length > 0 ? `${accounts.length} 个对标账号` : "";
+};
+
 export default function TodayTasksPage() {
   const navigate = useNavigate();
   const [tasks, setTasks] = useState<TodayTask[]>([]);
@@ -201,6 +214,8 @@ export default function TodayTasksPage() {
             <div className="divide-y divide-slate-100">
               {tasks.map((task, index) => {
                 const requirements = (task.contentRequirements || []).filter(Boolean);
+                const benchmark = benchmarkSummary(task.benchmarkAccounts);
+                const notes = isMeaningfulTaskText(task.notes) ? String(task.notes).trim() : "";
                 const priority = task.priority === "high" ? { label: "高", className: "bg-rose-50 text-rose-600" } : task.priority === "low" ? { label: "低", className: "bg-slate-100 text-slate-500" } : { label: "中", className: "bg-amber-50 text-amber-600" };
                 return (
                   <button key={task._id || index} type="button" onClick={() => openTask(task)} className="group grid w-full gap-5 px-5 py-6 text-left transition hover:bg-[#f8fbff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-600 sm:grid-cols-[minmax(0,1.65fr)_minmax(145px,.7fr)_minmax(160px,.75fr)_auto] sm:items-center sm:px-7">
@@ -208,7 +223,8 @@ export default function TodayTasksPage() {
                       <div className="flex flex-wrap items-center gap-2"><span className="text-[11px] font-semibold tracking-[0.14em] text-slate-400">TASK {String(index + 1).padStart(2, "0")}</span><span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${priority.className}`}>{priority.label}优先级</span></div>
                       <h3 className="mt-2 text-lg font-semibold text-slate-900 group-hover:text-blue-700">{task.customerName || "未命名客户"}<span className="ml-2 text-sm font-normal text-slate-400">{task.customerOccupation || "内容创作任务"}</span></h3>
                       <p className="mt-1.5 max-w-2xl truncate text-sm text-slate-500">{task.contentDirection || task.ipPositioning || "补充任务信息后即可生成对应选题"}</p>
-                      {requirements.length > 0 && <div className="mt-3 flex flex-wrap gap-2">{requirements.slice(0, 2).map((item, itemIndex) => <span key={itemIndex} className="rounded-md bg-slate-100 px-2 py-1 text-xs text-slate-500">{item}</span>)}</div>}
+                      {requirements.length > 0 && <div className="mt-3 flex flex-wrap gap-2">{requirements.slice(0, 3).map((item, itemIndex) => <span key={itemIndex} className="rounded-md bg-slate-100 px-2 py-1 text-xs text-slate-500">{item}</span>)}</div>}
+                      {(benchmark || notes) && <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-400">{benchmark && <span>对标：{benchmark}</span>}{notes && <span className="max-w-xl truncate">备注：{notes}</span>}</div>}
                     </div>
                     <div className="flex items-center gap-2 text-sm text-slate-600"><UserRound className="h-4 w-4 text-slate-400" />{task.ownerName || "待分配"}</div>
                     <div className="flex items-center gap-2 text-sm text-slate-600"><Layers3 className="h-4 w-4 text-slate-400" /><div><div>{task.platformName || "内容平台待定"}</div><div className="mt-0.5 text-xs text-slate-400">{formatPeriod(task.collaborationPeriod)}</div></div></div>
