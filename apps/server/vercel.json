@@ -1,0 +1,101 @@
+{
+  "functions": {
+    "api/review/workbook-recognition.ts": { "maxDuration": 180 },
+    "api/review/weekly.ts": { "maxDuration": 300 },
+    "api/weekly-analysis-reports/index.ts": { "maxDuration": 30 },
+    "api/review-memory/index.ts": { "maxDuration": 30 },
+    "api/tikhub/batch.ts": {
+      "maxDuration": 300,
+      "regions": ["hkg1"]
+    },
+    "api/tikhub/comments.ts": {
+      "maxDuration": 300,
+      "regions": ["hkg1"]
+    },
+    "api/tikhub/fans-portrait.ts": {
+      "maxDuration": 60,
+      "regions": ["hkg1"]
+    },
+    "api/agent/workflow/stream-run.ts": {
+      "maxDuration": 300
+    },
+    "api/agent/translation.ts": {
+      "maxDuration": 120
+    },
+    "api/agent/rewrite.ts": {
+      "maxDuration": 120
+    },
+    "api/agent/benchmark-analysis.ts": {
+      "maxDuration": 120
+    },
+    "api/agent/benchmark-topic-refresh.ts": {
+      "maxDuration": 300
+    },
+    "api/agent/publish.ts": {
+      "maxDuration": 300
+    },
+    "api/publish-warehouse/index.ts": {
+      "maxDuration": 30
+    },
+    "api/agent/gold-three-seconds.ts": {
+      "maxDuration": 300
+    },
+    "api/agent/ending-hooks.ts": {
+      "maxDuration": 300
+    },
+    "api/agent/benchmark-profile.ts": {
+      "maxDuration": 300
+    },
+    "api/benchmark-reports/index.ts": {
+      "maxDuration": 30
+    },
+    "api/gold-three-second-reports/index.ts": {
+      "maxDuration": 30
+    },
+    "api/ending-hook-reports/index.ts": {
+      "maxDuration": 30
+    },
+    "api/benchmark-profile-reports/index.ts": {
+      "maxDuration": 30
+    },
+    "api/agent/account-plan.ts": {
+      "maxDuration": 300
+    },
+    "api/account-plan-reports/index.ts": {
+      "maxDuration": 30
+    },
+    "api/agent/video-analysis.ts": {
+      "maxDuration": 300
+    },
+    "api/video-analysis-reports/index.ts": {
+      "maxDuration": 30
+    },
+    "api/review/workbook.ts": {
+      "maxDuration": 30
+    },
+    "api/adhoc-analyses/index.ts": {
+      "maxDuration": 30
+    },
+    "api/topic-libraries/index.ts": {
+      "maxDuration": 30
+    },
+    "api/customers.ts": {
+      "maxDuration": 30
+    },
+    "api/platform.ts": {
+      "maxDuration": 120
+    },
+    "api/export.ts": {
+      "maxDuration": 120
+    }
+  },
+  "rewrites": [
+    { "source": "/api/auth/:action", "destination": "/api/auth?action=$1" },
+    { "source": "/api/platform/accounts/search", "destination": "/api/platform" },
+    { "source": "/api/platform/topics/batch", "destination": "/api/platform" },
+    { "source": "/api/platform/topics/share-link", "destination": "/api/platform" },
+    { "source": "/api/export/feishu", "destination": "/api/export" },
+    { "source": "/api/export/bitable/create", "destination": "/api/export" },
+    { "source": "/api/export/bitable", "destination": "/api/export" }
+  ]
+}

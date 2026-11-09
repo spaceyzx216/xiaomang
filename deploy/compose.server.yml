@@ -1,0 +1,17 @@
+# 服务器上的聚合入口。
+#
+# 为什么需要它：deploy/backup.sh 与 deploy/restore.sh 只接受**单个** -f
+# （它们内部是 `docker compose -f "$compose_file" exec -T mongo ...`），
+# 而本机需要叠加 compose.yml + compose.cvm.yml 两份文件。
+# compose 的 include 会按顺序应用覆盖，正好补上这一环。
+#
+# 用法：
+#   COMPOSE_FILE=/opt/xiaomang/deploy/compose.server.yml sh backup.sh
+#   docker compose -f compose.server.yml ps
+#
+# name 必须显式写：不写的话 compose 会用**目录名**（deploy）当项目名，
+# 与容器实际所属的项目（xiaomang）对不上，exec 会找不到 mongo 容器。
+name: xiaomang
+include:
+  - compose.yml
+  - compose.cvm.yml

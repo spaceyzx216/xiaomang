@@ -1,0 +1,13 @@
+# Let's Encrypt IP 证书自动续期（IP 证书只有 6 天有效期，必须高频检查）。
+#
+# acme.sh 会读取 ARI（ACME Renewal Information）建议窗口来决定是否真的签发：
+# 不在窗口内时它直接跳过、退出码为 0，因此每天跑 3 次是安全的，
+# 不会浪费 Let's Encrypt 的签发配额。
+#
+# 续期成功后 acme.sh 会执行签发时记录的 reload 命令
+# （docker exec xiaomang-nginx-1 nginx -s reload），因此 nginx 会自动加载新证书。
+#
+# 排查：cat /var/log/xiaomang-ip-cert.log
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 2,10,18 * * * root /root/.acme.sh/acme.sh --cron --home /root/.acme.sh >>/var/log/xiaomang-ip-cert.log 2>&1

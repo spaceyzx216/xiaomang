@@ -1,0 +1,44 @@
+#!/bin/sh
+# 提交前扫描：挡住「连接串 / 密钥被硬编码进仓库」。
+#
+# 为什么要有它：2026-09-22 的合并审查发现 git 历史里有 4 个提交含**明文数据库密码**
+# （server/.env 与 server/index.js），且与线上密码相同。当时没有公网远端所以未泄露，
+# 但只要 push 一次就暴露；事后清理要重写历史，很麻烦 —— 在入口拦住便宜得多。
+#
+# 启用：git config core.hooksPath .githooks
+# 显式跳过：git commit --no-verify
+#
+# 设计取舍：**扫全部暂存差异**，不按文件名过滤（早期版本用 `-- $staged` 传文件名，
+# 变量里带引号时 git 会当成不存在的路径，导致静默漏检 —— 已改成全量扫描）。
+set -eu
+
+# 有暂存内容才扫。
+git diff --cached --quiet && exit 0
+
+# 命中任一模式即拒绝（写得宽一点：宁可让人多看一眼，也不要漏过真凭据）。
+PATTERN='mongodb(\+srv)?://[^:@/[:space:]]+:[^@[:space:]]+@'
+PATTERN="$PATTERN"'|(api[_-]?key|api[_-]?token|secret|password|passwd)["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9_/+-]{16,}'
+PATTERN="$PATTERN"'|sk-[A-Za-z0-9]{20,}'
+
+# 排除：**只排除明确的占位写法**，不要用宽泛子串。
+# ⚠️ 踩过的坑：这里原本写了 `example|xxx` 这种无锚定子串，结果
+#    形如 mongo 连接串中「以 example 结尾的域名」被无锚定子串 example 匹配，
+#    整行被当成「文档示例」放行 —— **过宽的排除比没有排除更危险**（会静默漏检）。
+#    所以现在只认 `YOUR_` / `<...>` / `***` / `EXAMPLE_`（带下划线，不会出现在域名里）这类明确标记。
+EXCLUDE='YOUR[_-]|<[^>]{1,40}>|\*\*\*|EXAMPLE[_-]|placeholder|placeholder_|PLACEHOLDER|REPLACE_ME|CHANGE_ME|REMOVED|process\.env|import\.meta\.env|\$\{[A-Z_]'
+
+hits=$(git diff --cached -U0 \
+  | grep -E '^\+[^+]' \
+  | grep -inE "$PATTERN" \
+  | grep -viE "$EXCLUDE" \
+  || true)
+
+if [ -n "$hits" ]; then
+  echo "✗ 提交被拒绝：检测到疑似硬编码的凭据 / 连接串。" >&2
+  echo "" >&2
+  echo "$hits" | sed 's/^/    /' >&2
+  echo "" >&2
+  echo "请改用环境变量（.env 已被 .gitignore 忽略）。确实要提交请用 git commit --no-verify。" >&2
+  exit 1
+fi
+exit 0

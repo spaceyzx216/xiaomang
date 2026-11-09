@@ -1,0 +1,45 @@
+# 腾讯云 CVM 部署覆盖配置
+#
+# 用途：在已由「宝塔面板」管理、宿主机 nginx 占用 80/443 的服务器上部署本项目。
+#
+# 用法（在 deploy/ 目录下）：
+#   docker compose -f compose.yml -f compose.tencent.yml up -d
+#
+# 与 compose.yml 的差异及原因：
+#   1. 禁用自带 nginx 容器 —— 宿主机 80/443 已被宝塔 nginx 占用，容器再绑 80 会直接启动失败。
+#      改为由宿主机 nginx 反代到 127.0.0.1:8787。
+#   2. app 只监听回环地址 —— 不直接对公网暴露 8787，避免绕过 nginx。
+#   3. 保留原有 app_data / mongo_data 数据卷，数据不随配置切换丢失。
+#
+# 若将来迁到没有宝塔的干净机器，只跑 compose.yml 即可（自带 nginx 会监听 80）。
+
+services:
+  nginx:
+    # 默认不启动；如需启用自带 nginx：加 --profile bundled-nginx
+    profiles: ["bundled-nginx"]
+
+  app:
+    build:
+      context: ..
+      args:
+        # 腾讯云 CVM 访问 deb.debian.org 缓慢（实测约 270KB/s 且 apt 会卡住），
+        # 换用腾讯云内网镜像源（实测约 835KB/s）。
+        APT_MIRROR: mirrors.cloud.tencent.com
+    ports:
+      - "127.0.0.1:8787:8787"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mongo:
+    # 这台机器只有 1.9G 内存且与其他业务共用（MySQL/Redis/宝塔/另一个 Node 项目）。
+    # MongoDB 8.0 默认 WiredTiger 缓存 = max(256MB, (RAM-1GB)/2) ≈ 512MB，
+    # 而本项目整个数据集只有约 1.5MB —— 默认值纯属浪费，会挤压同机其他服务。
+    command: ["--wiredTigerCacheSizeGB", "0.25"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,13 @@
+# 小芒部署相关日志的轮转规则。
+#
+# 为什么需要：证书续期每天 3 次、备份每天 1 次，两者都往日志里追加；
+# 这台机器系统盘 40G，长期运行不轮转会把盘写满（旧部署手册里就踩过
+# /var/log/secure 涨到 68MB 的坑）。
+/var/log/xiaomang-ip-cert.log /var/log/xiaomang-backup.log {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+    copytruncate
+}

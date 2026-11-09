@@ -1,0 +1,34 @@
+# 腾讯云 CVM（干净机器）部署覆盖配置
+#
+# 与 compose.tencent.yml 的区别：
+#   那份是给「宿主机 80/443 已被宝塔 nginx 占用」的机器用的 —— 它会禁用自带 nginx
+#   并把 app 绑到 127.0.0.1:8787，改由宿主机 nginx 反代。
+#   本文件面向**没有宝塔、80/443 空闲**的干净 CVM，因此保留自带 nginx，
+#   只做一件事：把构建时的 Debian 源换成腾讯云镜像。
+#
+# 为什么需要换源：官方 deb.debian.org 从该机器实测 229KB/s，腾讯云源 976KB/s（约 4 倍）。
+#   Dockerfile 的 APT_MIRROR 参数默认空字符串 = 沿用官方源，不影响其他环境。
+#
+# 用法（在 deploy/ 目录下）：
+#   docker compose -f compose.yml -f compose.cvm.yml up -d --build
+#
+# 若机器不在腾讯云，直接用 compose.yml 即可（自带 nginx 会监听 80）。
+
+services:
+  app:
+    build:
+      args:
+        APT_MIRROR: mirrors.cloud.tencent.com
+
+  nginx:
+    # compose.yml 里只发布了 80，这里补上 443。
+    # ⚠️ 发布端口 ≠ 公网可达：腾讯云安全组还需要放行 TCP 443，否则外网仍连不上。
+    ports:
+      - "443:443"
+    volumes:
+      # ACME HTTP-01 验证目录：acme.sh 把 token 写到宿主机这里，nginx 从容器内只读伺服。
+      # 走 webroot 而不是 standalone，是为了续期时**不需要停 nginx**（零停机）。
+      - ./acme-webroot:/usr/share/nginx/html/acme:ro
+      # Let's Encrypt 的 IP 证书（acme.sh 维护，续期 cron 见 /etc/cron.d/xiaomang-ip-cert）。
+      # 只读挂载；容器内 nginx master 以 root 运行，可读宿主机 600 权限的私钥。
+      - /etc/ssl/xiaomang-ip:/etc/nginx/certs:ro

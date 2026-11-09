@@ -1,0 +1,17 @@
+name: xiaomang-local
+services:
+  mongo:
+    image: mongo:8.0
+    restart: unless-stopped
+    env_file: local.env
+    ports:
+      - "127.0.0.1:27018:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --username \"$$MONGO_INITDB_ROOT_USERNAME\" --password \"$$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin --eval 'quit(db.adminCommand({ping:1}).ok ? 0 : 1)'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+volumes:
+  mongo_data:
