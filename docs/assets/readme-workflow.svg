@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="344" viewBox="0 0 1280 344" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">从账号研究到复盘回流的内容工作流</title>
+  <desc id="desc">研究与定位、选题与创作、发布材料、数据复盘依次相连。复盘结果经经理确认后，回流到选题与创作。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="7" markerHeight="7" refX="5.5" refY="3.5" orient="auto"><path d="M1 1L5 3.5L1 6" stroke="#98A2B1" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <marker id="back" markerWidth="7" markerHeight="7" refX="5.5" refY="3.5" orient="auto"><path d="M1 1L5 3.5L1 6" stroke="#9C7435" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></marker>
+  </defs>
+  <rect x=".5" y=".5" width="1279" height="343" rx="20" fill="#F8F9FC" stroke="#E6E9EF"/>
+  <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">
+    <text x="42" y="47" fill="#667085" font-size="15" letter-spacing="2">THE CONTENT LOOP</text>
+    <text x="1238" y="47" text-anchor="end" fill="#98A2B1" font-size="16">团队协作 / 人工确认 / 持续积累</text>
+    <path d="M306 157H344M610 157H648M914 157H952" stroke="#98A2B1" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <g>
+      <rect x="42" y="86" width="264" height="140" rx="14" fill="#FFFFFF" stroke="#E1E5EC"/>
+      <text x="64" y="120" fill="#B27A22" font-size="15" font-weight="600">01 / RESEARCH</text>
+      <text x="64" y="159" fill="#182230" font-size="28" font-weight="650">研究与定位</text>
+      <text x="64" y="193" fill="#667085" font-size="19">客户档案 · 对标研究</text>
+    </g>
+    <g>
+      <rect x="350" y="86" width="260" height="140" rx="14" fill="#FFFFFF" stroke="#E1E5EC"/>
+      <text x="372" y="120" fill="#5D77B3" font-size="15" font-weight="600">02 / CREATE</text>
+      <text x="372" y="159" fill="#182230" font-size="28" font-weight="650">选题与创作</text>
+      <text x="372" y="193" fill="#667085" font-size="19">选题筛选 · 脚本二创</text>
+    </g>
+    <g>
+      <rect x="654" y="86" width="260" height="140" rx="14" fill="#FFFFFF" stroke="#E1E5EC"/>
+      <text x="676" y="120" fill="#80629C" font-size="15" font-weight="600">03 / PREPARE</text>
+      <text x="676" y="159" fill="#182230" font-size="28" font-weight="650">发布材料</text>
+      <text x="676" y="193" fill="#667085" font-size="19">封面 · 文案 · 话题标签</text>
+    </g>
+    <g>
+      <rect x="958" y="86" width="280" height="140" rx="14" fill="#F0F7F5" stroke="#D2E5DE"/>
+      <text x="980" y="120" fill="#428471" font-size="15" font-weight="600">04 / REVIEW</text>
+      <text x="980" y="159" fill="#182230" font-size="28" font-weight="650">数据复盘</text>
+      <text x="980" y="193" fill="#667085" font-size="19">视频分析 · 周报 · 配比</text>
+    </g>
+    <path d="M1098 238V272Q1098 287 1083 287H495Q480 287 480 272V240" stroke="#B89761" stroke-width="1.5" stroke-dasharray="5 5" marker-end="url(#back)"/>
+    <rect x="590" y="268" width="400" height="35" rx="17.5" fill="#FBF1DE"/>
+    <text x="790" y="291" text-anchor="middle" fill="#8B662A" font-size="17" font-weight="500">经经理确认，将复盘经验带回选题与创作</text>
+  </g>
+</svg>

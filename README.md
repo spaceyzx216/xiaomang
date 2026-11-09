@@ -1,10 +1,38 @@
-# 小芒 AI · 内容生产工作台
+<a id="top"></a>
 
-小芒面向新媒体内容团队，将客户管理、账号定位、选题研究、AI 内容生产、发布材料准备和数据复盘放在同一个工作台中。项目经理负责客户、策略与任务分配，员工按任务完成选题与内容生产，复盘经验经确认后回流到后续创作。
+<p align="center">
+  <img src="docs/assets/readme-hero.svg" width="100%" alt="小芒 AI · 内容生产工作台：把内容生产，连成闭环。" />
+</p>
 
-当前仓库采用 npm Workspaces，包含 React 前端、Express 服务端和共享角色定义。
+<h1 align="center">从账号定位，到下一轮好内容。</h1>
 
-## 核心能力
+<p align="center">
+  面向新媒体团队的 AI 内容生产工作台<br />
+  让客户、策略、创作与复盘，沿着同一条工作流协作。
+</p>
+
+<p align="center">
+  <a href="#overview">功能全景</a> ·
+  <a href="#quick-start">快速开始</a> ·
+  <a href="#configuration">服务配置</a> ·
+  <a href="#development">开发验证</a> ·
+  <a href="#deployment">构建部署</a> ·
+  <a href="#documentation">文档导航</a>
+</p>
+
+---
+
+<a id="overview"></a>
+
+## 一个工作台，连接内容生产的每一步
+
+小芒将客户管理、账号定位、选题研究、AI 内容生产、发布材料准备和数据复盘放在同一工作台中。经理维护客户与策略、分配任务；员工围绕任务完成选题与创作；复盘经验经经理确认后，回到后续内容生产。
+
+| 研究有依据 | 创作有上下文 | 复盘能回流 |
+| :--- | :--- | :--- |
+| 从客户档案、对标研究到选题库，积累创作输入。 | 连接客户、任务与选题，准备脚本和发布材料。 | 把已确认的经验带入下一轮选题与创作配比。 |
+
+### 功能全景
 
 | 模块 | 能力 |
 | --- | --- |
@@ -14,11 +42,20 @@
 | 发布仓 | 封面、发布文案与话题标签生成和选择，按选题保存草稿，最终文案编辑与飞书导出 |
 | 数据复盘 | 单条视频与周度账号分析，手工填表、Excel 导入与 AI 识别，下周配比预览、确认与经验回流 |
 
-工作流：**客户建档 → 账号定位与建库 → 分配任务 → 筛选选题 → 内容生成 → 发布仓与最终编辑 → 人工发布 → 数据复盘**。
+### 从研究到复盘，形成内容闭环
 
-平台数据、AI、语音识别、图片生成和飞书导出依赖对应服务配置。发布仓用于准备发布材料，平台发布仍由人工完成。
+<p align="center">
+  <img src="docs/assets/readme-workflow.svg" width="100%" alt="研究与定位 → 选题与创作 → 发布材料 → 数据复盘；复盘经经理确认后回流到选题与创作。" />
+</p>
 
-## 技术栈与目录
+| 项目经理 | 内容员工 |
+| :--- | :--- |
+| 客户与 IP 档案、员工与任务管理、账号定位、选题建库、复盘与策略确认。 | 今日任务、选题筛选、脚本二创、发布材料准备与最终文案编辑。 |
+
+> 平台数据与 AI 能力按服务配置启用。发布仓用于准备材料，平台发布由人工完成；复盘经验经确认后生效。
+
+<details>
+<summary><strong>查看技术栈与项目结构</strong></summary>
 
 - **前端**：React 18、TypeScript、Vite 6、React Router、Tailwind CSS 4、Radix UI。
 - **后端**：Node.js、Express 5、MongoDB、bcryptjs；业务逻辑集中在 `apps/server/api/_lib/`。
@@ -43,9 +80,15 @@
 └── package.json                # 工作区与统一命令
 ```
 
-## 本地运行
+</details>
 
-### 1. 准备环境
+---
+
+<a id="quick-start"></a>
+
+## 快速开始
+
+### 01 · 准备环境
 
 - Node.js **22.18 或以上**及 npm；仓库 Dockerfile 使用 Node.js 24。
 - 可访问的 MongoDB；仓库容器配置使用 MongoDB 8.0。
@@ -59,7 +102,7 @@ npm ci
 cp apps/server/.env.example apps/server/.env
 ```
 
-### 2. 配置数据库与会话
+### 02 · 配置数据库与会话
 
 已有 MongoDB 时，可直接配置连接地址。也可以启动一个仅映射到本机回环地址的开发数据库：
 
@@ -87,9 +130,14 @@ JWT_SECRET=REPLACE_WITH_RANDOM_SESSION_SECRET
 openssl rand -base64 48
 ```
 
+<details>
+<summary>已有本地配置？查看环境变量加载顺序</summary>
+
 后端先加载 `apps/server/.env`，再以覆盖模式加载 `apps/server/src/.env`（如果存在）。新环境建议统一维护前者；如果本机保留了后者，请先检查其中是否有旧配置。
 
-### 3. 创建经理邀请码
+</details>
+
+### 03 · 创建经理邀请码
 
 首次注册经理账号前，需要在数据库中创建可用邀请码。在仓库根目录执行：
 
@@ -100,15 +148,19 @@ node --env-file=apps/server/.env \
 
 将 `<自定义邀请码>` 替换为自己的值；`1` 表示最多使用一次。该脚本读取进程环境变量，因此本地执行时需要显式指定 `--env-file`。
 
-### 4. 启动工作台
+### 04 · 启动工作台
 
 ```bash
 npm run dev
 ```
 
-- 前端通常位于 `http://localhost:5173`，以 Vite 实际输出为准。
-- 后端默认位于 `http://localhost:8787`。
-- Vite 将 `/api` 请求代理到 `http://localhost:8787`。如果修改后端端口，需要同步修改 `apps/web/vite.config.ts`。
+| 入口 | 默认地址 | 说明 |
+| --- | --- | --- |
+| 前端工作台 | `http://localhost:5173` | 以 Vite 实际输出为准 |
+| 后端 API | `http://localhost:8787` | Express 服务 |
+| 经理注册 | `http://localhost:5173/register` | 使用上一步创建的邀请码 |
+
+Vite 将 `/api` 请求代理到 `http://localhost:8787`。如果修改后端端口，需要同步修改 `apps/web/vite.config.ts`。
 
 打开前端的 `/register` 页面，使用邀请码注册经理账号。经理登录后可创建员工、客户和任务；员工使用经理创建的账号登录。
 
@@ -121,7 +173,11 @@ curl http://localhost:8787/health/ready
 
 `/health` 检查进程响应；`/health/ready` 同时检查数据库，数据库不可用时返回 HTTP 503。
 
-## 外部服务配置
+---
+
+<a id="configuration"></a>
+
+## 按需连接外部服务
 
 完整变量与说明见 [`apps/server/.env.example`](apps/server/.env.example)。按需要启用以下能力：
 
@@ -138,7 +194,11 @@ curl http://localhost:8787/health/ready
 
 本地开发默认使用同源 `/api` 代理，无需额外配置前端 API 地址。确需覆盖时，在 `apps/web/.env` 中设置 `VITE_API_PROXY_BASE` 并重新启动或构建前端。`VITE_*` 会进入浏览器代码，只应放公开配置；API 密钥和数据库连接串保留在服务端。
 
-## 常用命令与验证
+---
+
+<a id="development"></a>
+
+## 开发与验证
 
 以下命令均在仓库根目录执行：
 
@@ -157,7 +217,16 @@ curl http://localhost:8787/health/ready
 
 部分数据库测试在连接不可用时会跳过，管理端集成测试则会直接失败。测试脚本会使用独立临时数据库，需要相应的创建、读写与清理权限。页面渲染检查不能代替浏览器交互验证，Vite 构建也不等同于全项目 TypeScript 类型检查。
 
+<details>
+<summary>排查 esbuild 原生依赖错误</summary>
+
 如果从其他机器复制过 `node_modules` 并遇到 esbuild 原生二进制缺失或平台错误，请在当前机器重新执行 `npm ci`，不要复用其他环境的依赖目录。
+
+</details>
+
+---
+
+<a id="deployment"></a>
 
 ## 构建与部署
 
@@ -185,7 +254,11 @@ Express 默认在 `8787` 端口提供 API 与前端静态资源，并处理前�
 
 部署操作与历史记录见 [`docs/DEPLOY.md`](docs/DEPLOY.md)。其中的服务器地址、发布结果、证书与回滚记录对应文档记录时点，执行前需核对实际环境。更早的腾讯云环境说明保留在 [`docs/DEPLOY-TENCENT.md`](docs/DEPLOY-TENCENT.md)。
 
-## 项目文档
+---
+
+<a id="documentation"></a>
+
+## 继续了解小芒
 
 | 文档 | 内容 |
 | --- | --- |
@@ -197,3 +270,10 @@ Express 默认在 `8787` 端口提供 API 与前端静态资源，并处理前�
 | [交接记录](HANDOFF.md) | 实现背景、问题排查与历史决策 |
 
 `docs/legacy/` 保留旧版本资料。文档中的历史测试数量和上线记录不代表当前检出版本或线上环境已经重新验证。
+
+---
+
+<p align="center">
+  <strong>让每一轮创作，都带着上一轮的积累。</strong><br />
+  <a href="#top">回到顶部 ↑</a>
+</p>

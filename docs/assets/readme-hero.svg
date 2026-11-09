@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="480" viewBox="0 0 1280 480" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">小芒 AI · 内容生产工作台</title>
+  <desc id="desc">从洞察到创作，再从复盘回到下一轮内容。React、Node.js、MongoDB 构建的团队工作台。</desc>
+  <defs>
+    <linearGradient id="surface" x1="0" y1="0" x2="1280" y2="480" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#111827"/>
+      <stop offset="1" stop-color="#0A101B"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(1100 20) rotate(132) scale(530 410)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F6B34C" stop-opacity=".16"/>
+      <stop offset="1" stop-color="#F6B34C" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="line" x1="830" y1="115" x2="1140" y2="365" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F6B34C"/>
+      <stop offset="1" stop-color="#75CABD"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" stroke="#FFFFFF" stroke-opacity=".035"/>
+    </pattern>
+  </defs>
+  <rect width="1280" height="480" rx="24" fill="url(#surface)"/>
+  <rect width="1280" height="480" rx="24" fill="url(#glow)"/>
+  <path d="M720 0H1256Q1280 0 1280 24V456Q1280 480 1256 480H720V0Z" fill="url(#grid)"/>
+  <rect x=".5" y=".5" width="1279" height="479" rx="23.5" stroke="#FFFFFF" stroke-opacity=".09"/>
+  <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">
+    <rect x="64" y="54" width="46" height="46" rx="13" fill="#F6B34C"/>
+    <text x="87" y="85" text-anchor="middle" fill="#111827" font-size="29" font-weight="700">芒</text>
+    <text x="126" y="83" fill="#D7DDE6" font-size="19" font-weight="600" letter-spacing="3">XIAOMANG / AI WORKSPACE</text>
+    <text x="64" y="206" fill="#FFFFFF" font-size="78" font-weight="750" letter-spacing="-2">小芒 AI</text>
+    <text x="66" y="262" fill="#E2E6ED" font-size="34" font-weight="500">把内容生产，连成闭环。</text>
+    <text x="67" y="309" fill="#96A3B5" font-size="21">账号定位 · 内容创作 · 团队协作 · 数据复盘</text>
+    <path d="M66 350H602" stroke="#FFFFFF" stroke-opacity=".12"/>
+    <g font-size="16" font-weight="500" fill="#B5BFCD" text-anchor="middle">
+      <rect x="66" y="376" width="103" height="33" rx="16.5" fill="none" stroke="#354050"/><text x="117.5" y="398">React 18</text>
+      <rect x="181" y="376" width="130" height="33" rx="16.5" fill="none" stroke="#354050"/><text x="246" y="398">Node.js 22+</text>
+      <rect x="323" y="376" width="116" height="33" rx="16.5" fill="none" stroke="#354050"/><text x="381" y="398">MongoDB</text>
+      <rect x="451" y="376" width="99" height="33" rx="16.5" fill="none" stroke="#354050"/><text x="500.5" y="398">Docker</text>
+    </g>
+    <path d="M990 112C1160 112 1223 184 1196 273C1174 345 1080 380 980 368C869 355 798 299 812 215C820 166 866 132 920 120" stroke="url(#line)" stroke-opacity=".4" stroke-width="1.5" stroke-dasharray="5 7"/>
+    <path d="M912 118L924 120L917 131" stroke="#F6B34C" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="783" y="94" width="284" height="76" rx="16" fill="#1D2633" stroke="#4B4337"/>
+    <rect x="803" y="114" width="36" height="36" rx="10" fill="#F6B34C" fill-opacity=".12"/>
+    <circle cx="818" cy="129" r="6" stroke="#F6B34C" stroke-width="1.8"/><path d="M823 134L828 139" stroke="#F6B34C" stroke-width="1.8" stroke-linecap="round"/>
+    <text x="855" y="126" fill="#8D99AA" font-size="13" letter-spacing="2">01 / INSIGHT</text>
+    <text x="854" y="151" fill="#F3F5F8" font-size="22" font-weight="600">让创作有依据</text>
+    <rect x="892" y="202" width="284" height="76" rx="16" fill="#1D2633" stroke="#3E4A5D"/>
+    <rect x="912" y="222" width="36" height="36" rx="10" fill="#90A8E4" fill-opacity=".12"/>
+    <path d="M925 231L934 240L925 249M921 240H938" stroke="#A3B8ED" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="964" y="234" fill="#8D99AA" font-size="13" letter-spacing="2">02 / CREATE</text>
+    <text x="963" y="259" fill="#F3F5F8" font-size="22" font-weight="600">让协作有上下文</text>
+    <rect x="811" y="310" width="284" height="76" rx="16" fill="#192A2B" stroke="#35534E"/>
+    <rect x="831" y="330" width="36" height="36" rx="10" fill="#75CABD" fill-opacity=".12"/>
+    <path d="M841 354V348M848 354V343M855 354V338" stroke="#86D4C8" stroke-width="2" stroke-linecap="round"/>
+    <text x="883" y="342" fill="#90AAA7" font-size="13" letter-spacing="2">03 / LEARN</text>
+    <text x="882" y="367" fill="#F3F5F8" font-size="22" font-weight="600">让复盘回到下一轮</text>
+    <circle cx="1198" cy="84" r="4" fill="#F6B34C"/>
+    <circle cx="753" cy="349" r="3" fill="#75CABD" fill-opacity=".7"/>
+    <text x="1214" y="441" text-anchor="end" fill="#627084" font-size="12" letter-spacing="2">RESEARCH → CREATE → REVIEW</text>
+  </g>
+</svg>
